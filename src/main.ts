@@ -1,22 +1,27 @@
-import { MarkdownView, Notice, Plugin, TFile, type TAbstractFile } from "obsidian";
+import { MarkdownView, Notice, Plugin, TFile, normalizePath, type TAbstractFile } from "obsidian";
+import * as Y from "yjs";
 import { RolayApiClient } from "./api/client";
 import { FileBridge } from "./obsidian/file-bridge";
 import { CrdtSessionManager } from "./realtime/crdt-session";
 import { createSharedPresenceExtension } from "./realtime/shared-presence";
 import {
   getRoomBindingSettings,
+  ROLAY_AUTO_CONNECT,
+  ROLAY_DEVICE_NAME,
+  ROLAY_SERVER_URL,
   type RolayCrdtCacheEntry,
   getRoomSyncState,
   mergePluginData,
   normalizeServerUrl,
   type RolayLogEntry,
+  type RolayPendingMarkdownCreateEntry,
   type RolayPluginData,
   type RolayPluginSettings,
   type RolayRoomBindingSettings
 } from "./settings/data";
 import { RolaySettingTab } from "./settings/tab";
 import { WorkspaceEventStream, type WorkspaceEventStreamStatus } from "./sync/event-stream";
-import { OperationsQueue } from "./sync/operations";
+import { OperationsQueue, RolayOperationError } from "./sync/operations";
 import {
   getRoomRoot,
   isValidRoomFolderName,
@@ -44,6 +49,17 @@ interface RoomRuntimeState {
   eventStream: WorkspaceEventStream | null;
   streamStatus: WorkspaceEventStreamStatus;
   snapshotRefreshHandle: number | null;
+  markdownBootstrap: RoomMarkdownBootstrapState;
+}
+
+interface RoomMarkdownBootstrapState {
+  status: "idle" | "loading" | "ready" | "error";
+  totalTargets: number;
+  completedTargets: number;
+  lastRunAt: string | null;
+  lastError: string | null;
+  rerunRequested: boolean;
+  runToken: number;
 }
 
 interface DownloadedRoomDescriptor {
@@ -61,6 +77,9 @@ export interface RoomCardState {
   lastCursorLabel: string;
   lastSnapshotLabel: string;
   entryCount: number;
+  markdownEntryCount: number;
+  cachedMarkdownCount: number;
+  crdtCacheLabel: string;
   invite: InviteState | null;
 }
 
@@ -71,11 +90,14 @@ interface StatusSnapshot {
   downloadedRoomCount: number;
   activeStreamCount: number;
   crdtLabel: string;
+  persistentLogPath: string;
   recentLogs: string[];
 }
 
 export default class RolayPlugin extends Plugin {
   private static readonly MAX_PERSISTED_CRDT_DOCS = 64;
+  private static readonly MAX_LOG_FILE_BYTES = 512 * 1024;
+  private static readonly LOG_FILE_NAME = "rolay-sync.log";
   private data!: RolayPluginData;
   private apiClient!: RolayApiClient;
   private crdtManager!: CrdtSessionManager;
@@ -90,6 +112,9 @@ export default class RolayPlugin extends Plugin {
   private managedUsers: ManagedUser[] = [];
   private adminSelectedRoomId = "";
   private adminRoomMembers: RoomMember[] = [];
+  private logFlushHandle: number | null = null;
+  private logFileWrite = Promise.resolve();
+  private readonly pendingLogLines: string[] = [];
   private profileDraftDisplayName = "";
   private createRoomDraft: CreateRoomRequest = {
     name: ""
@@ -195,6 +220,10 @@ export default class RolayPlugin extends Plugin {
         window.clearTimeout(this.persistHandle);
       }
 
+      if (this.logFlushHandle !== null) {
+        window.clearTimeout(this.logFlushHandle);
+      }
+
       for (const runtime of this.roomRuntime.values()) {
         if (runtime.snapshotRefreshHandle !== null) {
           window.clearTimeout(runtime.snapshotRefreshHandle);
@@ -204,15 +233,14 @@ export default class RolayPlugin extends Plugin {
 
     this.recordLog("plugin", "Rolay plugin loaded.");
 
-    if (this.data.settings.autoConnect) {
-      await this.bootstrapSync("startup");
-    }
+    await this.bootstrapSync("startup");
   }
 
   override async onunload(): Promise<void> {
     this.stopAllRoomEventStreams();
     await this.crdtManager.disconnect();
     await this.persistNow();
+    await this.flushLogFile();
   }
 
   getSettings(): RolayPluginSettings {
@@ -235,6 +263,8 @@ export default class RolayPlugin extends Plugin {
       const roomSync = getRoomSyncState(this.data.sync, room.workspace.id);
       const runtime = this.roomRuntime.get(room.workspace.id);
       const treeStore = runtime?.treeStore ?? null;
+      const markdownEntries = treeStore?.getEntries().filter((entry) => !entry.deleted && entry.kind === "markdown") ?? [];
+      const cachedMarkdownCount = markdownEntries.filter((entry) => this.hasPersistedCrdtCache(entry.id)).length;
 
       return {
         room,
@@ -246,6 +276,9 @@ export default class RolayPlugin extends Plugin {
         lastCursorLabel: roomSync.lastCursor === null ? "none" : String(roomSync.lastCursor),
         lastSnapshotLabel: roomSync.lastSnapshotAt ?? "never",
         entryCount: treeStore?.getEntries().length ?? 0,
+        markdownEntryCount: markdownEntries.length,
+        cachedMarkdownCount,
+        crdtCacheLabel: this.formatRoomCrdtCacheLabel(runtime?.markdownBootstrap, markdownEntries.length, cachedMarkdownCount),
         invite: this.roomInvites.get(room.workspace.id) ?? null
       };
     });
@@ -350,6 +383,7 @@ export default class RolayPlugin extends Plugin {
       crdtLabel: crdtState
         ? `${crdtState.status} for ${crdtState.filePath}`
         : "inactive (open a markdown note inside a downloaded room folder)",
+      persistentLogPath: this.getPersistentLogFilePath(),
       recentLogs: this.data.logs.slice(-12).map((entry) => {
         return `[${entry.at}] ${entry.scope}/${entry.level}: ${entry.message}`;
       })
@@ -360,12 +394,15 @@ export default class RolayPlugin extends Plugin {
     this.data.settings = {
       ...this.data.settings,
       ...update,
+      serverUrl: ROLAY_SERVER_URL,
+      deviceName: ROLAY_DEVICE_NAME,
+      autoConnect: ROLAY_AUTO_CONNECT,
       roomBindings: {
         ...this.data.settings.roomBindings,
         ...(update.roomBindings ?? {})
       }
     };
-    this.data.settings.serverUrl = normalizeServerUrl(this.data.settings.serverUrl);
+    this.data.settings.serverUrl = normalizeServerUrl(ROLAY_SERVER_URL);
     this.data.settings.syncRoot = this.data.settings.syncRoot.trim();
     await this.persistNow();
     this.updateStatusBar();
@@ -384,7 +421,7 @@ export default class RolayPlugin extends Plugin {
   }
 
   async loginWithSettings(showNotice = true): Promise<void> {
-    const { username, password, deviceName } = this.data.settings;
+    const { username, password } = this.data.settings;
 
     if (!username || !password) {
       throw this.notifyError("Username and password are required before login.");
@@ -394,7 +431,7 @@ export default class RolayPlugin extends Plugin {
       const response = await this.apiClient.login({
         username,
         password,
-        deviceName: deviceName || "Obsidian Desktop"
+        deviceName: ROLAY_DEVICE_NAME
       });
 
       await this.applySessionUser(response.user);
@@ -913,6 +950,8 @@ export default class RolayPlugin extends Plugin {
         "tree",
         `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
       );
+      await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
+      await this.reconcilePendingMarkdownCreates(room.workspace.id, reason);
       await this.persistNow();
       this.updateStatusBar();
       await this.bindActiveMarkdownToCrdt();
@@ -968,6 +1007,7 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
+    this.cancelRoomMarkdownBootstrap(workspaceId);
     runtime.eventStream?.stop();
     runtime.eventStream = null;
     runtime.streamStatus = "stopped";
@@ -1000,7 +1040,7 @@ export default class RolayPlugin extends Plugin {
     if (!this.canAttemptAuth()) {
       this.recordLog(
         "startup",
-        `Skipping ${reason} auto-connect because auth settings are incomplete.`
+        `Skipping ${reason} sync bootstrap because auth settings are incomplete.`
       );
       return;
     }
@@ -1100,6 +1140,7 @@ export default class RolayPlugin extends Plugin {
 
   private async handleVaultRename(file: TAbstractFile, oldPath: string): Promise<void> {
     try {
+      this.handlePendingMarkdownCreateRename(oldPath, file.path);
       await this.fileBridge.handleVaultRename(file, oldPath);
     } catch (error) {
       this.handleError(`Local rename sync failed for ${oldPath}`, error, false);
@@ -1108,6 +1149,7 @@ export default class RolayPlugin extends Plugin {
 
   private async handleVaultDelete(file: TAbstractFile): Promise<void> {
     try {
+      this.clearPendingMarkdownCreate(file.path);
       if (await this.handlePotentialRoomRootRemoval(file.path, "delete")) {
         return;
       }
@@ -1203,7 +1245,9 @@ export default class RolayPlugin extends Plugin {
     };
 
     this.data.logs = [...this.data.logs.slice(-99), entry];
+    this.pendingLogLines.push(formatPersistentLogLine(entry));
     this.schedulePersist();
+    this.scheduleLogFlush();
     console[level === "error" ? "error" : "info"](`[Rolay] ${scope}: ${message}`);
     this.updateStatusBar();
   }
@@ -1240,6 +1284,86 @@ export default class RolayPlugin extends Plugin {
     }
 
     await this.saveData(this.data);
+    await this.flushLogFile();
+  }
+
+  private scheduleLogFlush(): void {
+    if (this.logFlushHandle !== null) {
+      return;
+    }
+
+    this.logFlushHandle = window.setTimeout(() => {
+      this.logFlushHandle = null;
+      void this.flushLogFile();
+    }, 250);
+  }
+
+  private async flushLogFile(): Promise<void> {
+    if (this.logFlushHandle !== null) {
+      window.clearTimeout(this.logFlushHandle);
+      this.logFlushHandle = null;
+    }
+
+    const nextBatch = this.pendingLogLines.splice(0).join("");
+    if (!nextBatch) {
+      await this.logFileWrite;
+      return;
+    }
+
+    this.logFileWrite = this.logFileWrite.then(async () => {
+      try {
+        await this.ensurePersistentLogFolderExists();
+        const adapter = this.app.vault.adapter;
+        const logFilePath = this.getPersistentLogFilePath();
+        if (await adapter.exists(logFilePath)) {
+          await adapter.append(logFilePath, nextBatch);
+        } else {
+          await adapter.write(logFilePath, nextBatch);
+        }
+
+        await this.trimPersistentLogFileIfNeeded(logFilePath);
+      } catch (error) {
+        console.error("[Rolay] failed to write persistent log file", error);
+      }
+    });
+
+    await this.logFileWrite;
+  }
+
+  private getPersistentLogFilePath(): string {
+    return normalizePath(`${this.app.vault.configDir}/plugins/${this.manifest.id}/${RolayPlugin.LOG_FILE_NAME}`);
+  }
+
+  private getPersistentLogFolderPath(): string {
+    return normalizePath(`${this.app.vault.configDir}/plugins/${this.manifest.id}`);
+  }
+
+  private async ensurePersistentLogFolderExists(): Promise<void> {
+    const adapter = this.app.vault.adapter;
+    const folderPath = this.getPersistentLogFolderPath();
+    const segments = folderPath.split("/").filter(Boolean);
+    let currentPath = "";
+
+    for (const segment of segments) {
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+      if (await adapter.exists(currentPath)) {
+        continue;
+      }
+
+      await adapter.mkdir(currentPath);
+    }
+  }
+
+  private async trimPersistentLogFileIfNeeded(logFilePath: string): Promise<void> {
+    const stat = await this.app.vault.adapter.stat(logFilePath);
+    if (!stat || stat.size <= RolayPlugin.MAX_LOG_FILE_BYTES) {
+      return;
+    }
+
+    const fileContents = await this.app.vault.adapter.read(logFilePath);
+    const keptTail = fileContents.slice(-Math.floor(RolayPlugin.MAX_LOG_FILE_BYTES / 2));
+    const trimmedContents = `... trimmed older Rolay log lines ...\n${keptTail}`;
+    await this.app.vault.adapter.write(logFilePath, trimmedContents);
   }
 
   private requireAdmin(): void {
@@ -1318,7 +1442,16 @@ export default class RolayPlugin extends Plugin {
       treeStore: new TreeStore(),
       eventStream: null,
       streamStatus: "stopped",
-      snapshotRefreshHandle: null
+      snapshotRefreshHandle: null,
+      markdownBootstrap: {
+        status: "idle",
+        totalTargets: 0,
+        completedTargets: 0,
+        lastRunAt: null,
+        lastError: null,
+        rerunRequested: false,
+        runToken: 0
+      }
     };
     this.roomRuntime.set(workspaceId, runtime);
     return runtime;
@@ -1326,6 +1459,14 @@ export default class RolayPlugin extends Plugin {
 
   private getRoomStore(workspaceId: string): TreeStore | null {
     return this.roomRuntime.get(workspaceId)?.treeStore ?? null;
+  }
+
+  private optimisticUpsertRoomEntry(workspaceId: string, entry: FileEntry): void {
+    this.getRoomStore(workspaceId)?.upsertEntry(entry);
+  }
+
+  private optimisticDeleteRoomEntry(workspaceId: string, entryId: string): void {
+    this.getRoomStore(workspaceId)?.markEntryDeleted(entryId);
   }
 
   private async saveRoomBinding(
@@ -1398,6 +1539,7 @@ export default class RolayPlugin extends Plugin {
 
     this.roomRuntime.delete(workspaceId);
     this.roomInvites.delete(workspaceId);
+    this.clearPendingMarkdownCreatesForWorkspace(workspaceId);
 
     const binding = this.getStoredRoomBinding(workspaceId);
     if (binding?.downloaded) {
@@ -1512,6 +1654,109 @@ export default class RolayPlugin extends Plugin {
     this.clearAdminRoomMemberDraft();
   }
 
+  private getPendingMarkdownCreatesForWorkspace(workspaceId: string): RolayPendingMarkdownCreateEntry[] {
+    return Object.values(this.data.pendingMarkdownCreates)
+      .filter((entry) => entry.workspaceId === workspaceId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  }
+
+  private handlePendingMarkdownCreateRename(oldPath: string, newPath: string): void {
+    const normalizedOldPath = normalizePath(oldPath);
+    const normalizedNewPath = normalizePath(newPath);
+    const pendingCreate = this.data.pendingMarkdownCreates[normalizedOldPath];
+    if (!pendingCreate) {
+      return;
+    }
+
+    delete this.data.pendingMarkdownCreates[normalizedOldPath];
+    const nextServerPath = this.resolvePendingMarkdownServerPath(
+      pendingCreate.workspaceId,
+      normalizedNewPath,
+      pendingCreate.serverPath
+    );
+
+    if (!nextServerPath) {
+      this.schedulePersist();
+      this.recordLog(
+        "ops",
+        `[${pendingCreate.workspaceId}] Cleared pending markdown create for ${normalizedOldPath} because it moved outside the downloaded room.`
+      );
+      return;
+    }
+
+    this.data.pendingMarkdownCreates[normalizedNewPath] = {
+      ...pendingCreate,
+      localPath: normalizedNewPath,
+      serverPath: nextServerPath
+    };
+    this.schedulePersist();
+  }
+
+  private clearPendingMarkdownCreate(localPath: string): void {
+    const normalizedLocalPath = normalizePath(localPath);
+    if (!(normalizedLocalPath in this.data.pendingMarkdownCreates)) {
+      return;
+    }
+
+    delete this.data.pendingMarkdownCreates[normalizedLocalPath];
+    this.schedulePersist();
+  }
+
+  private clearPendingMarkdownCreatesForWorkspace(workspaceId: string): void {
+    let changed = false;
+    for (const [localPath, pendingCreate] of Object.entries(this.data.pendingMarkdownCreates)) {
+      if (pendingCreate.workspaceId !== workspaceId) {
+        continue;
+      }
+
+      delete this.data.pendingMarkdownCreates[localPath];
+      changed = true;
+    }
+
+    if (changed) {
+      this.schedulePersist();
+    }
+  }
+
+  private async rememberPendingMarkdownCreate(
+    workspaceId: string,
+    localPath: string,
+    serverPath: string,
+    error: unknown
+  ): Promise<void> {
+    const normalizedLocalPath = normalizePath(localPath);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const existing = this.data.pendingMarkdownCreates[normalizedLocalPath];
+    this.data.pendingMarkdownCreates[normalizedLocalPath] = {
+      workspaceId,
+      localPath: normalizedLocalPath,
+      serverPath,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      lastAttemptAt: new Date().toISOString(),
+      lastError: errorMessage
+    };
+    this.schedulePersist();
+
+    this.recordLog(
+      "ops",
+      `[${workspaceId}] Keeping local markdown create for ${serverPath} pending until the next successful room refresh/connect: ${errorMessage}`,
+      "error"
+    );
+  }
+
+  private resolvePendingMarkdownServerPath(
+    workspaceId: string,
+    localPath: string,
+    fallbackServerPath: string
+  ): string | null {
+    const folderName = this.getDownloadedFolderName(workspaceId);
+    if (!folderName) {
+      return fallbackServerPath;
+    }
+
+    return toServerPathForRoom(localPath, this.data.settings.syncRoot, folderName) ?? null;
+  }
+
   private resolveEntryByLocalPath(localPath: string): FileEntry | null {
     const downloadedRooms = this.getDownloadedRooms().sort((left, right) => right.folderName.length - left.folderName.length);
 
@@ -1530,9 +1775,18 @@ export default class RolayPlugin extends Plugin {
     return null;
   }
 
+  private hasPersistedCrdtCache(entryId: string): boolean {
+    return Boolean(this.findPersistedCrdtCacheEntry(entryId));
+  }
+
+  private findPersistedCrdtCacheEntry(entryId: string): RolayCrdtCacheEntry | null {
+    const cacheKey = this.getCrdtCacheKey(entryId);
+    return this.data.crdtCache.entries[cacheKey] ?? this.data.crdtCache.entries[entryId] ?? null;
+  }
+
   private getPersistedCrdtState(entryId: string): Uint8Array | null {
     const cacheKey = this.getCrdtCacheKey(entryId);
-    const cached = this.data.crdtCache.entries[cacheKey] ?? this.data.crdtCache.entries[entryId];
+    const cached = this.findPersistedCrdtCacheEntry(entryId);
     if (!cached) {
       return null;
     }
@@ -1582,6 +1836,147 @@ export default class RolayPlugin extends Plugin {
   private getCrdtCacheKey(entryId: string): string {
     const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl);
     return normalizedServerUrl ? `${normalizedServerUrl}::${entryId}` : entryId;
+  }
+
+  private formatRoomCrdtCacheLabel(
+    bootstrap: RoomMarkdownBootstrapState | undefined,
+    markdownEntryCount: number,
+    cachedMarkdownCount: number
+  ): string {
+    if (markdownEntryCount === 0) {
+      return "no markdown files yet";
+    }
+
+    if (!bootstrap || bootstrap.status === "idle") {
+      return `${cachedMarkdownCount}/${markdownEntryCount} cached`;
+    }
+
+    if (bootstrap.status === "loading") {
+      return `bootstrapping ${cachedMarkdownCount}/${markdownEntryCount} cached (${bootstrap.completedTargets}/${bootstrap.totalTargets} stored)`;
+    }
+
+    if (bootstrap.status === "error") {
+      return `partial ${cachedMarkdownCount}/${markdownEntryCount} cached (${bootstrap.lastError ?? "bootstrap error"})`;
+    }
+
+    return `${cachedMarkdownCount}/${markdownEntryCount} cached`;
+  }
+
+  private cancelRoomMarkdownBootstrap(workspaceId: string): void {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+
+    runtime.markdownBootstrap.runToken += 1;
+    runtime.markdownBootstrap.rerunRequested = false;
+    runtime.markdownBootstrap.status = "idle";
+    runtime.markdownBootstrap.totalTargets = 0;
+    runtime.markdownBootstrap.completedTargets = 0;
+    runtime.markdownBootstrap.lastError = null;
+  }
+
+  private async bootstrapRoomMarkdownCache(
+    workspaceId: string,
+    entries: FileEntry[],
+    reason: string
+  ): Promise<void> {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+
+    const markdownEntries = entries.filter((entry) => !entry.deleted && entry.kind === "markdown");
+    const uncachedEntries = markdownEntries.filter((entry) => !this.hasPersistedCrdtCache(entry.id));
+
+    if (runtime.markdownBootstrap.status === "loading") {
+      runtime.markdownBootstrap.rerunRequested = true;
+      return;
+    }
+
+    runtime.markdownBootstrap.runToken += 1;
+    const runToken = runtime.markdownBootstrap.runToken;
+    runtime.markdownBootstrap.rerunRequested = false;
+    runtime.markdownBootstrap.totalTargets = uncachedEntries.length;
+    runtime.markdownBootstrap.completedTargets = 0;
+    runtime.markdownBootstrap.lastRunAt = new Date().toISOString();
+    runtime.markdownBootstrap.lastError = null;
+    runtime.markdownBootstrap.status = uncachedEntries.length > 0 ? "loading" : "ready";
+    this.updateStatusBar();
+
+    if (uncachedEntries.length === 0) {
+      return;
+    }
+
+    this.recordLog(
+      "crdt",
+      `[${workspaceId}] Bootstrapping CRDT cache for ${uncachedEntries.length} markdown document(s) via HTTP (${reason}).`
+    );
+
+    try {
+      const response = await this.apiClient.getWorkspaceMarkdownBootstrap(workspaceId, {
+        entryIds: uncachedEntries.map((entry) => entry.id)
+      });
+      if (runtime.markdownBootstrap.runToken !== runToken) {
+        return;
+      }
+
+      if (response.encoding !== "base64") {
+        throw new Error(`Unsupported markdown bootstrap encoding: ${response.encoding}`);
+      }
+
+      const responseByEntryId = new Map(response.documents.map((document) => [document.entryId, document]));
+      for (const entry of uncachedEntries) {
+        const document = responseByEntryId.get(entry.id);
+        if (!document) {
+          continue;
+        }
+
+        const normalizedState = normalizeBootstrapState(document.state);
+        const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
+        this.persistCrdtState(entry.id, localPath, normalizedState);
+        runtime.markdownBootstrap.completedTargets += 1;
+      }
+
+      const missingEntryCount = uncachedEntries.length - runtime.markdownBootstrap.completedTargets;
+      runtime.markdownBootstrap.lastError = missingEntryCount > 0
+        ? `server returned ${response.documents.length}/${uncachedEntries.length} bootstrap document(s)`
+        : null;
+      runtime.markdownBootstrap.status = missingEntryCount > 0 ? "error" : "ready";
+      this.updateStatusBar();
+
+      if (missingEntryCount === 0) {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets} document(s).`
+        );
+      } else {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets}/${uncachedEntries.length} document(s).`,
+          "error"
+        );
+      }
+    } catch (error) {
+      if (runtime.markdownBootstrap.runToken !== runToken) {
+        return;
+      }
+
+      const message = error instanceof Error ? error.message : String(error);
+      runtime.markdownBootstrap.lastError = message;
+      runtime.markdownBootstrap.status = "error";
+      this.recordLog(
+        "crdt",
+        `[${workspaceId}] HTTP markdown bootstrap failed: ${message}`,
+        "error"
+      );
+      this.updateStatusBar();
+    }
+
+    if (runtime.markdownBootstrap.rerunRequested) {
+      runtime.markdownBootstrap.rerunRequested = false;
+      await this.bootstrapRoomMarkdownCache(workspaceId, runtime.treeStore.getEntries(), "rerun");
+    }
   }
 
   private isLiveSyncEnabledForLocalPath(localPath: string): boolean {
@@ -1657,7 +2052,7 @@ export default class RolayPlugin extends Plugin {
   }
 
   private async queueCreateFolder(workspaceId: string, path: string): Promise<void> {
-    await this.operationsQueue.enqueue(
+    const response = await this.operationsQueue.enqueue(
       workspaceId,
       {
         type: "create_folder",
@@ -1665,6 +2060,11 @@ export default class RolayPlugin extends Plugin {
       },
       `local folder create ${path}`
     );
+
+    const createdEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+    if (createdEntry) {
+      this.optimisticUpsertRoomEntry(workspaceId, createdEntry);
+    }
   }
 
   private async queueCreateMarkdown(
@@ -1672,38 +2072,218 @@ export default class RolayPlugin extends Plugin {
     path: string,
     localContent = ""
   ): Promise<void> {
-    const response = await this.operationsQueue.enqueue(
+    const localPath = this.fileBridge.toLocalPath(workspaceId, path) ?? path;
+    await this.syncMarkdownCreate(workspaceId, path, localPath, localContent, 0);
+  }
+
+  private async syncMarkdownCreate(
+    workspaceId: string,
+    path: string,
+    localPath: string,
+    localContent = "",
+    conflictDepth = 0
+  ): Promise<void> {
+    try {
+      const response = await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type: "create_markdown",
+          path
+        },
+        `local markdown create ${path}`
+      );
+      const appliedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+      if (appliedEntry) {
+        this.optimisticUpsertRoomEntry(workspaceId, appliedEntry);
+      }
+      this.clearPendingMarkdownCreate(localPath);
+      this.recordLog(
+        "ops",
+        `[${workspaceId}] Markdown entry created for ${path}. Existing local text will be pushed into the remote CRDT doc when possible.`
+      );
+
+      let createdEntry = appliedEntry;
+      if (!createdEntry) {
+        await this.refreshRoomSnapshot(workspaceId, "markdown-create-seed");
+        createdEntry = this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null;
+      }
+
+      if (!createdEntry || createdEntry.kind !== "markdown") {
+        return;
+      }
+
+      const currentLocalContent = await this.readLocalMarkdownContent(localPath, localContent);
+      if (!currentLocalContent) {
+        return;
+      }
+
+      try {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (
+          activeFile?.path === localPath &&
+          this.isLiveSyncEnabledForLocalPath(localPath)
+        ) {
+          await this.bindActiveMarkdownToCrdt();
+          const activeCrdtState = this.crdtManager.getState();
+          if (activeCrdtState?.entryId === createdEntry.id) {
+            this.recordLog(
+              "crdt",
+              `[${workspaceId}] Skipped one-shot markdown seed for ${path} because the live CRDT session is already attached.`
+            );
+            return;
+          }
+        }
+
+        await this.crdtManager.seedRemoteMarkdown(createdEntry, currentLocalContent, path);
+        this.scheduleSnapshotRefresh(workspaceId, "markdown-seed");
+      } catch (error) {
+        this.handleError(`Remote markdown seed failed for ${path}`, error, false);
+      }
+    } catch (error) {
+      if (
+        error instanceof RolayOperationError &&
+        error.result.status === "conflict" &&
+        error.result.reason === "path_already_exists"
+      ) {
+        await this.resolveMarkdownCreatePathConflict(
+          workspaceId,
+          path,
+          localPath,
+          localContent,
+          error.result.suggestedPath,
+          conflictDepth
+        );
+        return;
+      }
+
+      await this.rememberPendingMarkdownCreate(workspaceId, localPath, path, error);
+      throw error;
+    }
+  }
+
+  private async resolveMarkdownCreatePathConflict(
+    workspaceId: string,
+    originalServerPath: string,
+    originalLocalPath: string,
+    fallbackLocalContent: string,
+    suggestedPath: string | undefined,
+    conflictDepth: number
+  ): Promise<void> {
+    if (conflictDepth >= 8) {
+      throw new Error(`Too many markdown rename retries for ${originalServerPath}.`);
+    }
+
+    const localFile = this.app.vault.getAbstractFileByPath(originalLocalPath);
+    if (!(localFile instanceof TFile) || localFile.extension !== "md") {
+      this.clearPendingMarkdownCreate(originalLocalPath);
+      this.recordLog(
+        "ops",
+        `[${workspaceId}] Dropped conflicting local markdown create for ${originalServerPath} because the local file is gone.`,
+        "error"
+      );
+      return;
+    }
+
+    const replacementServerPath = this.findAvailableMarkdownConflictPath(
       workspaceId,
-      {
-        type: "create_markdown",
-        path
-      },
-      `local markdown create ${path}`
+      suggestedPath?.trim() || originalServerPath
     );
+    const replacementLocalPath = this.fileBridge.toLocalPath(workspaceId, replacementServerPath) ?? replacementServerPath;
+    if (replacementLocalPath === originalLocalPath) {
+      throw new Error(`No available fallback markdown path for ${originalServerPath}.`);
+    }
+
+    await this.fileBridge.runWithSuppressedPaths([originalLocalPath, replacementLocalPath], async () => {
+      await this.app.fileManager.renameFile(localFile, replacementLocalPath);
+    });
+
+    const conflictMessage =
+      `[${workspaceId}] Local markdown ${originalServerPath} conflicted with an existing server path. ` +
+      `Renamed local file to ${replacementServerPath} so both copies survive.`;
+    this.recordLog("ops", conflictMessage, "error");
+    new Notice(`Rolay kept your offline note as ${replacementServerPath}.`);
+
+    const latestLocalContent = await this.readLocalMarkdownContent(replacementLocalPath, fallbackLocalContent);
+    await this.rememberPendingMarkdownCreate(
+      workspaceId,
+      replacementLocalPath,
+      replacementServerPath,
+      new Error(conflictMessage)
+    );
+    await this.syncMarkdownCreate(
+      workspaceId,
+      replacementServerPath,
+      replacementLocalPath,
+      latestLocalContent,
+      conflictDepth + 1
+    );
+  }
+
+  private async reconcilePendingMarkdownCreates(
+    workspaceId: string,
+    reason: string
+  ): Promise<void> {
+    const pendingCreates = this.getPendingMarkdownCreatesForWorkspace(workspaceId);
+    if (pendingCreates.length === 0) {
+      return;
+    }
+
     this.recordLog(
       "ops",
-      `[${workspaceId}] Markdown entry created for ${path}. Existing local text will be pushed into the remote CRDT doc when possible.`
+      `[${workspaceId}] Replaying ${pendingCreates.length} pending local markdown create(s) after ${reason}.`
     );
 
-    if (!localContent) {
-      return;
-    }
+    for (const pendingCreate of pendingCreates) {
+      const currentFile = this.app.vault.getAbstractFileByPath(pendingCreate.localPath);
+      if (!(currentFile instanceof TFile) || currentFile.extension !== "md") {
+        this.clearPendingMarkdownCreate(pendingCreate.localPath);
+        this.recordLog(
+          "ops",
+          `[${workspaceId}] Cleared pending markdown create for ${pendingCreate.localPath} because the local file no longer exists.`
+        );
+        continue;
+      }
 
-    let createdEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
-    if (!createdEntry) {
-      await this.refreshRoomSnapshot(workspaceId, "markdown-create-seed");
-      createdEntry = this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null;
-    }
+      const currentServerPath = toServerPathForRoom(
+        pendingCreate.localPath,
+        this.data.settings.syncRoot,
+        this.getDownloadedFolderName(workspaceId)
+      );
+      if (currentServerPath === null) {
+        this.clearPendingMarkdownCreate(pendingCreate.localPath);
+        this.recordLog(
+          "ops",
+          `[${workspaceId}] Cleared pending markdown create for ${pendingCreate.localPath} because it is no longer inside the room root.`
+        );
+        continue;
+      }
 
-    if (!createdEntry || createdEntry.kind !== "markdown") {
-      return;
-    }
+      const remoteEntry = this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
+      if (remoteEntry) {
+        const currentLocalContent = await this.readLocalMarkdownContent(pendingCreate.localPath, "");
+        await this.resolveMarkdownCreatePathConflict(
+          workspaceId,
+          currentServerPath,
+          pendingCreate.localPath,
+          currentLocalContent,
+          undefined,
+          0
+        );
+        continue;
+      }
 
-    try {
-      await this.crdtManager.seedRemoteMarkdown(createdEntry, localContent, path);
-      this.scheduleSnapshotRefresh(workspaceId, "markdown-seed");
-    } catch (error) {
-      this.handleError(`Remote markdown seed failed for ${path}`, error, false);
+      try {
+        const currentLocalContent = await this.readLocalMarkdownContent(pendingCreate.localPath, "");
+        await this.syncMarkdownCreate(
+          workspaceId,
+          currentServerPath,
+          pendingCreate.localPath,
+          currentLocalContent,
+          0
+        );
+      } catch {
+        // Keep the pending create registered for the next room refresh/connect.
+      }
     }
   }
 
@@ -1713,7 +2293,7 @@ export default class RolayPlugin extends Plugin {
     newPath: string,
     type: "rename_entry" | "move_entry"
   ): Promise<void> {
-    await this.operationsQueue.enqueue(
+    const response = await this.operationsQueue.enqueue(
       workspaceId,
       {
         type,
@@ -1726,10 +2306,18 @@ export default class RolayPlugin extends Plugin {
       },
       `${type} ${entry.path} -> ${newPath}`
     );
+
+    const updatedEntry =
+      response.results.find((result) => result.status === "applied")?.entry ??
+      {
+        ...entry,
+        path: newPath
+      };
+    this.optimisticUpsertRoomEntry(workspaceId, updatedEntry);
   }
 
   private async queueDeleteEntry(workspaceId: string, entry: FileEntry): Promise<void> {
-    await this.operationsQueue.enqueue(
+    const response = await this.operationsQueue.enqueue(
       workspaceId,
       {
         type: "delete_entry",
@@ -1741,6 +2329,62 @@ export default class RolayPlugin extends Plugin {
       },
       `delete ${entry.path}`
     );
+
+    const deletedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+    if (deletedEntry) {
+      this.optimisticUpsertRoomEntry(workspaceId, deletedEntry);
+      return;
+    }
+
+    this.optimisticDeleteRoomEntry(workspaceId, entry.id);
+  }
+
+  private findAvailableMarkdownConflictPath(workspaceId: string, desiredServerPath: string): string {
+    const normalizedDesiredPath = desiredServerPath.replace(/\\/g, "/");
+    const directoryPath = getParentPath(normalizedDesiredPath);
+    const fileName = getFileName(normalizedDesiredPath);
+    const extension = getFileExtension(fileName);
+    const stem = extension ? fileName.slice(0, -(extension.length + 1)) : fileName;
+
+    const candidates = [normalizedDesiredPath];
+    for (let index = 1; index <= 999; index += 1) {
+      const candidateFileName = extension ? `${stem}(${index}).${extension}` : `${stem}(${index})`;
+      candidates.push(directoryPath ? `${directoryPath}/${candidateFileName}` : candidateFileName);
+    }
+
+    for (const candidatePath of candidates) {
+      const remoteExists = Boolean(this.getRoomStore(workspaceId)?.getEntryByPath(candidatePath));
+      if (remoteExists) {
+        continue;
+      }
+
+      const candidateLocalPath = this.fileBridge.toLocalPath(workspaceId, candidatePath) ?? candidatePath;
+      if (this.app.vault.getAbstractFileByPath(candidateLocalPath)) {
+        continue;
+      }
+
+      return candidatePath;
+    }
+
+    throw new Error(`No free conflict-safe path is available for ${desiredServerPath}.`);
+  }
+
+  private async readLocalMarkdownContent(localPath: string, fallback = ""): Promise<string> {
+    const localFile = this.app.vault.getAbstractFileByPath(localPath);
+    if (!(localFile instanceof TFile) || localFile.extension !== "md") {
+      return fallback;
+    }
+
+    try {
+      return await this.app.vault.cachedRead(localFile);
+    } catch (error) {
+      this.recordLog(
+        "bridge",
+        `Failed to read local markdown content for ${localPath}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+      return fallback;
+    }
   }
 }
 
@@ -1761,6 +2405,42 @@ function compareRoomMembers(left: RoomMember, right: RoomMember): number {
   return left.user.username.localeCompare(right.user.username);
 }
 
+function normalizeBootstrapState(encodedState: string): Uint8Array {
+  const decodedState = decodeBase64(encodedState);
+  const yDocument = new Y.Doc();
+
+  try {
+    Y.applyUpdate(yDocument, decodedState, "rolay-http-bootstrap");
+    return Y.encodeStateAsUpdate(yDocument);
+  } finally {
+    yDocument.destroy();
+  }
+}
+
 function compareCrdtCacheEntries(left: RolayCrdtCacheEntry, right: RolayCrdtCacheEntry): number {
   return left.updatedAt.localeCompare(right.updatedAt);
+}
+
+function formatPersistentLogLine(entry: RolayLogEntry): string {
+  const sanitizedMessage = entry.message.replace(/\r?\n/g, " ");
+  return `[${entry.at}] ${entry.scope}/${entry.level}: ${sanitizedMessage}\n`;
+}
+
+function getFileName(path: string): string {
+  const separatorIndex = path.lastIndexOf("/");
+  return separatorIndex === -1 ? path : path.slice(separatorIndex + 1);
+}
+
+function getParentPath(path: string): string {
+  const separatorIndex = path.lastIndexOf("/");
+  return separatorIndex === -1 ? "" : path.slice(0, separatorIndex);
+}
+
+function getFileExtension(fileName: string): string {
+  const dotIndex = fileName.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === fileName.length - 1) {
+    return "";
+  }
+
+  return fileName.slice(dotIndex + 1);
 }

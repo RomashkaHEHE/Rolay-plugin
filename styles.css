@@ -26,6 +26,16 @@
   margin-top: 1rem;
 }
 
+.rolay-settings-tabs {
+  display: flex;
+  gap: 0.5rem;
+  margin: 0 0 1rem;
+}
+
+.rolay-settings-tab-button {
+  min-width: 96px;
+}
+
 .cm-editor .rolay-shared-selection {
   border-radius: 2px;
 }
@@ -33,20 +43,31 @@
 .rolay-shared-cursor {
   display: inline-block;
   cursor: default;
-  margin: 0 -4px;
-  padding: 0 4px;
   pointer-events: auto;
   position: relative;
+  vertical-align: text-bottom;
+  height: 1.35em;
   width: 0;
   z-index: 6;
 }
 
 .rolay-shared-cursor__caret {
-  border-left: 2px solid var(--rolay-presence-color);
-  bottom: -0.2em;
-  left: -1px;
+  height: 1.35em;
+  left: 0;
   position: absolute;
-  top: -0.2em;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 10px;
+}
+
+.rolay-shared-cursor__caret::before {
+  border-left: 2px solid var(--rolay-presence-color);
+  bottom: 0;
+  content: "";
+  left: 50%;
+  position: absolute;
+  top: 0;
+  transform: translateX(-50%);
 }
 
 .rolay-shared-cursor__label {
@@ -55,15 +76,15 @@
   color: white;
   font-size: 0.72em;
   font-weight: 600;
-  left: 0;
+  left: 6px;
   line-height: 1;
   opacity: 0;
   padding: 2px 6px;
   pointer-events: none;
   position: absolute;
-  top: -0.3em;
-  transform: translateY(calc(-100% - 2px)) scale(0.96);
-  transform-origin: left bottom;
+  top: 50%;
+  transform: translateY(calc(-100% - 0.7em)) scale(0.96);
+  transform-origin: left center;
   transition: opacity 120ms ease, transform 120ms ease, visibility 120ms ease;
   visibility: hidden;
   white-space: nowrap;
@@ -71,6 +92,6 @@
 
 .rolay-shared-cursor:hover .rolay-shared-cursor__label {
   opacity: 1;
-  transform: translateY(calc(-100% - 4px)) scale(1);
+  transform: translateY(calc(-100% - 0.85em)) scale(1);
   visibility: visible;
 }

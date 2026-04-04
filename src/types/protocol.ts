@@ -221,6 +221,22 @@ export interface CrdtTokenResponse {
   expiresAt: string;
 }
 
+export interface MarkdownBootstrapRequest {
+  entryIds?: string[];
+}
+
+export interface MarkdownBootstrapDocument {
+  entryId: string;
+  docId: string;
+  state: string;
+}
+
+export interface MarkdownBootstrapResponse {
+  workspaceId: string;
+  encoding: "base64";
+  documents: MarkdownBootstrapDocument[];
+}
+
 export interface BlobUploadTicketRequest {
   hash: string;
   sizeBytes: number;

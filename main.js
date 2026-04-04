@@ -27,855 +27,10 @@ __export(main_exports, {
 module.exports = __toCommonJS(main_exports);
 var import_obsidian9 = require("obsidian");
 
-// src/api/client.ts
-var import_obsidian = require("obsidian");
-var RolayApiError = class extends Error {
-  constructor(status, message, code = "http_error", details) {
-    super(message);
-    this.name = "RolayApiError";
-    this.status = status;
-    this.code = code;
-    this.details = details;
-  }
-};
-var RolayApiClient = class {
-  constructor(config) {
-    this.config = config;
-  }
-  async login(request) {
-    const response = await this.requestJson(
-      "POST",
-      "/v1/auth/login",
-      request,
-      { auth: false }
-    );
-    await this.config.saveSession({
-      accessToken: response.accessToken,
-      refreshToken: response.refreshToken,
-      user: response.user,
-      authenticatedAt: (/* @__PURE__ */ new Date()).toISOString()
-    });
-    return response;
-  }
-  async refresh() {
-    const session = this.config.getSession();
-    if (!session?.refreshToken) {
-      throw new Error("No refresh token is stored yet.");
-    }
-    const body = {
-      refreshToken: session.refreshToken
-    };
-    try {
-      const response = await this.requestJson(
-        "POST",
-        "/v1/auth/refresh",
-        body,
-        { auth: false }
-      );
-      await this.config.saveSession({
-        ...session,
-        accessToken: response.accessToken,
-        refreshToken: response.refreshToken,
-        authenticatedAt: (/* @__PURE__ */ new Date()).toISOString()
-      });
-      return response;
-    } catch (error) {
-      if (error instanceof RolayApiError && error.status === 401) {
-        await this.config.saveSession(null);
-      }
-      throw error;
-    }
-  }
-  async getCurrentUser() {
-    return this.requestJson(
-      "GET",
-      "/v1/auth/me"
-    );
-  }
-  async updateCurrentUserProfile(body) {
-    return this.requestJson(
-      "PATCH",
-      "/v1/auth/me/profile",
-      body
-    );
-  }
-  async listRooms() {
-    return this.requestJson(
-      "GET",
-      "/v1/rooms"
-    );
-  }
-  async createRoom(body) {
-    return this.requestJson(
-      "POST",
-      "/v1/rooms",
-      body
-    );
-  }
-  async joinRoom(body) {
-    return this.requestJson(
-      "POST",
-      "/v1/rooms/join",
-      body
-    );
-  }
-  async getRoomInvite(workspaceId) {
-    return this.requestJson(
-      "GET",
-      `/v1/rooms/${encodeURIComponent(workspaceId)}/invite`
-    );
-  }
-  async updateRoomInviteState(workspaceId, body) {
-    return this.requestJson(
-      "PATCH",
-      `/v1/rooms/${encodeURIComponent(workspaceId)}/invite`,
-      body
-    );
-  }
-  async regenerateRoomInvite(workspaceId) {
-    return this.requestJson(
-      "POST",
-      `/v1/rooms/${encodeURIComponent(workspaceId)}/invite/regenerate`
-    );
-  }
-  async listManagedUsers() {
-    return this.requestJson(
-      "GET",
-      "/v1/admin/users"
-    );
-  }
-  async createManagedUser(body) {
-    return this.requestJson(
-      "POST",
-      "/v1/admin/users",
-      body
-    );
-  }
-  async deleteManagedUser(userId) {
-    return this.requestJson(
-      "DELETE",
-      `/v1/admin/users/${encodeURIComponent(userId)}`
-    );
-  }
-  async listAllRoomsAsAdmin() {
-    return this.requestJson(
-      "GET",
-      "/v1/admin/workspaces"
-    );
-  }
-  async listRoomMembersAsAdmin(workspaceId) {
-    return this.requestJson(
-      "GET",
-      `/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/members`
-    );
-  }
-  async addRoomMemberAsAdmin(workspaceId, body) {
-    return this.requestJson(
-      "POST",
-      `/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/members`,
-      body
-    );
-  }
-  async deleteRoomAsAdmin(workspaceId) {
-    return this.requestJson(
-      "DELETE",
-      `/v1/admin/workspaces/${encodeURIComponent(workspaceId)}`
-    );
-  }
-  async getWorkspaceTree(workspaceId) {
-    return this.requestJson(
-      "GET",
-      `/v1/workspaces/${encodeURIComponent(workspaceId)}/tree`
-    );
-  }
-  async applyBatchOperations(workspaceId, body) {
-    return this.requestJson(
-      "POST",
-      `/v1/workspaces/${encodeURIComponent(workspaceId)}/ops/batch`,
-      body
-    );
-  }
-  async createCrdtToken(entryId) {
-    return this.requestJson(
-      "POST",
-      `/v1/files/${encodeURIComponent(entryId)}/crdt-token`
-    );
-  }
-  async createBlobUploadTicket(entryId, body) {
-    return this.requestJson(
-      "POST",
-      `/v1/files/${encodeURIComponent(entryId)}/blob/upload-ticket`,
-      body
-    );
-  }
-  async createBlobDownloadTicket(entryId) {
-    return this.requestJson(
-      "POST",
-      `/v1/files/${encodeURIComponent(entryId)}/blob/download-ticket`
-    );
-  }
-  async fetchAuthorizedStream(path, init = {}) {
-    const initialToken = await this.getAccessToken();
-    let response = await this.fetchStream(path, initialToken, init);
-    if (response.status === 401) {
-      await this.refresh();
-      const nextToken = await this.getAccessToken();
-      response = await this.fetchStream(path, nextToken, init);
-    }
-    if (!response.ok) {
-      throw await this.createFetchError(response);
-    }
-    return response;
-  }
-  buildAbsoluteUrl(path) {
-    return this.buildUrl(path);
-  }
-  async getValidAccessToken() {
-    return this.getAccessToken();
-  }
-  async requestJson(method, path, body, options = {}) {
-    const auth = options.auth !== false;
-    const response = auth ? await this.requestWithRefresh(method, path, body) : await this.performRequest(method, path, body, void 0);
-    if (response.status >= 400) {
-      throw createRequestUrlError(response);
-    }
-    return response.json;
-  }
-  async requestWithRefresh(method, path, body) {
-    const initialToken = await this.getAccessToken();
-    let response = await this.performRequest(method, path, body, initialToken);
-    if (response.status === 401) {
-      await this.refresh();
-      const nextToken = await this.getAccessToken();
-      response = await this.performRequest(method, path, body, nextToken);
-    }
-    if (response.status >= 400) {
-      throw createRequestUrlError(response);
-    }
-    return response;
-  }
-  async performRequest(method, path, body, accessToken) {
-    const headers = {
-      Accept: "application/json"
-    };
-    if (accessToken) {
-      headers.Authorization = `Bearer ${accessToken}`;
-    }
-    return (0, import_obsidian.requestUrl)({
-      url: this.buildUrl(path),
-      method,
-      headers,
-      contentType: body === void 0 ? void 0 : "application/json",
-      body: body === void 0 ? void 0 : JSON.stringify(body),
-      throw: false
-    });
-  }
-  async getAccessToken() {
-    const session = this.config.getSession();
-    if (session?.accessToken) {
-      return session.accessToken;
-    }
-    if (session?.refreshToken) {
-      const response = await this.refresh();
-      return response.accessToken;
-    }
-    throw new Error("You are not authenticated yet.");
-  }
-  buildUrl(path) {
-    const baseUrl = this.config.getServerUrl().trim().replace(/\/+$/, "");
-    if (!baseUrl) {
-      throw new Error("Server URL is empty.");
-    }
-    return `${baseUrl}${path}`;
-  }
-  async fetchStream(path, accessToken, init) {
-    const headers = new Headers(init.headers ?? {});
-    headers.set("Accept", "text/event-stream");
-    headers.set("Authorization", `Bearer ${accessToken}`);
-    return fetch(this.buildUrl(path), {
-      ...init,
-      headers
-    });
-  }
-  async createFetchError(response) {
-    const fallbackMessage = `HTTP ${response.status}`;
-    const responseText = await response.text();
-    return createTextError(response.status, responseText, fallbackMessage);
-  }
-};
-function createRequestUrlError(response) {
-  return createTextError(response.status, response.text, `HTTP ${response.status}`);
-}
-function createTextError(status, responseText, fallbackMessage) {
-  try {
-    const parsed = JSON.parse(responseText);
-    if (parsed?.error?.message) {
-      return new RolayApiError(
-        status,
-        parsed.error.message,
-        parsed.error.code,
-        parsed.error.details
-      );
-    }
-  } catch {
-  }
-  return new RolayApiError(status, responseText || fallbackMessage);
-}
-
-// src/obsidian/file-bridge.ts
-var import_obsidian3 = require("obsidian");
-
-// src/sync/path-mapper.ts
-var import_obsidian2 = require("obsidian");
-function normalizeSyncRoot(syncRoot) {
-  const trimmed = syncRoot.trim();
-  if (!trimmed) {
-    return "";
-  }
-  return (0, import_obsidian2.normalizePath)(trimmed);
-}
-function normalizeRoomFolderName(folderName) {
-  return folderName.trim();
-}
-function isValidRoomFolderName(folderName) {
-  const normalized = normalizeRoomFolderName(folderName);
-  return Boolean(normalized) && !/[\\/]/.test(normalized);
-}
-function getRoomRoot(syncRoot, folderName) {
-  const normalizedSyncRoot = normalizeSyncRoot(syncRoot);
-  const normalizedFolderName = normalizeRoomFolderName(folderName ?? "");
-  if (!normalizedFolderName) {
-    return normalizedSyncRoot;
-  }
-  if (!normalizedSyncRoot) {
-    return normalizedFolderName;
-  }
-  return (0, import_obsidian2.normalizePath)(`${normalizedSyncRoot}/${normalizedFolderName}`);
-}
-function toLocalPathForRoom(syncRoot, folderName, serverPath) {
-  const roomRoot = getRoomRoot(syncRoot, folderName);
-  const normalizedServerPath = (0, import_obsidian2.normalizePath)(serverPath);
-  if (!roomRoot) {
-    return normalizedServerPath;
-  }
-  if (!normalizedServerPath) {
-    return roomRoot;
-  }
-  return (0, import_obsidian2.normalizePath)(`${roomRoot}/${normalizedServerPath}`);
-}
-function toServerPathForRoom(localPath, syncRoot, folderName) {
-  const normalizedLocalPath = (0, import_obsidian2.normalizePath)(localPath);
-  const roomRoot = getRoomRoot(syncRoot, folderName);
-  if (!roomRoot) {
-    return normalizedLocalPath;
-  }
-  if (normalizedLocalPath === roomRoot) {
-    return "";
-  }
-  if (!normalizedLocalPath.startsWith(`${roomRoot}/`)) {
-    return null;
-  }
-  return normalizedLocalPath.slice(roomRoot.length + 1);
-}
-function isManagedPathForRoom(localPath, syncRoot, folderName) {
-  const normalizedLocalPath = (0, import_obsidian2.normalizePath)(localPath);
-  const roomRoot = getRoomRoot(syncRoot, folderName);
-  if (!roomRoot) {
-    return true;
-  }
-  return normalizedLocalPath === roomRoot || normalizedLocalPath.startsWith(`${roomRoot}/`);
-}
-
-// src/obsidian/file-bridge.ts
-var FileBridge = class {
-  constructor(config) {
-    this.suppressedPrefixes = /* @__PURE__ */ new Map();
-    this.app = config.app;
-    this.getSyncRoot = config.getSyncRoot;
-    this.getFolderName = config.getFolderName;
-    this.getDownloadedRooms = config.getDownloadedRooms;
-    this.getEntryByPath = config.getEntryByPath;
-    this.log = config.log;
-    this.onCreateFolder = config.onCreateFolder;
-    this.onCreateMarkdown = config.onCreateMarkdown;
-    this.onRenameOrMove = config.onRenameOrMove;
-    this.onDeleteEntry = config.onDeleteEntry;
-  }
-  async applySnapshot(snapshot, previousEntries) {
-    const folderName = this.getFolderName(snapshot.workspace.id);
-    if (!folderName) {
-      return;
-    }
-    const roomRoot = this.getRoomRoot(folderName);
-    if (roomRoot) {
-      await this.ensureFolderExists(roomRoot);
-    }
-    const previousById = new Map(previousEntries.map((entry) => [entry.id, entry]));
-    const nextById = new Map(snapshot.entries.map((entry) => [entry.id, entry]));
-    const renamedEntries = snapshot.entries.filter((entry) => !entry.deleted).filter((entry) => {
-      const previous = previousById.get(entry.id);
-      return previous && previous.path !== entry.path;
-    });
-    for (const entry of renamedEntries) {
-      const previous = previousById.get(entry.id);
-      if (previous) {
-        await this.safeApply(`rename local ${previous.path} -> ${entry.path}`, async () => {
-          await this.renameLocalPath(folderName, previous.path, entry.path);
-        });
-      }
-    }
-    const activeEntries = snapshot.entries.filter((entry) => !entry.deleted).sort(compareEntriesForMaterialization);
-    for (const entry of activeEntries) {
-      await this.safeApply(`materialize ${entry.path}`, async () => {
-        await this.ensureLocalEntry(folderName, entry);
-      });
-    }
-    const deletedEntries = previousEntries.filter((previous) => {
-      const next = nextById.get(previous.id);
-      return !next || next.deleted;
-    });
-    for (const entry of deletedEntries.sort(compareEntriesForDeletion)) {
-      await this.safeApply(`trash ${entry.path}`, async () => {
-        await this.trashLocalEntry(folderName, entry.path);
-      });
-    }
-  }
-  async handleVaultCreate(file) {
-    const resolved = this.resolveRoomPath(file.path);
-    if (!resolved || this.isSuppressedPath(file.path)) {
-      return;
-    }
-    if (this.getEntryByPath(resolved.workspaceId, resolved.serverPath)) {
-      return;
-    }
-    if (file instanceof import_obsidian3.TFolder) {
-      await this.onCreateFolder(resolved.workspaceId, resolved.serverPath);
-      return;
-    }
-    if (file instanceof import_obsidian3.TFile && file.extension === "md") {
-      await this.onCreateMarkdown(
-        resolved.workspaceId,
-        resolved.serverPath,
-        await this.readMarkdownFile(file)
-      );
-      return;
-    }
-    this.log(`Ignoring unsupported local create for ${file.path}. Blob upload is not implemented yet.`);
-  }
-  async handleVaultRename(file, oldPath) {
-    if (this.isSuppressedPath(oldPath) || this.isSuppressedPath(file.path)) {
-      return;
-    }
-    const oldResolved = this.resolveRoomPath(oldPath);
-    const newResolved = this.resolveRoomPath(file.path);
-    if (!oldResolved && !newResolved) {
-      return;
-    }
-    if (!oldResolved && newResolved) {
-      await this.handleVaultCreate(file);
-      return;
-    }
-    if (oldResolved && !newResolved) {
-      const entry2 = this.getEntryByPath(oldResolved.workspaceId, oldResolved.serverPath);
-      if (!entry2) {
-        return;
-      }
-      await this.onDeleteEntry(oldResolved.workspaceId, entry2);
-      return;
-    }
-    if (!oldResolved || !newResolved) {
-      return;
-    }
-    if (oldResolved.workspaceId !== newResolved.workspaceId) {
-      this.log(`Managed path ${oldPath} was moved across room roots. Cross-room moves are not supported.`);
-      return;
-    }
-    const entry = this.getEntryByPath(oldResolved.workspaceId, oldResolved.serverPath);
-    if (!entry) {
-      return;
-    }
-    const type = getParentPath(oldResolved.serverPath) === getParentPath(newResolved.serverPath) ? "rename_entry" : "move_entry";
-    await this.onRenameOrMove(oldResolved.workspaceId, entry, newResolved.serverPath, type);
-  }
-  async handleVaultDelete(file) {
-    const resolved = this.resolveRoomPath(file.path);
-    if (!resolved || this.isSuppressedPath(file.path)) {
-      return;
-    }
-    const roomRoot = this.getRoomRoot(resolved.folderName);
-    if (!this.app.vault.getAbstractFileByPath(roomRoot)) {
-      this.log(`Skipping remote delete for ${file.path} because the local room root is no longer installed.`);
-      return;
-    }
-    const entry = this.getEntryByPath(resolved.workspaceId, resolved.serverPath);
-    if (!entry) {
-      return;
-    }
-    await this.onDeleteEntry(resolved.workspaceId, entry);
-  }
-  toLocalPath(workspaceId, serverPath) {
-    const folderName = this.getFolderName(workspaceId);
-    if (!folderName) {
-      return null;
-    }
-    return toLocalPathForRoom(this.getSyncRoot(), folderName, serverPath);
-  }
-  resolveRoomPath(localPath) {
-    for (const room of this.getDownloadedRooms()) {
-      if (!isManagedPathForRoom(localPath, this.getSyncRoot(), room.folderName)) {
-        continue;
-      }
-      const serverPath = toServerPathForRoom(localPath, this.getSyncRoot(), room.folderName);
-      if (serverPath === null) {
-        continue;
-      }
-      return {
-        ...room,
-        serverPath
-      };
-    }
-    return null;
-  }
-  async renameLocalPath(folderName, oldServerPath, newServerPath) {
-    const oldLocalPath = toLocalPathForRoom(this.getSyncRoot(), folderName, oldServerPath);
-    const newLocalPath = toLocalPathForRoom(this.getSyncRoot(), folderName, newServerPath);
-    if (oldLocalPath === newLocalPath) {
-      return;
-    }
-    const existing = this.app.vault.getAbstractFileByPath(oldLocalPath);
-    if (!existing) {
-      return;
-    }
-    const destination = this.app.vault.getAbstractFileByPath(newLocalPath);
-    if (destination && destination.path !== existing.path) {
-      this.log(`Skipped local rename to ${newLocalPath} because that path already exists.`);
-      return;
-    }
-    await this.ensureFolderExists(getParentPath(newLocalPath));
-    await this.withSuppressedPaths([oldLocalPath, newLocalPath], async () => {
-      await this.app.fileManager.renameFile(existing, newLocalPath);
-    });
-  }
-  async ensureLocalEntry(folderName, entry) {
-    const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, entry.path);
-    const existing = this.app.vault.getAbstractFileByPath(localPath);
-    if (entry.kind === "folder") {
-      await this.ensureFolderExists(localPath);
-      return;
-    }
-    await this.ensureFolderExists(getParentPath(localPath));
-    if (existing) {
-      return;
-    }
-    if (entry.kind === "markdown") {
-      await this.withSuppressedPaths([localPath], async () => {
-        await this.app.vault.create(localPath, "");
-      });
-      return;
-    }
-    this.log(`Skipping binary materialization for ${entry.path} until blob download is implemented.`);
-  }
-  async trashLocalEntry(folderName, serverPath) {
-    const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, serverPath);
-    const existing = this.app.vault.getAbstractFileByPath(localPath);
-    if (!existing) {
-      return;
-    }
-    await this.withSuppressedPaths([localPath], async () => {
-      await this.app.vault.trash(existing, false);
-    });
-  }
-  async ensureFolderExists(folderPath) {
-    const normalizedFolderPath = (0, import_obsidian3.normalizePath)(folderPath);
-    if (!normalizedFolderPath) {
-      return;
-    }
-    const segments = normalizedFolderPath.split("/");
-    let currentPath = "";
-    for (const segment of segments) {
-      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
-      const existing = this.app.vault.getAbstractFileByPath(currentPath);
-      if (existing instanceof import_obsidian3.TFolder) {
-        continue;
-      }
-      if (existing) {
-        throw new Error(`Expected folder at ${currentPath}, but a file already exists there.`);
-      }
-      await this.withSuppressedPaths([currentPath], async () => {
-        await this.app.vault.createFolder(currentPath);
-      });
-    }
-  }
-  getRoomRoot(folderName) {
-    return getRoomRoot(this.getSyncRoot(), folderName);
-  }
-  async readMarkdownFile(file) {
-    try {
-      return await this.app.vault.cachedRead(file);
-    } catch (error) {
-      this.log(`Failed to read markdown content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
-      return "";
-    }
-  }
-  isSuppressedPath(path) {
-    const normalizedPath = (0, import_obsidian3.normalizePath)(path);
-    for (const prefix of this.suppressedPrefixes.keys()) {
-      if (normalizedPath === prefix || normalizedPath.startsWith(`${prefix}/`)) {
-        return true;
-      }
-    }
-    return false;
-  }
-  async withSuppressedPaths(paths, work) {
-    const normalizedPaths = [...new Set(paths.map((path) => (0, import_obsidian3.normalizePath)(path)).filter(Boolean))];
-    for (const path of normalizedPaths) {
-      this.incrementSuppression(path);
-    }
-    try {
-      await work();
-    } finally {
-      window.setTimeout(() => {
-        for (const path of normalizedPaths) {
-          this.decrementSuppression(path);
-        }
-      }, 750);
-    }
-  }
-  async runWithSuppressedPaths(paths, work) {
-    await this.withSuppressedPaths(paths, work);
-  }
-  incrementSuppression(path) {
-    this.suppressedPrefixes.set(path, (this.suppressedPrefixes.get(path) ?? 0) + 1);
-  }
-  decrementSuppression(path) {
-    const currentCount = this.suppressedPrefixes.get(path);
-    if (!currentCount) {
-      return;
-    }
-    if (currentCount <= 1) {
-      this.suppressedPrefixes.delete(path);
-      return;
-    }
-    this.suppressedPrefixes.set(path, currentCount - 1);
-  }
-  async safeApply(label, work) {
-    try {
-      await work();
-    } catch (error) {
-      this.log(`${label} failed: ${error instanceof Error ? error.message : String(error)}`);
-    }
-  }
-};
-function getParentPath(path) {
-  const normalized = (0, import_obsidian3.normalizePath)(path);
-  const separatorIndex = normalized.lastIndexOf("/");
-  return separatorIndex === -1 ? "" : normalized.slice(0, separatorIndex);
-}
-function compareEntriesForMaterialization(left, right) {
-  if (left.kind === "folder" && right.kind !== "folder") {
-    return -1;
-  }
-  if (left.kind !== "folder" && right.kind === "folder") {
-    return 1;
-  }
-  return left.path.localeCompare(right.path);
-}
-function compareEntriesForDeletion(left, right) {
-  return right.path.length - left.path.length;
-}
-
-// node_modules/@hocuspocus/common/dist/hocuspocus-common.esm.js
-var floor = Math.floor;
-var min = (a, b) => a < b ? a : b;
-var max = (a, b) => a > b ? a : b;
-var BIT8 = 128;
-var BITS7 = 127;
-var MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
-var _encodeUtf8Polyfill = (str) => {
-  const encodedString = unescape(encodeURIComponent(str));
-  const len = encodedString.length;
-  const buf = new Uint8Array(len);
-  for (let i = 0; i < len; i++) {
-    buf[i] = /** @type {number} */
-    encodedString.codePointAt(i);
-  }
-  return buf;
-};
-var utf8TextEncoder = (
-  /** @type {TextEncoder} */
-  typeof TextEncoder !== "undefined" ? new TextEncoder() : null
-);
-var _encodeUtf8Native = (str) => utf8TextEncoder.encode(str);
-var encodeUtf8 = utf8TextEncoder ? _encodeUtf8Native : _encodeUtf8Polyfill;
-var utf8TextDecoder = typeof TextDecoder === "undefined" ? null : new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-if (utf8TextDecoder && utf8TextDecoder.decode(new Uint8Array()).length === 1) {
-  utf8TextDecoder = null;
-}
-var write = (encoder, num) => {
-  const bufferLen = encoder.cbuf.length;
-  if (encoder.cpos === bufferLen) {
-    encoder.bufs.push(encoder.cbuf);
-    encoder.cbuf = new Uint8Array(bufferLen * 2);
-    encoder.cpos = 0;
-  }
-  encoder.cbuf[encoder.cpos++] = num;
-};
-var writeVarUint = (encoder, num) => {
-  while (num > BITS7) {
-    write(encoder, BIT8 | BITS7 & num);
-    num = floor(num / 128);
-  }
-  write(encoder, BITS7 & num);
-};
-var _strBuffer = new Uint8Array(3e4);
-var _maxStrBSize = _strBuffer.length / 3;
-var _writeVarStringNative = (encoder, str) => {
-  if (str.length < _maxStrBSize) {
-    const written = utf8TextEncoder.encodeInto(str, _strBuffer).written || 0;
-    writeVarUint(encoder, written);
-    for (let i = 0; i < written; i++) {
-      write(encoder, _strBuffer[i]);
-    }
-  } else {
-    writeVarUint8Array(encoder, encodeUtf8(str));
-  }
-};
-var _writeVarStringPolyfill = (encoder, str) => {
-  const encodedString = unescape(encodeURIComponent(str));
-  const len = encodedString.length;
-  writeVarUint(encoder, len);
-  for (let i = 0; i < len; i++) {
-    write(
-      encoder,
-      /** @type {number} */
-      encodedString.codePointAt(i)
-    );
-  }
-};
-var writeVarString = utf8TextEncoder && /** @type {any} */
-utf8TextEncoder.encodeInto ? _writeVarStringNative : _writeVarStringPolyfill;
-var writeUint8Array = (encoder, uint8Array) => {
-  const bufferLen = encoder.cbuf.length;
-  const cpos = encoder.cpos;
-  const leftCopyLen = min(bufferLen - cpos, uint8Array.length);
-  const rightCopyLen = uint8Array.length - leftCopyLen;
-  encoder.cbuf.set(uint8Array.subarray(0, leftCopyLen), cpos);
-  encoder.cpos += leftCopyLen;
-  if (rightCopyLen > 0) {
-    encoder.bufs.push(encoder.cbuf);
-    encoder.cbuf = new Uint8Array(max(bufferLen * 2, rightCopyLen));
-    encoder.cbuf.set(uint8Array.subarray(leftCopyLen));
-    encoder.cpos = rightCopyLen;
-  }
-};
-var writeVarUint8Array = (encoder, uint8Array) => {
-  writeVarUint(encoder, uint8Array.byteLength);
-  writeUint8Array(encoder, uint8Array);
-};
-var create = (s) => new Error(s);
-var errorUnexpectedEndOfArray = create("Unexpected end of array");
-var errorIntegerOutOfRange = create("Integer out of Range");
-var readUint8Array = (decoder, len) => {
-  const view = new Uint8Array(decoder.arr.buffer, decoder.pos + decoder.arr.byteOffset, len);
-  decoder.pos += len;
-  return view;
-};
-var readVarUint8Array = (decoder) => readUint8Array(decoder, readVarUint(decoder));
-var readUint8 = (decoder) => decoder.arr[decoder.pos++];
-var readVarUint = (decoder) => {
-  let num = 0;
-  let mult = 1;
-  const len = decoder.arr.length;
-  while (decoder.pos < len) {
-    const r = decoder.arr[decoder.pos++];
-    num = num + (r & BITS7) * mult;
-    mult *= 128;
-    if (r < BIT8) {
-      return num;
-    }
-    if (num > MAX_SAFE_INTEGER) {
-      throw errorIntegerOutOfRange;
-    }
-  }
-  throw errorUnexpectedEndOfArray;
-};
-var _readVarStringPolyfill = (decoder) => {
-  let remainingLen = readVarUint(decoder);
-  if (remainingLen === 0) {
-    return "";
-  } else {
-    let encodedString = String.fromCodePoint(readUint8(decoder));
-    if (--remainingLen < 100) {
-      while (remainingLen--) {
-        encodedString += String.fromCodePoint(readUint8(decoder));
-      }
-    } else {
-      while (remainingLen > 0) {
-        const nextLen = remainingLen < 1e4 ? remainingLen : 1e4;
-        const bytes = decoder.arr.subarray(decoder.pos, decoder.pos + nextLen);
-        decoder.pos += nextLen;
-        encodedString += String.fromCodePoint.apply(
-          null,
-          /** @type {any} */
-          bytes
-        );
-        remainingLen -= nextLen;
-      }
-    }
-    return decodeURIComponent(escape(encodedString));
-  }
-};
-var _readVarStringNative = (decoder) => (
-  /** @type any */
-  utf8TextDecoder.decode(readVarUint8Array(decoder))
-);
-var readVarString = utf8TextDecoder ? _readVarStringNative : _readVarStringPolyfill;
-var AuthMessageType;
-(function(AuthMessageType2) {
-  AuthMessageType2[AuthMessageType2["Token"] = 0] = "Token";
-  AuthMessageType2[AuthMessageType2["PermissionDenied"] = 1] = "PermissionDenied";
-  AuthMessageType2[AuthMessageType2["Authenticated"] = 2] = "Authenticated";
-})(AuthMessageType || (AuthMessageType = {}));
-var writeAuthentication = (encoder, auth) => {
-  writeVarUint(encoder, AuthMessageType.Token);
-  writeVarString(encoder, auth);
-};
-var readAuthMessage = (decoder, sendToken, permissionDeniedHandler, authenticatedHandler) => {
-  switch (readVarUint(decoder)) {
-    case AuthMessageType.Token: {
-      sendToken();
-      break;
-    }
-    case AuthMessageType.PermissionDenied: {
-      permissionDeniedHandler(readVarString(decoder));
-      break;
-    }
-    case AuthMessageType.Authenticated: {
-      authenticatedHandler(readVarString(decoder));
-      break;
-    }
-  }
-};
-var awarenessStatesToArray = (states) => {
-  return Array.from(states.entries()).map(([key, value]) => {
-    return {
-      clientId: key,
-      ...value
-    };
-  });
-};
-var WsReadyStates;
-(function(WsReadyStates2) {
-  WsReadyStates2[WsReadyStates2["Connecting"] = 0] = "Connecting";
-  WsReadyStates2[WsReadyStates2["Open"] = 1] = "Open";
-  WsReadyStates2[WsReadyStates2["Closing"] = 2] = "Closing";
-  WsReadyStates2[WsReadyStates2["Closed"] = 3] = "Closed";
-})(WsReadyStates || (WsReadyStates = {}));
-
 // node_modules/lib0/map.js
-var create2 = () => /* @__PURE__ */ new Map();
+var create = () => /* @__PURE__ */ new Map();
 var copy = (m) => {
-  const r = create2();
+  const r = create();
   m.forEach((v, k) => {
     r.set(k, v);
   });
@@ -905,7 +60,7 @@ var any = (m, f) => {
 };
 
 // node_modules/lib0/set.js
-var create3 = () => /* @__PURE__ */ new Set();
+var create2 = () => /* @__PURE__ */ new Set();
 
 // node_modules/lib0/array.js
 var last = (arr) => arr[arr.length - 1];
@@ -943,7 +98,7 @@ var isArray = Array.isArray;
 // node_modules/lib0/observable.js
 var ObservableV2 = class {
   constructor() {
-    this._observers = create2();
+    this._observers = create();
   }
   /**
    * @template {keyof EVENTS & string} NAME
@@ -955,7 +110,7 @@ var ObservableV2 = class {
       this._observers,
       /** @type {string} */
       name,
-      create3
+      create2
     ).add(f);
     return f;
   }
@@ -1004,18 +159,18 @@ var ObservableV2 = class {
    * @param {Parameters<EVENTS[NAME]>} args The arguments that are applied to the event listener.
    */
   emit(name, args2) {
-    return from((this._observers.get(name) || create2()).values()).forEach((f) => f(...args2));
+    return from((this._observers.get(name) || create()).values()).forEach((f) => f(...args2));
   }
   destroy() {
-    this._observers = create2();
+    this._observers = create();
   }
 };
 
 // node_modules/lib0/math.js
-var floor2 = Math.floor;
+var floor = Math.floor;
 var abs = Math.abs;
-var min2 = (a, b) => a < b ? a : b;
-var max2 = (a, b) => a > b ? a : b;
+var min = (a, b) => a < b ? a : b;
+var max = (a, b) => a > b ? a : b;
 var isNaN = Number.isNaN;
 var isNegativeZero = (n) => n !== 0 ? n < 0 : 1 / n < 0;
 
@@ -1026,7 +181,7 @@ var BIT3 = 4;
 var BIT4 = 8;
 var BIT6 = 32;
 var BIT7 = 64;
-var BIT82 = 128;
+var BIT8 = 128;
 var BIT18 = 1 << 17;
 var BIT19 = 1 << 18;
 var BIT20 = 1 << 19;
@@ -1044,7 +199,7 @@ var BIT31 = 1 << 30;
 var BIT32 = 1 << 31;
 var BITS5 = 31;
 var BITS6 = 63;
-var BITS72 = 127;
+var BITS7 = 127;
 var BITS17 = BIT18 - 1;
 var BITS18 = BIT19 - 1;
 var BITS19 = BIT20 - 1;
@@ -1062,10 +217,10 @@ var BITS30 = BIT31 - 1;
 var BITS31 = 2147483647;
 
 // node_modules/lib0/number.js
-var MAX_SAFE_INTEGER2 = Number.MAX_SAFE_INTEGER;
+var MAX_SAFE_INTEGER = Number.MAX_SAFE_INTEGER;
 var MIN_SAFE_INTEGER = Number.MIN_SAFE_INTEGER;
 var LOWEST_INT32 = 1 << 31;
-var isInteger = Number.isInteger || ((num) => typeof num === "number" && isFinite(num) && floor2(num) === num);
+var isInteger = Number.isInteger || ((num) => typeof num === "number" && isFinite(num) && floor(num) === num);
 var isNaN2 = Number.isNaN;
 var parseInt2 = Number.parseInt;
 
@@ -1078,7 +233,7 @@ var trimLeftRegex = /^\s*/g;
 var trimLeft = (s) => s.replace(trimLeftRegex, "");
 var fromCamelCaseRegex = /([A-Z])/g;
 var fromCamelCase = (s, separator) => trimLeft(s.replace(fromCamelCaseRegex, (match2) => `${separator}${toLowerCase(match2)}`));
-var _encodeUtf8Polyfill2 = (str) => {
+var _encodeUtf8Polyfill = (str) => {
   const encodedString = unescape(encodeURIComponent(str));
   const len = encodedString.length;
   const buf = new Uint8Array(len);
@@ -1088,15 +243,15 @@ var _encodeUtf8Polyfill2 = (str) => {
   }
   return buf;
 };
-var utf8TextEncoder2 = (
+var utf8TextEncoder = (
   /** @type {TextEncoder} */
   typeof TextEncoder !== "undefined" ? new TextEncoder() : null
 );
-var _encodeUtf8Native2 = (str) => utf8TextEncoder2.encode(str);
-var encodeUtf82 = utf8TextEncoder2 ? _encodeUtf8Native2 : _encodeUtf8Polyfill2;
-var utf8TextDecoder2 = typeof TextDecoder === "undefined" ? null : new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
-if (utf8TextDecoder2 && utf8TextDecoder2.decode(new Uint8Array()).length === 1) {
-  utf8TextDecoder2 = null;
+var _encodeUtf8Native = (str) => utf8TextEncoder.encode(str);
+var encodeUtf8 = utf8TextEncoder ? _encodeUtf8Native : _encodeUtf8Polyfill;
+var utf8TextDecoder = typeof TextDecoder === "undefined" ? null : new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+if (utf8TextDecoder && utf8TextDecoder.decode(new Uint8Array()).length === 1) {
+  utf8TextDecoder = null;
 }
 var repeat = (source, n) => unfold(n, () => source).join("");
 
@@ -1131,11 +286,11 @@ var verifyLen = (encoder, len) => {
   const bufferLen = encoder.cbuf.length;
   if (bufferLen - encoder.cpos < len) {
     encoder.bufs.push(new Uint8Array(encoder.cbuf.buffer, 0, encoder.cpos));
-    encoder.cbuf = new Uint8Array(max2(bufferLen, len) * 2);
+    encoder.cbuf = new Uint8Array(max(bufferLen, len) * 2);
     encoder.cpos = 0;
   }
 };
-var write2 = (encoder, num) => {
+var write = (encoder, num) => {
   const bufferLen = encoder.cbuf.length;
   if (encoder.cpos === bufferLen) {
     encoder.bufs.push(encoder.cbuf);
@@ -1144,70 +299,70 @@ var write2 = (encoder, num) => {
   }
   encoder.cbuf[encoder.cpos++] = num;
 };
-var writeUint8 = write2;
-var writeVarUint2 = (encoder, num) => {
-  while (num > BITS72) {
-    write2(encoder, BIT82 | BITS72 & num);
-    num = floor2(num / 128);
+var writeUint8 = write;
+var writeVarUint = (encoder, num) => {
+  while (num > BITS7) {
+    write(encoder, BIT8 | BITS7 & num);
+    num = floor(num / 128);
   }
-  write2(encoder, BITS72 & num);
+  write(encoder, BITS7 & num);
 };
 var writeVarInt = (encoder, num) => {
   const isNegative = isNegativeZero(num);
   if (isNegative) {
     num = -num;
   }
-  write2(encoder, (num > BITS6 ? BIT82 : 0) | (isNegative ? BIT7 : 0) | BITS6 & num);
-  num = floor2(num / 64);
+  write(encoder, (num > BITS6 ? BIT8 : 0) | (isNegative ? BIT7 : 0) | BITS6 & num);
+  num = floor(num / 64);
   while (num > 0) {
-    write2(encoder, (num > BITS72 ? BIT82 : 0) | BITS72 & num);
-    num = floor2(num / 128);
+    write(encoder, (num > BITS7 ? BIT8 : 0) | BITS7 & num);
+    num = floor(num / 128);
   }
 };
-var _strBuffer2 = new Uint8Array(3e4);
-var _maxStrBSize2 = _strBuffer2.length / 3;
-var _writeVarStringNative2 = (encoder, str) => {
-  if (str.length < _maxStrBSize2) {
-    const written = utf8TextEncoder2.encodeInto(str, _strBuffer2).written || 0;
-    writeVarUint2(encoder, written);
+var _strBuffer = new Uint8Array(3e4);
+var _maxStrBSize = _strBuffer.length / 3;
+var _writeVarStringNative = (encoder, str) => {
+  if (str.length < _maxStrBSize) {
+    const written = utf8TextEncoder.encodeInto(str, _strBuffer).written || 0;
+    writeVarUint(encoder, written);
     for (let i = 0; i < written; i++) {
-      write2(encoder, _strBuffer2[i]);
+      write(encoder, _strBuffer[i]);
     }
   } else {
-    writeVarUint8Array2(encoder, encodeUtf82(str));
+    writeVarUint8Array(encoder, encodeUtf8(str));
   }
 };
-var _writeVarStringPolyfill2 = (encoder, str) => {
+var _writeVarStringPolyfill = (encoder, str) => {
   const encodedString = unescape(encodeURIComponent(str));
   const len = encodedString.length;
-  writeVarUint2(encoder, len);
+  writeVarUint(encoder, len);
   for (let i = 0; i < len; i++) {
-    write2(
+    write(
       encoder,
       /** @type {number} */
       encodedString.codePointAt(i)
     );
   }
 };
-var writeVarString2 = utf8TextEncoder2 && /** @type {any} */
-utf8TextEncoder2.encodeInto ? _writeVarStringNative2 : _writeVarStringPolyfill2;
-var writeUint8Array2 = (encoder, uint8Array) => {
+var writeVarString = utf8TextEncoder && /** @type {any} */
+utf8TextEncoder.encodeInto ? _writeVarStringNative : _writeVarStringPolyfill;
+var writeUint8Array = (encoder, uint8Array) => {
   const bufferLen = encoder.cbuf.length;
   const cpos = encoder.cpos;
-  const leftCopyLen = min2(bufferLen - cpos, uint8Array.length);
+  const leftCopyLen = min(bufferLen - cpos, uint8Array.length);
   const rightCopyLen = uint8Array.length - leftCopyLen;
   encoder.cbuf.set(uint8Array.subarray(0, leftCopyLen), cpos);
   encoder.cpos += leftCopyLen;
   if (rightCopyLen > 0) {
     encoder.bufs.push(encoder.cbuf);
-    encoder.cbuf = new Uint8Array(max2(bufferLen * 2, rightCopyLen));
+    encoder.cbuf = new Uint8Array(max(bufferLen * 2, rightCopyLen));
     encoder.cbuf.set(uint8Array.subarray(leftCopyLen));
     encoder.cpos = rightCopyLen;
   }
 };
-var writeVarUint8Array2 = (encoder, uint8Array) => {
-  writeVarUint2(encoder, uint8Array.byteLength);
-  writeUint8Array2(encoder, uint8Array);
+var writeVarUint8Array = (encoder, uint8Array) => {
+  writeVarUint(encoder, uint8Array.byteLength);
+  writeUint8Array(encoder, uint8Array);
 };
 var writeOnDataView = (encoder, len) => {
   verifyLen(encoder, len);
@@ -1229,53 +384,53 @@ var isFloat32 = (num) => {
 var writeAny = (encoder, data) => {
   switch (typeof data) {
     case "string":
-      write2(encoder, 119);
-      writeVarString2(encoder, data);
+      write(encoder, 119);
+      writeVarString(encoder, data);
       break;
     case "number":
       if (isInteger(data) && abs(data) <= BITS31) {
-        write2(encoder, 125);
+        write(encoder, 125);
         writeVarInt(encoder, data);
       } else if (isFloat32(data)) {
-        write2(encoder, 124);
+        write(encoder, 124);
         writeFloat32(encoder, data);
       } else {
-        write2(encoder, 123);
+        write(encoder, 123);
         writeFloat64(encoder, data);
       }
       break;
     case "bigint":
-      write2(encoder, 122);
+      write(encoder, 122);
       writeBigInt64(encoder, data);
       break;
     case "object":
       if (data === null) {
-        write2(encoder, 126);
+        write(encoder, 126);
       } else if (isArray(data)) {
-        write2(encoder, 117);
-        writeVarUint2(encoder, data.length);
+        write(encoder, 117);
+        writeVarUint(encoder, data.length);
         for (let i = 0; i < data.length; i++) {
           writeAny(encoder, data[i]);
         }
       } else if (data instanceof Uint8Array) {
-        write2(encoder, 116);
-        writeVarUint8Array2(encoder, data);
+        write(encoder, 116);
+        writeVarUint8Array(encoder, data);
       } else {
-        write2(encoder, 118);
+        write(encoder, 118);
         const keys3 = Object.keys(data);
-        writeVarUint2(encoder, keys3.length);
+        writeVarUint(encoder, keys3.length);
         for (let i = 0; i < keys3.length; i++) {
           const key = keys3[i];
-          writeVarString2(encoder, key);
+          writeVarString(encoder, key);
           writeAny(encoder, data[key]);
         }
       }
       break;
     case "boolean":
-      write2(encoder, data ? 120 : 121);
+      write(encoder, data ? 120 : 121);
       break;
     default:
-      write2(encoder, 127);
+      write(encoder, 127);
   }
 };
 var RleEncoder = class extends Encoder {
@@ -1296,7 +451,7 @@ var RleEncoder = class extends Encoder {
       this.count++;
     } else {
       if (this.count > 0) {
-        writeVarUint2(this, this.count - 1);
+        writeVarUint(this, this.count - 1);
       }
       this.count = 1;
       this.w(this, v);
@@ -1308,7 +463,7 @@ var flushUintOptRleEncoder = (encoder) => {
   if (encoder.count > 0) {
     writeVarInt(encoder.encoder, encoder.count === 1 ? encoder.s : -encoder.s);
     if (encoder.count > 1) {
-      writeVarUint2(encoder.encoder, encoder.count - 2);
+      writeVarUint(encoder.encoder, encoder.count - 2);
     }
   }
 };
@@ -1345,7 +500,7 @@ var flushIntDiffOptRleEncoder = (encoder) => {
     const encodedDiff = encoder.diff * 2 + (encoder.count === 1 ? 0 : 1);
     writeVarInt(encoder.encoder, encodedDiff);
     if (encoder.count > 1) {
-      writeVarUint2(encoder.encoder, encoder.count - 2);
+      writeVarUint(encoder.encoder, encoder.count - 2);
     }
   }
 };
@@ -1401,24 +556,24 @@ var StringEncoder = class {
     const encoder = new Encoder();
     this.sarr.push(this.s);
     this.s = "";
-    writeVarString2(encoder, this.sarr.join(""));
-    writeUint8Array2(encoder, this.lensE.toUint8Array());
+    writeVarString(encoder, this.sarr.join(""));
+    writeUint8Array(encoder, this.lensE.toUint8Array());
     return toUint8Array(encoder);
   }
 };
 
 // node_modules/lib0/error.js
-var create4 = (s) => new Error(s);
+var create3 = (s) => new Error(s);
 var methodUnimplemented = () => {
-  throw create4("Method unimplemented");
+  throw create3("Method unimplemented");
 };
 var unexpectedCase = () => {
-  throw create4("Unexpected case");
+  throw create3("Unexpected case");
 };
 
 // node_modules/lib0/decoding.js
-var errorUnexpectedEndOfArray2 = create4("Unexpected end of array");
-var errorIntegerOutOfRange2 = create4("Integer out of Range");
+var errorUnexpectedEndOfArray = create3("Unexpected end of array");
+var errorIntegerOutOfRange = create3("Integer out of Range");
 var Decoder = class {
   /**
    * @param {Uint8Array<Buf>} uint8Array Binary data to decode
@@ -1430,61 +585,61 @@ var Decoder = class {
 };
 var createDecoder = (uint8Array) => new Decoder(uint8Array);
 var hasContent = (decoder) => decoder.pos !== decoder.arr.length;
-var readUint8Array2 = (decoder, len) => {
+var readUint8Array = (decoder, len) => {
   const view = new Uint8Array(decoder.arr.buffer, decoder.pos + decoder.arr.byteOffset, len);
   decoder.pos += len;
   return view;
 };
-var readVarUint8Array2 = (decoder) => readUint8Array2(decoder, readVarUint2(decoder));
-var readUint82 = (decoder) => decoder.arr[decoder.pos++];
-var readVarUint2 = (decoder) => {
+var readVarUint8Array = (decoder) => readUint8Array(decoder, readVarUint(decoder));
+var readUint8 = (decoder) => decoder.arr[decoder.pos++];
+var readVarUint = (decoder) => {
   let num = 0;
   let mult = 1;
   const len = decoder.arr.length;
   while (decoder.pos < len) {
     const r = decoder.arr[decoder.pos++];
-    num = num + (r & BITS72) * mult;
+    num = num + (r & BITS7) * mult;
     mult *= 128;
-    if (r < BIT82) {
+    if (r < BIT8) {
       return num;
     }
-    if (num > MAX_SAFE_INTEGER2) {
-      throw errorIntegerOutOfRange2;
+    if (num > MAX_SAFE_INTEGER) {
+      throw errorIntegerOutOfRange;
     }
   }
-  throw errorUnexpectedEndOfArray2;
+  throw errorUnexpectedEndOfArray;
 };
 var readVarInt = (decoder) => {
   let r = decoder.arr[decoder.pos++];
   let num = r & BITS6;
   let mult = 64;
   const sign = (r & BIT7) > 0 ? -1 : 1;
-  if ((r & BIT82) === 0) {
+  if ((r & BIT8) === 0) {
     return sign * num;
   }
   const len = decoder.arr.length;
   while (decoder.pos < len) {
     r = decoder.arr[decoder.pos++];
-    num = num + (r & BITS72) * mult;
+    num = num + (r & BITS7) * mult;
     mult *= 128;
-    if (r < BIT82) {
+    if (r < BIT8) {
       return sign * num;
     }
-    if (num > MAX_SAFE_INTEGER2) {
-      throw errorIntegerOutOfRange2;
+    if (num > MAX_SAFE_INTEGER) {
+      throw errorIntegerOutOfRange;
     }
   }
-  throw errorUnexpectedEndOfArray2;
+  throw errorUnexpectedEndOfArray;
 };
-var _readVarStringPolyfill2 = (decoder) => {
-  let remainingLen = readVarUint2(decoder);
+var _readVarStringPolyfill = (decoder) => {
+  let remainingLen = readVarUint(decoder);
   if (remainingLen === 0) {
     return "";
   } else {
-    let encodedString = String.fromCodePoint(readUint82(decoder));
+    let encodedString = String.fromCodePoint(readUint8(decoder));
     if (--remainingLen < 100) {
       while (remainingLen--) {
-        encodedString += String.fromCodePoint(readUint82(decoder));
+        encodedString += String.fromCodePoint(readUint8(decoder));
       }
     } else {
       while (remainingLen > 0) {
@@ -1502,11 +657,11 @@ var _readVarStringPolyfill2 = (decoder) => {
     return decodeURIComponent(escape(encodedString));
   }
 };
-var _readVarStringNative2 = (decoder) => (
+var _readVarStringNative = (decoder) => (
   /** @type any */
-  utf8TextDecoder2.decode(readVarUint8Array2(decoder))
+  utf8TextDecoder.decode(readVarUint8Array(decoder))
 );
-var readVarString2 = utf8TextDecoder2 ? _readVarStringNative2 : _readVarStringPolyfill2;
+var readVarString = utf8TextDecoder ? _readVarStringNative : _readVarStringPolyfill;
 var readFromDataView = (decoder, len) => {
   const dv = new DataView(decoder.arr.buffer, decoder.arr.byteOffset + decoder.pos, len);
   decoder.pos += len;
@@ -1535,29 +690,29 @@ var readAnyLookupTable = [
   // CASE 121: boolean (false)
   (decoder) => true,
   // CASE 120: boolean (true)
-  readVarString2,
+  readVarString,
   // CASE 119: string
   (decoder) => {
-    const len = readVarUint2(decoder);
+    const len = readVarUint(decoder);
     const obj = {};
     for (let i = 0; i < len; i++) {
-      const key = readVarString2(decoder);
+      const key = readVarString(decoder);
       obj[key] = readAny(decoder);
     }
     return obj;
   },
   (decoder) => {
-    const len = readVarUint2(decoder);
+    const len = readVarUint(decoder);
     const arr = [];
     for (let i = 0; i < len; i++) {
       arr.push(readAny(decoder));
     }
     return arr;
   },
-  readVarUint8Array2
+  readVarUint8Array
   // CASE 116: Uint8Array
 ];
-var readAny = (decoder) => readAnyLookupTable[127 - readUint82(decoder)](decoder);
+var readAny = (decoder) => readAnyLookupTable[127 - readUint8(decoder)](decoder);
 var RleDecoder = class extends Decoder {
   /**
    * @param {Uint8Array} uint8Array
@@ -1573,7 +728,7 @@ var RleDecoder = class extends Decoder {
     if (this.count === 0) {
       this.s = this.reader(this);
       if (hasContent(this)) {
-        this.count = readVarUint2(this) + 1;
+        this.count = readVarUint(this) + 1;
       } else {
         this.count = -1;
       }
@@ -1601,7 +756,7 @@ var UintOptRleDecoder = class extends Decoder {
       this.count = 1;
       if (isNegative) {
         this.s = -this.s;
-        this.count = readVarUint2(this) + 2;
+        this.count = readVarUint(this) + 2;
       }
     }
     this.count--;
@@ -1628,10 +783,10 @@ var IntDiffOptRleDecoder = class extends Decoder {
     if (this.count === 0) {
       const diff = readVarInt(this);
       const hasCount = diff & 1;
-      this.diff = floor2(diff / 2);
+      this.diff = floor(diff / 2);
       this.count = 1;
       if (hasCount) {
-        this.count = readVarUint2(this) + 2;
+        this.count = readVarUint(this) + 2;
       }
     }
     this.s += this.diff;
@@ -1645,7 +800,7 @@ var StringDecoder = class {
    */
   constructor(uint8Array) {
     this.decoder = new UintOptRleDecoder(uint8Array);
-    this.str = readVarString2(this.decoder);
+    this.str = readVarString(this.decoder);
     this.spos = 0;
   }
   /**
@@ -1676,7 +831,7 @@ var uuidv4 = () => uuidv4Template.replace(
 var getUnixTime = Date.now;
 
 // node_modules/lib0/promise.js
-var create5 = (f) => (
+var create4 = (f) => (
   /** @type {Promise<T>} */
   new Promise(f)
 );
@@ -1853,7 +1008,7 @@ var args = [];
 var computeParams = () => {
   if (params === void 0) {
     if (isNode) {
-      params = create2();
+      params = create();
       const pargs = process.argv;
       let currParamName = null;
       for (let i = 0; i < pargs.length; i++) {
@@ -1876,7 +1031,7 @@ var computeParams = () => {
         params.set(currParamName, "");
       }
     } else if (typeof location === "object") {
-      params = create2();
+      params = create();
       (location.search || "?").slice(1).split("&").forEach((kv) => {
         if (kv.length !== 0) {
           const [key, value] = kv.split("=");
@@ -1885,7 +1040,7 @@ var computeParams = () => {
         }
       });
     } else {
-      params = create2();
+      params = create();
     }
   }
   return params;
@@ -1917,12 +1072,12 @@ var Pair = class {
     this.right = right;
   }
 };
-var create6 = (left, right) => new Pair(left, right);
+var create5 = (left, right) => new Pair(left, right);
 
 // node_modules/lib0/prng.js
 var bool = (gen) => gen.next() >= 0.5;
-var int53 = (gen, min4, max4) => floor2(gen.next() * (max4 + 1 - min4) + min4);
-var int32 = (gen, min4, max4) => floor2(gen.next() * (max4 + 1 - min4) + min4);
+var int53 = (gen, min4, max4) => floor(gen.next() * (max4 + 1 - min4) + min4);
+var int32 = (gen, min4, max4) => floor(gen.next() * (max4 + 1 - min4) + min4);
 var int31 = (gen, min4, max4) => int32(gen, min4, max4);
 var letter = (gen) => fromCharCode(int31(gen, 97, 122));
 var word = (gen, minLen = 0, maxLen = 20) => {
@@ -2561,7 +1716,7 @@ var assert = production ? () => {
 } : (o, schema) => {
   const err = new ValidationError();
   if (!schema.check(o, err)) {
-    throw create4(`Expected value to be of type ${schema.constructor.name}.
+    throw create3(`Expected value to be of type ${schema.constructor.name}.
 ${err.toString()}`);
   }
 };
@@ -2606,7 +1761,7 @@ var PatternMatcher = class {
             return p.h(o, s);
           }
         }
-        throw create4("Unhandled pattern");
+        throw create3("Unhandled pattern");
       }
     );
   }
@@ -2620,7 +1775,7 @@ var _random = (
   match(
     /** @type {Schema<prng.PRNG>} */
     $any
-  ).if($$number, (_o, gen) => int53(gen, MIN_SAFE_INTEGER, MAX_SAFE_INTEGER2)).if($$string, (_o, gen) => word(gen)).if($$boolean, (_o, gen) => bool(gen)).if($$bigint, (_o, gen) => BigInt(int53(gen, MIN_SAFE_INTEGER, MAX_SAFE_INTEGER2))).if($$union, (o, gen) => random(gen, oneOf(gen, o.shape))).if($$object, (o, gen) => {
+  ).if($$number, (_o, gen) => int53(gen, MIN_SAFE_INTEGER, MAX_SAFE_INTEGER)).if($$string, (_o, gen) => word(gen)).if($$boolean, (_o, gen) => bool(gen)).if($$bigint, (_o, gen) => BigInt(int53(gen, MIN_SAFE_INTEGER, MAX_SAFE_INTEGER))).if($$union, (o, gen) => random(gen, oneOf(gen, o.shape))).if($$object, (o, gen) => {
     const res = {};
     for (const k in o.shape) {
       let prop = o.shape[k];
@@ -2695,18 +1850,18 @@ var DOCUMENT_FRAGMENT_NODE = doc.DOCUMENT_FRAGMENT_NODE;
 var $node = $custom((el) => el.nodeType === DOCUMENT_NODE);
 
 // node_modules/lib0/symbol.js
-var create7 = Symbol;
+var create6 = Symbol;
 
 // node_modules/lib0/logging.common.js
-var BOLD = create7();
-var UNBOLD = create7();
-var BLUE = create7();
-var GREY = create7();
-var GREEN = create7();
-var RED = create7();
-var PURPLE = create7();
-var ORANGE = create7();
-var UNCOLOR = create7();
+var BOLD = create6();
+var UNBOLD = create6();
+var BLUE = create6();
+var GREY = create6();
+var GREEN = create6();
+var RED = create6();
+var PURPLE = create6();
+var ORANGE = create6();
+var UNCOLOR = create6();
 var computeNoColorLoggingArgs = (args2) => {
   if (args2.length === 1 && args2[0]?.constructor === Function) {
     args2 = /** @type {Array<string|Symbol|Object|number>} */
@@ -2741,16 +1896,16 @@ var lastLoggingTime = getUnixTime();
 
 // node_modules/lib0/logging.js
 var _browserStyleMap = {
-  [BOLD]: create6("font-weight", "bold"),
-  [UNBOLD]: create6("font-weight", "normal"),
-  [BLUE]: create6("color", "blue"),
-  [GREEN]: create6("color", "green"),
-  [GREY]: create6("color", "grey"),
-  [RED]: create6("color", "red"),
-  [PURPLE]: create6("color", "purple"),
-  [ORANGE]: create6("color", "orange"),
+  [BOLD]: create5("font-weight", "bold"),
+  [UNBOLD]: create5("font-weight", "normal"),
+  [BLUE]: create5("color", "blue"),
+  [GREEN]: create5("color", "green"),
+  [GREY]: create5("color", "grey"),
+  [RED]: create5("color", "red"),
+  [PURPLE]: create5("color", "purple"),
+  [ORANGE]: create5("color", "orange"),
   // not well supported in chrome when debugging node with inspector - TODO: deprecate
-  [UNCOLOR]: create6("color", "black")
+  [UNCOLOR]: create5("color", "black")
 };
 var computeBrowserLoggingArgs = (args2) => {
   if (args2.length === 1 && args2[0]?.constructor === Function) {
@@ -2760,7 +1915,7 @@ var computeBrowserLoggingArgs = (args2) => {
   }
   const strBuilder = [];
   const styles = [];
-  const currentStyle = create2();
+  const currentStyle = create();
   let logArgs = [];
   let i = 0;
   for (; i < args2.length; i++) {
@@ -2807,7 +1962,7 @@ var warn = (...args2) => {
   args2.unshift(ORANGE);
   vconsoles.forEach((vc) => vc.print(args2));
 };
-var vconsoles = create3();
+var vconsoles = create2();
 
 // node_modules/lib0/iterator.js
 var createIterator = (next) => ({
@@ -2865,7 +2020,7 @@ var findIndexDS = (dis, clock) => {
   let left = 0;
   let right = dis.length - 1;
   while (left <= right) {
-    const midindex = floor2((left + right) / 2);
+    const midindex = floor((left + right) / 2);
     const mid = dis[midindex];
     const midclock = mid.clock;
     if (midclock <= clock) {
@@ -2891,7 +2046,7 @@ var sortAndMergeDeleteSet = (ds) => {
       const left = dels[j - 1];
       const right = dels[i];
       if (left.clock + left.len >= right.clock) {
-        dels[j - 1] = new DeleteItem(left.clock, max2(left.len, right.clock + right.len - left.clock));
+        dels[j - 1] = new DeleteItem(left.clock, max(left.len, right.clock + right.len - left.clock));
       } else {
         if (j < i) {
           dels[j] = right;
@@ -2949,12 +2104,12 @@ var createDeleteSetFromStructStore = (ss) => {
   return ds;
 };
 var writeDeleteSet = (encoder, ds) => {
-  writeVarUint2(encoder.restEncoder, ds.clients.size);
+  writeVarUint(encoder.restEncoder, ds.clients.size);
   from(ds.clients.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, dsitems]) => {
     encoder.resetDsCurVal();
-    writeVarUint2(encoder.restEncoder, client);
+    writeVarUint(encoder.restEncoder, client);
     const len = dsitems.length;
-    writeVarUint2(encoder.restEncoder, len);
+    writeVarUint(encoder.restEncoder, len);
     for (let i = 0; i < len; i++) {
       const item = dsitems[i];
       encoder.writeDsClock(item.clock);
@@ -2964,11 +2119,11 @@ var writeDeleteSet = (encoder, ds) => {
 };
 var readDeleteSet = (decoder) => {
   const ds = new DeleteSet();
-  const numClients = readVarUint2(decoder.restDecoder);
+  const numClients = readVarUint(decoder.restDecoder);
   for (let i = 0; i < numClients; i++) {
     decoder.resetDsCurVal();
-    const client = readVarUint2(decoder.restDecoder);
-    const numberOfDeletes = readVarUint2(decoder.restDecoder);
+    const client = readVarUint(decoder.restDecoder);
+    const numberOfDeletes = readVarUint(decoder.restDecoder);
     if (numberOfDeletes > 0) {
       const dsField = setIfUndefined(ds.clients, client, () => (
         /** @type {Array<DeleteItem>} */
@@ -2983,11 +2138,11 @@ var readDeleteSet = (decoder) => {
 };
 var readAndApplyDeleteSet = (decoder, transaction, store) => {
   const unappliedDS = new DeleteSet();
-  const numClients = readVarUint2(decoder.restDecoder);
+  const numClients = readVarUint(decoder.restDecoder);
   for (let i = 0; i < numClients; i++) {
     decoder.resetDsCurVal();
-    const client = readVarUint2(decoder.restDecoder);
-    const numberOfDeletes = readVarUint2(decoder.restDecoder);
+    const client = readVarUint(decoder.restDecoder);
+    const numberOfDeletes = readVarUint(decoder.restDecoder);
     const structs = store.clients.get(client) || [];
     const state = getState(store, client);
     for (let i2 = 0; i2 < numberOfDeletes; i2++) {
@@ -3023,7 +2178,7 @@ var readAndApplyDeleteSet = (decoder, transaction, store) => {
   }
   if (unappliedDS.clients.size > 0) {
     const ds = new UpdateEncoderV2();
-    writeVarUint2(ds.restEncoder, 0);
+    writeVarUint(ds.restEncoder, 0);
     writeDeleteSet(ds, unappliedDS);
     return ds.toUint8Array();
   }
@@ -3053,13 +2208,13 @@ var Doc = class _Doc extends ObservableV2 {
     this.isLoaded = false;
     this.isSynced = false;
     this.isDestroyed = false;
-    this.whenLoaded = create5((resolve) => {
+    this.whenLoaded = create4((resolve) => {
       this.on("load", () => {
         this.isLoaded = true;
         resolve(this);
       });
     });
-    const provideSyncedPromise = () => create5((resolve) => {
+    const provideSyncedPromise = () => create4((resolve) => {
       const eventHandler = (isSynced) => {
         if (isSynced === void 0 || isSynced === true) {
           this.off("sync", eventHandler);
@@ -3310,13 +2465,13 @@ var DSDecoderV1 = class {
    * @return {number}
    */
   readDsClock() {
-    return readVarUint2(this.restDecoder);
+    return readVarUint(this.restDecoder);
   }
   /**
    * @return {number}
    */
   readDsLen() {
-    return readVarUint2(this.restDecoder);
+    return readVarUint(this.restDecoder);
   }
 };
 var UpdateDecoderV1 = class extends DSDecoderV1 {
@@ -3324,44 +2479,44 @@ var UpdateDecoderV1 = class extends DSDecoderV1 {
    * @return {ID}
    */
   readLeftID() {
-    return createID(readVarUint2(this.restDecoder), readVarUint2(this.restDecoder));
+    return createID(readVarUint(this.restDecoder), readVarUint(this.restDecoder));
   }
   /**
    * @return {ID}
    */
   readRightID() {
-    return createID(readVarUint2(this.restDecoder), readVarUint2(this.restDecoder));
+    return createID(readVarUint(this.restDecoder), readVarUint(this.restDecoder));
   }
   /**
    * Read the next client id.
    * Use this in favor of readID whenever possible to reduce the number of objects created.
    */
   readClient() {
-    return readVarUint2(this.restDecoder);
+    return readVarUint(this.restDecoder);
   }
   /**
    * @return {number} info An unsigned 8-bit integer
    */
   readInfo() {
-    return readUint82(this.restDecoder);
+    return readUint8(this.restDecoder);
   }
   /**
    * @return {string}
    */
   readString() {
-    return readVarString2(this.restDecoder);
+    return readVarString(this.restDecoder);
   }
   /**
    * @return {boolean} isKey
    */
   readParentInfo() {
-    return readVarUint2(this.restDecoder) === 1;
+    return readVarUint(this.restDecoder) === 1;
   }
   /**
    * @return {number} info An unsigned 8-bit integer
    */
   readTypeRef() {
-    return readVarUint2(this.restDecoder);
+    return readVarUint(this.restDecoder);
   }
   /**
    * Write len of a struct - well suited for Opt RLE encoder.
@@ -3369,7 +2524,7 @@ var UpdateDecoderV1 = class extends DSDecoderV1 {
    * @return {number} len
    */
   readLen() {
-    return readVarUint2(this.restDecoder);
+    return readVarUint(this.restDecoder);
   }
   /**
    * @return {any}
@@ -3381,7 +2536,7 @@ var UpdateDecoderV1 = class extends DSDecoderV1 {
    * @return {Uint8Array}
    */
   readBuf() {
-    return copyUint8Array(readVarUint8Array2(this.restDecoder));
+    return copyUint8Array(readVarUint8Array(this.restDecoder));
   }
   /**
    * Legacy implementation uses JSON parse. We use any-decoding in v2.
@@ -3389,13 +2544,13 @@ var UpdateDecoderV1 = class extends DSDecoderV1 {
    * @return {any}
    */
   readJSON() {
-    return JSON.parse(readVarString2(this.restDecoder));
+    return JSON.parse(readVarString(this.restDecoder));
   }
   /**
    * @return {string}
    */
   readKey() {
-    return readVarString2(this.restDecoder);
+    return readVarString(this.restDecoder);
   }
 };
 var DSDecoderV2 = class {
@@ -3413,14 +2568,14 @@ var DSDecoderV2 = class {
    * @return {number}
    */
   readDsClock() {
-    this.dsCurrVal += readVarUint2(this.restDecoder);
+    this.dsCurrVal += readVarUint(this.restDecoder);
     return this.dsCurrVal;
   }
   /**
    * @return {number}
    */
   readDsLen() {
-    const diff = readVarUint2(this.restDecoder) + 1;
+    const diff = readVarUint(this.restDecoder) + 1;
     this.dsCurrVal += diff;
     return diff;
   }
@@ -3432,16 +2587,16 @@ var UpdateDecoderV2 = class extends DSDecoderV2 {
   constructor(decoder) {
     super(decoder);
     this.keys = [];
-    readVarUint2(decoder);
-    this.keyClockDecoder = new IntDiffOptRleDecoder(readVarUint8Array2(decoder));
-    this.clientDecoder = new UintOptRleDecoder(readVarUint8Array2(decoder));
-    this.leftClockDecoder = new IntDiffOptRleDecoder(readVarUint8Array2(decoder));
-    this.rightClockDecoder = new IntDiffOptRleDecoder(readVarUint8Array2(decoder));
-    this.infoDecoder = new RleDecoder(readVarUint8Array2(decoder), readUint82);
-    this.stringDecoder = new StringDecoder(readVarUint8Array2(decoder));
-    this.parentInfoDecoder = new RleDecoder(readVarUint8Array2(decoder), readUint82);
-    this.typeRefDecoder = new UintOptRleDecoder(readVarUint8Array2(decoder));
-    this.lenDecoder = new UintOptRleDecoder(readVarUint8Array2(decoder));
+    readVarUint(decoder);
+    this.keyClockDecoder = new IntDiffOptRleDecoder(readVarUint8Array(decoder));
+    this.clientDecoder = new UintOptRleDecoder(readVarUint8Array(decoder));
+    this.leftClockDecoder = new IntDiffOptRleDecoder(readVarUint8Array(decoder));
+    this.rightClockDecoder = new IntDiffOptRleDecoder(readVarUint8Array(decoder));
+    this.infoDecoder = new RleDecoder(readVarUint8Array(decoder), readUint8);
+    this.stringDecoder = new StringDecoder(readVarUint8Array(decoder));
+    this.parentInfoDecoder = new RleDecoder(readVarUint8Array(decoder), readUint8);
+    this.typeRefDecoder = new UintOptRleDecoder(readVarUint8Array(decoder));
+    this.lenDecoder = new UintOptRleDecoder(readVarUint8Array(decoder));
   }
   /**
    * @return {ID}
@@ -3507,7 +2662,7 @@ var UpdateDecoderV2 = class extends DSDecoderV2 {
    * @return {Uint8Array}
    */
   readBuf() {
-    return readVarUint8Array2(this.restDecoder);
+    return readVarUint8Array(this.restDecoder);
   }
   /**
    * This is mainly here for legacy purposes.
@@ -3546,13 +2701,13 @@ var DSEncoderV1 = class {
    * @param {number} clock
    */
   writeDsClock(clock) {
-    writeVarUint2(this.restEncoder, clock);
+    writeVarUint(this.restEncoder, clock);
   }
   /**
    * @param {number} len
    */
   writeDsLen(len) {
-    writeVarUint2(this.restEncoder, len);
+    writeVarUint(this.restEncoder, len);
   }
 };
 var UpdateEncoderV1 = class extends DSEncoderV1 {
@@ -3560,22 +2715,22 @@ var UpdateEncoderV1 = class extends DSEncoderV1 {
    * @param {ID} id
    */
   writeLeftID(id2) {
-    writeVarUint2(this.restEncoder, id2.client);
-    writeVarUint2(this.restEncoder, id2.clock);
+    writeVarUint(this.restEncoder, id2.client);
+    writeVarUint(this.restEncoder, id2.clock);
   }
   /**
    * @param {ID} id
    */
   writeRightID(id2) {
-    writeVarUint2(this.restEncoder, id2.client);
-    writeVarUint2(this.restEncoder, id2.clock);
+    writeVarUint(this.restEncoder, id2.client);
+    writeVarUint(this.restEncoder, id2.clock);
   }
   /**
    * Use writeClient and writeClock instead of writeID if possible.
    * @param {number} client
    */
   writeClient(client) {
-    writeVarUint2(this.restEncoder, client);
+    writeVarUint(this.restEncoder, client);
   }
   /**
    * @param {number} info An unsigned 8-bit integer
@@ -3587,19 +2742,19 @@ var UpdateEncoderV1 = class extends DSEncoderV1 {
    * @param {string} s
    */
   writeString(s) {
-    writeVarString2(this.restEncoder, s);
+    writeVarString(this.restEncoder, s);
   }
   /**
    * @param {boolean} isYKey
    */
   writeParentInfo(isYKey) {
-    writeVarUint2(this.restEncoder, isYKey ? 1 : 0);
+    writeVarUint(this.restEncoder, isYKey ? 1 : 0);
   }
   /**
    * @param {number} info An unsigned 8-bit integer
    */
   writeTypeRef(info) {
-    writeVarUint2(this.restEncoder, info);
+    writeVarUint(this.restEncoder, info);
   }
   /**
    * Write len of a struct - well suited for Opt RLE encoder.
@@ -3607,7 +2762,7 @@ var UpdateEncoderV1 = class extends DSEncoderV1 {
    * @param {number} len
    */
   writeLen(len) {
-    writeVarUint2(this.restEncoder, len);
+    writeVarUint(this.restEncoder, len);
   }
   /**
    * @param {any} any
@@ -3619,19 +2774,19 @@ var UpdateEncoderV1 = class extends DSEncoderV1 {
    * @param {Uint8Array} buf
    */
   writeBuf(buf) {
-    writeVarUint8Array2(this.restEncoder, buf);
+    writeVarUint8Array(this.restEncoder, buf);
   }
   /**
    * @param {any} embed
    */
   writeJSON(embed) {
-    writeVarString2(this.restEncoder, JSON.stringify(embed));
+    writeVarString(this.restEncoder, JSON.stringify(embed));
   }
   /**
    * @param {string} key
    */
   writeKey(key) {
-    writeVarString2(this.restEncoder, key);
+    writeVarString(this.restEncoder, key);
   }
 };
 var DSEncoderV2 = class {
@@ -3651,7 +2806,7 @@ var DSEncoderV2 = class {
   writeDsClock(clock) {
     const diff = clock - this.dsCurrVal;
     this.dsCurrVal = clock;
-    writeVarUint2(this.restEncoder, diff);
+    writeVarUint(this.restEncoder, diff);
   }
   /**
    * @param {number} len
@@ -3660,7 +2815,7 @@ var DSEncoderV2 = class {
     if (len === 0) {
       unexpectedCase();
     }
-    writeVarUint2(this.restEncoder, len - 1);
+    writeVarUint(this.restEncoder, len - 1);
     this.dsCurrVal += len;
   }
 };
@@ -3681,17 +2836,17 @@ var UpdateEncoderV2 = class extends DSEncoderV2 {
   }
   toUint8Array() {
     const encoder = createEncoder();
-    writeVarUint2(encoder, 0);
-    writeVarUint8Array2(encoder, this.keyClockEncoder.toUint8Array());
-    writeVarUint8Array2(encoder, this.clientEncoder.toUint8Array());
-    writeVarUint8Array2(encoder, this.leftClockEncoder.toUint8Array());
-    writeVarUint8Array2(encoder, this.rightClockEncoder.toUint8Array());
-    writeVarUint8Array2(encoder, toUint8Array(this.infoEncoder));
-    writeVarUint8Array2(encoder, this.stringEncoder.toUint8Array());
-    writeVarUint8Array2(encoder, toUint8Array(this.parentInfoEncoder));
-    writeVarUint8Array2(encoder, this.typeRefEncoder.toUint8Array());
-    writeVarUint8Array2(encoder, this.lenEncoder.toUint8Array());
-    writeUint8Array2(encoder, toUint8Array(this.restEncoder));
+    writeVarUint(encoder, 0);
+    writeVarUint8Array(encoder, this.keyClockEncoder.toUint8Array());
+    writeVarUint8Array(encoder, this.clientEncoder.toUint8Array());
+    writeVarUint8Array(encoder, this.leftClockEncoder.toUint8Array());
+    writeVarUint8Array(encoder, this.rightClockEncoder.toUint8Array());
+    writeVarUint8Array(encoder, toUint8Array(this.infoEncoder));
+    writeVarUint8Array(encoder, this.stringEncoder.toUint8Array());
+    writeVarUint8Array(encoder, toUint8Array(this.parentInfoEncoder));
+    writeVarUint8Array(encoder, this.typeRefEncoder.toUint8Array());
+    writeVarUint8Array(encoder, this.lenEncoder.toUint8Array());
+    writeUint8Array(encoder, toUint8Array(this.restEncoder));
     return toUint8Array(encoder);
   }
   /**
@@ -3756,7 +2911,7 @@ var UpdateEncoderV2 = class extends DSEncoderV2 {
    * @param {Uint8Array} buf
    */
   writeBuf(buf) {
-    writeVarUint8Array2(this.restEncoder, buf);
+    writeVarUint8Array(this.restEncoder, buf);
   }
   /**
    * This is mainly here for legacy purposes.
@@ -3787,11 +2942,11 @@ var UpdateEncoderV2 = class extends DSEncoderV2 {
   }
 };
 var writeStructs = (encoder, structs, client, clock) => {
-  clock = max2(clock, structs[0].id.clock);
+  clock = max(clock, structs[0].id.clock);
   const startNewStructs = findIndexSS(structs, clock);
-  writeVarUint2(encoder.restEncoder, structs.length - startNewStructs);
+  writeVarUint(encoder.restEncoder, structs.length - startNewStructs);
   encoder.writeClient(client);
-  writeVarUint2(encoder.restEncoder, clock);
+  writeVarUint(encoder.restEncoder, clock);
   const firstStruct = structs[startNewStructs];
   firstStruct.write(encoder, clock - firstStruct.id.clock);
   for (let i = startNewStructs + 1; i < structs.length; i++) {
@@ -3810,7 +2965,7 @@ var writeClientsStructs = (encoder, store, _sm) => {
       sm.set(client, 0);
     }
   });
-  writeVarUint2(encoder.restEncoder, sm.size);
+  writeVarUint(encoder.restEncoder, sm.size);
   from(sm.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, clock]) => {
     writeStructs(
       encoder,
@@ -3822,13 +2977,13 @@ var writeClientsStructs = (encoder, store, _sm) => {
   });
 };
 var readClientsStructRefs = (decoder, doc2) => {
-  const clientRefs = create2();
-  const numOfStateUpdates = readVarUint2(decoder.restDecoder);
+  const clientRefs = create();
+  const numOfStateUpdates = readVarUint(decoder.restDecoder);
   for (let i = 0; i < numOfStateUpdates; i++) {
-    const numberOfStructs = readVarUint2(decoder.restDecoder);
+    const numberOfStructs = readVarUint(decoder.restDecoder);
     const refs = new Array(numberOfStructs);
     const client = decoder.readClient();
-    let clock = readVarUint2(decoder.restDecoder);
+    let clock = readVarUint(decoder.restDecoder);
     clientRefs.set(client, { i: 0, refs });
     for (let i2 = 0; i2 < numberOfStructs; i2++) {
       const info = decoder.readInfo();
@@ -3840,18 +2995,18 @@ var readClientsStructRefs = (decoder, doc2) => {
           break;
         }
         case 10: {
-          const len = readVarUint2(decoder.restDecoder);
+          const len = readVarUint(decoder.restDecoder);
           refs[i2] = new Skip(createID(client, clock), len);
           clock += len;
           break;
         }
         default: {
-          const cantCopyParentInfo = (info & (BIT7 | BIT82)) === 0;
+          const cantCopyParentInfo = (info & (BIT7 | BIT8)) === 0;
           const struct = new Item(
             createID(client, clock),
             null,
             // left
-            (info & BIT82) === BIT82 ? decoder.readLeftID() : null,
+            (info & BIT8) === BIT8 ? decoder.readLeftID() : null,
             // origin
             null,
             // right
@@ -3986,7 +3141,7 @@ var integrateStructs = (transaction, store, clientsStructRefs) => {
   if (restStructs.clients.size > 0) {
     const encoder = new UpdateEncoderV2();
     writeClientsStructs(encoder, restStructs, /* @__PURE__ */ new Map());
-    writeVarUint2(encoder.restEncoder, 0);
+    writeVarUint(encoder.restEncoder, 0);
     return { missing: missingSV, update: encoder.toUint8Array() };
   }
   return null;
@@ -4022,7 +3177,7 @@ var readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = new Update
   const dsRest = readAndApplyDeleteSet(structDecoder, transaction, store);
   if (store.pendingDs) {
     const pendingDSUpdate = new UpdateDecoderV2(createDecoder(store.pendingDs));
-    readVarUint2(pendingDSUpdate.restDecoder);
+    readVarUint(pendingDSUpdate.restDecoder);
     const dsRest2 = readAndApplyDeleteSet(pendingDSUpdate, transaction, store);
     if (dsRest && dsRest2) {
       store.pendingDs = mergeUpdatesV2([dsRest, dsRest2]);
@@ -4072,20 +3227,20 @@ var encodeStateAsUpdateV2 = (doc2, encodedTargetStateVector = new Uint8Array([0]
 var encodeStateAsUpdate = (doc2, encodedTargetStateVector) => encodeStateAsUpdateV2(doc2, encodedTargetStateVector, new UpdateEncoderV1());
 var readStateVector = (decoder) => {
   const ss = /* @__PURE__ */ new Map();
-  const ssLength = readVarUint2(decoder.restDecoder);
+  const ssLength = readVarUint(decoder.restDecoder);
   for (let i = 0; i < ssLength; i++) {
-    const client = readVarUint2(decoder.restDecoder);
-    const clock = readVarUint2(decoder.restDecoder);
+    const client = readVarUint(decoder.restDecoder);
+    const clock = readVarUint(decoder.restDecoder);
     ss.set(client, clock);
   }
   return ss;
 };
 var decodeStateVector = (decodedState) => readStateVector(new DSDecoderV1(createDecoder(decodedState)));
 var writeStateVector = (encoder, sv) => {
-  writeVarUint2(encoder.restEncoder, sv.size);
+  writeVarUint(encoder.restEncoder, sv.size);
   from(sv.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, clock]) => {
-    writeVarUint2(encoder.restEncoder, client);
-    writeVarUint2(encoder.restEncoder, clock);
+    writeVarUint(encoder.restEncoder, client);
+    writeVarUint(encoder.restEncoder, clock);
   });
   return encoder;
 };
@@ -4149,7 +3304,7 @@ var createSnapshot = (ds, sm) => new Snapshot(ds, sm);
 var emptySnapshot = createSnapshot(createDeleteSet(), /* @__PURE__ */ new Map());
 var isVisible = (item, snapshot) => snapshot === void 0 ? !item.deleted : snapshot.sv.has(item.id.client) && (snapshot.sv.get(item.id.client) || 0) > item.id.clock && !isDeleted(snapshot.ds, item.id);
 var splitSnapshotAffectedStructs = (transaction, snapshot) => {
-  const meta = setIfUndefined(transaction.meta, splitSnapshotAffectedStructs, create3);
+  const meta = setIfUndefined(transaction.meta, splitSnapshotAffectedStructs, create2);
   const store = transaction.doc.store;
   if (!meta.has(snapshot)) {
     snapshot.sv.forEach((clock, client) => {
@@ -4206,7 +3361,7 @@ var findIndexSS = (structs, clock) => {
   if (midclock === clock) {
     return right;
   }
-  let midindex = floor2(clock / (midclock + mid.length - 1) * right);
+  let midindex = floor(clock / (midclock + mid.length - 1) * right);
   while (left <= right) {
     mid = structs[midindex];
     midclock = mid.id.clock;
@@ -4218,7 +3373,7 @@ var findIndexSS = (structs, clock) => {
     } else {
       right = midindex - 1;
     }
-    midindex = floor2((left + right) / 2);
+    midindex = floor((left + right) / 2);
   }
   throw unexpectedCase();
 };
@@ -4312,7 +3467,7 @@ var writeUpdateMessageFromTransaction = (encoder, transaction) => {
 var addChangedTypeToTransaction = (transaction, type, parentSub) => {
   const item = type._item;
   if (item === null || item.id.clock < (transaction.beforeState.get(item.id.client) || 0) && !item.deleted) {
-    setIfUndefined(transaction.changed, type, create3).add(parentSub);
+    setIfUndefined(transaction.changed, type, create2).add(parentSub);
   }
 };
 var tryToMergeWithLefts = (structs, pos) => {
@@ -4370,7 +3525,7 @@ var tryMergeDeleteSet = (ds, store) => {
     );
     for (let di = deleteItems.length - 1; di >= 0; di--) {
       const deleteItem = deleteItems[di];
-      const mostRightIndexToCheck = min2(structs.length - 1, 1 + findIndexSS(structs, deleteItem.clock + deleteItem.len - 1));
+      const mostRightIndexToCheck = min(structs.length - 1, 1 + findIndexSS(structs, deleteItem.clock + deleteItem.len - 1));
       for (let si = mostRightIndexToCheck, struct = structs[si]; si > 0 && struct.id.clock >= deleteItem.clock; struct = structs[si]) {
         si -= 1 + tryToMergeWithLefts(structs, si);
       }
@@ -4432,7 +3587,7 @@ var cleanupTransactions = (transactionCleanups, i) => {
             /** @type {Array<GC|Item>} */
             store.clients.get(client)
           );
-          const firstChangePos = max2(findIndexSS(structs, beforeClock), 1);
+          const firstChangePos = max(findIndexSS(structs, beforeClock), 1);
           for (let i2 = structs.length - 1; i2 >= firstChangePos; ) {
             i2 -= 1 + tryToMergeWithLefts(structs, i2);
           }
@@ -4522,24 +3677,24 @@ var transact = (doc2, f, origin = null, local = true) => {
   return result;
 };
 function* lazyStructReaderGenerator(decoder) {
-  const numOfStateUpdates = readVarUint2(decoder.restDecoder);
+  const numOfStateUpdates = readVarUint(decoder.restDecoder);
   for (let i = 0; i < numOfStateUpdates; i++) {
-    const numberOfStructs = readVarUint2(decoder.restDecoder);
+    const numberOfStructs = readVarUint(decoder.restDecoder);
     const client = decoder.readClient();
-    let clock = readVarUint2(decoder.restDecoder);
+    let clock = readVarUint(decoder.restDecoder);
     for (let i2 = 0; i2 < numberOfStructs; i2++) {
       const info = decoder.readInfo();
       if (info === 10) {
-        const len = readVarUint2(decoder.restDecoder);
+        const len = readVarUint(decoder.restDecoder);
         yield new Skip(createID(client, clock), len);
         clock += len;
       } else if ((BITS5 & info) !== 0) {
-        const cantCopyParentInfo = (info & (BIT7 | BIT82)) === 0;
+        const cantCopyParentInfo = (info & (BIT7 | BIT8)) === 0;
         const struct = new Item(
           createID(client, clock),
           null,
           // left
-          (info & BIT82) === BIT82 ? decoder.readLeftID() : null,
+          (info & BIT8) === BIT8 ? decoder.readLeftID() : null,
           // origin
           null,
           // right
@@ -4742,7 +3897,7 @@ var diffUpdateV2 = (update, sv, YDecoder = UpdateDecoderV2, YEncoder = UpdateEnc
       continue;
     }
     if (curr.id.clock + curr.length > svClock) {
-      writeStructToLazyStructWriter(lazyStructWriter, curr, max2(svClock - curr.id.clock, 0));
+      writeStructToLazyStructWriter(lazyStructWriter, curr, max(svClock - curr.id.clock, 0));
       reader.next();
       while (reader.curr && reader.curr.id.client === currClient) {
         writeStructToLazyStructWriter(lazyStructWriter, reader.curr, 0);
@@ -4773,7 +3928,7 @@ var writeStructToLazyStructWriter = (lazyWriter, struct, offset) => {
   if (lazyWriter.written === 0) {
     lazyWriter.currClient = struct.id.client;
     lazyWriter.encoder.writeClient(struct.id.client);
-    writeVarUint2(lazyWriter.encoder.restEncoder, struct.id.clock + offset);
+    writeVarUint(lazyWriter.encoder.restEncoder, struct.id.clock + offset);
   }
   struct.write(lazyWriter.encoder, offset);
   lazyWriter.written++;
@@ -4781,11 +3936,11 @@ var writeStructToLazyStructWriter = (lazyWriter, struct, offset) => {
 var finishLazyStructWriting = (lazyWriter) => {
   flushLazyStructWriter(lazyWriter);
   const restEncoder = lazyWriter.encoder.restEncoder;
-  writeVarUint2(restEncoder, lazyWriter.clientStructs.length);
+  writeVarUint(restEncoder, lazyWriter.clientStructs.length);
   for (let i = 0; i < lazyWriter.clientStructs.length; i++) {
     const partStructs = lazyWriter.clientStructs[i];
-    writeVarUint2(restEncoder, partStructs.written);
-    writeUint8Array2(restEncoder, partStructs.restEncoder);
+    writeVarUint(restEncoder, partStructs.written);
+    writeUint8Array(restEncoder, partStructs.restEncoder);
   }
 };
 var convertUpdateFormat = (update, blockTransformer, YDecoder, YEncoder) => {
@@ -4850,7 +4005,7 @@ var YEvent = class {
   get keys() {
     if (this._keys === null) {
       if (this.transaction.doc._transactionCleanups.length === 0) {
-        throw create4(errorComputeChanges);
+        throw create3(errorComputeChanges);
       }
       const keys3 = /* @__PURE__ */ new Map();
       const target = this.target;
@@ -4939,11 +4094,11 @@ var YEvent = class {
     let changes = this._changes;
     if (changes === null) {
       if (this.transaction.doc._transactionCleanups.length === 0) {
-        throw create4(errorComputeChanges);
+        throw create3(errorComputeChanges);
       }
       const target = this.target;
-      const added = create3();
-      const deleted = create3();
+      const added = create2();
+      const deleted = create2();
       const delta = [];
       changes = {
         added,
@@ -5124,7 +4279,7 @@ var updateMarkerChanges = (searchMarker, index, len) => {
       p.marker = true;
     }
     if (index < m.index || len > 0 && index === m.index) {
-      m.index = max2(index, m.index + len);
+      m.index = max(index, m.index + len);
     }
   }
 };
@@ -5429,7 +4584,7 @@ var typeListInsertGenericsAfter = (transaction, parent, referenceItem, content) 
   });
   packJsonContent();
 };
-var lengthExceeded = () => create4("Length exceeded!");
+var lengthExceeded = () => create3("Length exceeded!");
 var typeListInsertGenerics = (transaction, parent, index, content) => {
   if (index > parent._length) {
     throw lengthExceeded();
@@ -6296,7 +5451,7 @@ var formatText = (transaction, parent, currPos, length3, attributes) => {
 };
 var cleanupFormattingGap = (transaction, start, curr, startAttributes, currAttributes) => {
   let end = start;
-  const endFormats = create2();
+  const endFormats = create();
   while (end && (!end.countable || end.deleted)) {
     if (!end.deleted && end.content.constructor === ContentFormat) {
       const cf = (
@@ -6380,7 +5535,7 @@ var cleanupYTextFormatting = (type) => {
         type._start
       );
       let end = type._start;
-      let startAttributes = create2();
+      let startAttributes = create();
       const currentAttributes = copy(startAttributes);
       while (end) {
         if (end.deleted === false) {
@@ -7381,7 +6536,7 @@ var YXmlFragment = class _YXmlFragment extends AbstractType {
       );
       const index = ref === null ? 0 : pc.findIndex((el) => el === ref) + 1;
       if (index === 0 && ref !== null) {
-        throw create4("Reference item not found");
+        throw create3("Reference item not found");
       }
       pc.splice(index, 0, ...content);
     }
@@ -9145,7 +8300,7 @@ var Item = class _Item extends AbstractStruct {
     const origin = offset > 0 ? createID(this.id.client, this.id.clock + offset - 1) : this.origin;
     const rightOrigin = this.rightOrigin;
     const parentSub = this.parentSub;
-    const info = this.content.getRef() & BITS5 | (origin === null ? 0 : BIT82) | // origin is defined
+    const info = this.content.getRef() & BITS5 | (origin === null ? 0 : BIT8) | // origin is defined
     (rightOrigin === null ? 0 : BIT7) | // right origin is defined
     (parentSub === null ? 0 : BIT6);
     encoder.writeInfo(info);
@@ -9246,7 +8401,7 @@ var Skip = class extends AbstractStruct {
    */
   write(encoder, offset) {
     encoder.writeInfo(structSkipRefNumber);
-    writeVarUint2(encoder.restEncoder, this.length - offset);
+    writeVarUint(encoder.restEncoder, this.length - offset);
   }
   /**
    * @param {Transaction} transaction
@@ -9266,6 +8421,861 @@ if (glo[importIdentifier] === true) {
   console.error("Yjs was already imported. This breaks constructor checks and will lead to issues! - https://github.com/yjs/yjs/issues/438");
 }
 glo[importIdentifier] = true;
+
+// src/api/client.ts
+var import_obsidian = require("obsidian");
+var RolayApiError = class extends Error {
+  constructor(status, message, code = "http_error", details) {
+    super(message);
+    this.name = "RolayApiError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
+  }
+};
+var RolayApiClient = class {
+  constructor(config) {
+    this.config = config;
+  }
+  async login(request) {
+    const response = await this.requestJson(
+      "POST",
+      "/v1/auth/login",
+      request,
+      { auth: false }
+    );
+    await this.config.saveSession({
+      accessToken: response.accessToken,
+      refreshToken: response.refreshToken,
+      user: response.user,
+      authenticatedAt: (/* @__PURE__ */ new Date()).toISOString()
+    });
+    return response;
+  }
+  async refresh() {
+    const session = this.config.getSession();
+    if (!session?.refreshToken) {
+      throw new Error("No refresh token is stored yet.");
+    }
+    const body = {
+      refreshToken: session.refreshToken
+    };
+    try {
+      const response = await this.requestJson(
+        "POST",
+        "/v1/auth/refresh",
+        body,
+        { auth: false }
+      );
+      await this.config.saveSession({
+        ...session,
+        accessToken: response.accessToken,
+        refreshToken: response.refreshToken,
+        authenticatedAt: (/* @__PURE__ */ new Date()).toISOString()
+      });
+      return response;
+    } catch (error) {
+      if (error instanceof RolayApiError && error.status === 401) {
+        await this.config.saveSession(null);
+      }
+      throw error;
+    }
+  }
+  async getCurrentUser() {
+    return this.requestJson(
+      "GET",
+      "/v1/auth/me"
+    );
+  }
+  async updateCurrentUserProfile(body) {
+    return this.requestJson(
+      "PATCH",
+      "/v1/auth/me/profile",
+      body
+    );
+  }
+  async listRooms() {
+    return this.requestJson(
+      "GET",
+      "/v1/rooms"
+    );
+  }
+  async createRoom(body) {
+    return this.requestJson(
+      "POST",
+      "/v1/rooms",
+      body
+    );
+  }
+  async joinRoom(body) {
+    return this.requestJson(
+      "POST",
+      "/v1/rooms/join",
+      body
+    );
+  }
+  async getRoomInvite(workspaceId) {
+    return this.requestJson(
+      "GET",
+      `/v1/rooms/${encodeURIComponent(workspaceId)}/invite`
+    );
+  }
+  async updateRoomInviteState(workspaceId, body) {
+    return this.requestJson(
+      "PATCH",
+      `/v1/rooms/${encodeURIComponent(workspaceId)}/invite`,
+      body
+    );
+  }
+  async regenerateRoomInvite(workspaceId) {
+    return this.requestJson(
+      "POST",
+      `/v1/rooms/${encodeURIComponent(workspaceId)}/invite/regenerate`
+    );
+  }
+  async listManagedUsers() {
+    return this.requestJson(
+      "GET",
+      "/v1/admin/users"
+    );
+  }
+  async createManagedUser(body) {
+    return this.requestJson(
+      "POST",
+      "/v1/admin/users",
+      body
+    );
+  }
+  async deleteManagedUser(userId) {
+    return this.requestJson(
+      "DELETE",
+      `/v1/admin/users/${encodeURIComponent(userId)}`
+    );
+  }
+  async listAllRoomsAsAdmin() {
+    return this.requestJson(
+      "GET",
+      "/v1/admin/workspaces"
+    );
+  }
+  async listRoomMembersAsAdmin(workspaceId) {
+    return this.requestJson(
+      "GET",
+      `/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/members`
+    );
+  }
+  async addRoomMemberAsAdmin(workspaceId, body) {
+    return this.requestJson(
+      "POST",
+      `/v1/admin/workspaces/${encodeURIComponent(workspaceId)}/members`,
+      body
+    );
+  }
+  async deleteRoomAsAdmin(workspaceId) {
+    return this.requestJson(
+      "DELETE",
+      `/v1/admin/workspaces/${encodeURIComponent(workspaceId)}`
+    );
+  }
+  async getWorkspaceTree(workspaceId) {
+    return this.requestJson(
+      "GET",
+      `/v1/workspaces/${encodeURIComponent(workspaceId)}/tree`
+    );
+  }
+  async applyBatchOperations(workspaceId, body) {
+    return this.requestJson(
+      "POST",
+      `/v1/workspaces/${encodeURIComponent(workspaceId)}/ops/batch`,
+      body
+    );
+  }
+  async createCrdtToken(entryId) {
+    return this.requestJson(
+      "POST",
+      `/v1/files/${encodeURIComponent(entryId)}/crdt-token`
+    );
+  }
+  async getWorkspaceMarkdownBootstrap(workspaceId, body) {
+    return this.requestJson(
+      "POST",
+      `/v1/workspaces/${encodeURIComponent(workspaceId)}/markdown/bootstrap`,
+      body
+    );
+  }
+  async createBlobUploadTicket(entryId, body) {
+    return this.requestJson(
+      "POST",
+      `/v1/files/${encodeURIComponent(entryId)}/blob/upload-ticket`,
+      body
+    );
+  }
+  async createBlobDownloadTicket(entryId) {
+    return this.requestJson(
+      "POST",
+      `/v1/files/${encodeURIComponent(entryId)}/blob/download-ticket`
+    );
+  }
+  async fetchAuthorizedStream(path, init = {}) {
+    const initialToken = await this.getAccessToken();
+    let response = await this.fetchStream(path, initialToken, init);
+    if (response.status === 401) {
+      await this.refresh();
+      const nextToken = await this.getAccessToken();
+      response = await this.fetchStream(path, nextToken, init);
+    }
+    if (!response.ok) {
+      throw await this.createFetchError(response);
+    }
+    return response;
+  }
+  buildAbsoluteUrl(path) {
+    return this.buildUrl(path);
+  }
+  async getValidAccessToken() {
+    return this.getAccessToken();
+  }
+  async requestJson(method, path, body, options = {}) {
+    const auth = options.auth !== false;
+    const response = auth ? await this.requestWithRefresh(method, path, body) : await this.performRequest(method, path, body, void 0);
+    if (response.status >= 400) {
+      throw createRequestUrlError(response);
+    }
+    return response.json;
+  }
+  async requestWithRefresh(method, path, body) {
+    const initialToken = await this.getAccessToken();
+    let response = await this.performRequest(method, path, body, initialToken);
+    if (response.status === 401) {
+      await this.refresh();
+      const nextToken = await this.getAccessToken();
+      response = await this.performRequest(method, path, body, nextToken);
+    }
+    if (response.status >= 400) {
+      throw createRequestUrlError(response);
+    }
+    return response;
+  }
+  async performRequest(method, path, body, accessToken) {
+    const headers = {
+      Accept: "application/json"
+    };
+    if (accessToken) {
+      headers.Authorization = `Bearer ${accessToken}`;
+    }
+    return (0, import_obsidian.requestUrl)({
+      url: this.buildUrl(path),
+      method,
+      headers,
+      contentType: body === void 0 ? void 0 : "application/json",
+      body: body === void 0 ? void 0 : JSON.stringify(body),
+      throw: false
+    });
+  }
+  async getAccessToken() {
+    const session = this.config.getSession();
+    if (session?.accessToken) {
+      return session.accessToken;
+    }
+    if (session?.refreshToken) {
+      const response = await this.refresh();
+      return response.accessToken;
+    }
+    throw new Error("You are not authenticated yet.");
+  }
+  buildUrl(path) {
+    const baseUrl = this.config.getServerUrl().trim().replace(/\/+$/, "");
+    if (!baseUrl) {
+      throw new Error("Server URL is empty.");
+    }
+    return `${baseUrl}${path}`;
+  }
+  async fetchStream(path, accessToken, init) {
+    const headers = new Headers(init.headers ?? {});
+    headers.set("Accept", "text/event-stream");
+    headers.set("Authorization", `Bearer ${accessToken}`);
+    return fetch(this.buildUrl(path), {
+      ...init,
+      headers
+    });
+  }
+  async createFetchError(response) {
+    const fallbackMessage = `HTTP ${response.status}`;
+    const responseText = await response.text();
+    return createTextError(response.status, responseText, fallbackMessage);
+  }
+};
+function createRequestUrlError(response) {
+  return createTextError(response.status, response.text, `HTTP ${response.status}`);
+}
+function createTextError(status, responseText, fallbackMessage) {
+  try {
+    const parsed = JSON.parse(responseText);
+    if (parsed?.error?.message) {
+      return new RolayApiError(
+        status,
+        parsed.error.message,
+        parsed.error.code,
+        parsed.error.details
+      );
+    }
+  } catch {
+  }
+  return new RolayApiError(status, responseText || fallbackMessage);
+}
+
+// src/obsidian/file-bridge.ts
+var import_obsidian3 = require("obsidian");
+
+// src/sync/path-mapper.ts
+var import_obsidian2 = require("obsidian");
+function normalizeSyncRoot(syncRoot) {
+  const trimmed = syncRoot.trim();
+  if (!trimmed) {
+    return "";
+  }
+  return (0, import_obsidian2.normalizePath)(trimmed);
+}
+function normalizeRoomFolderName(folderName) {
+  return folderName.trim();
+}
+function isValidRoomFolderName(folderName) {
+  const normalized = normalizeRoomFolderName(folderName);
+  return Boolean(normalized) && !/[\\/]/.test(normalized);
+}
+function getRoomRoot(syncRoot, folderName) {
+  const normalizedSyncRoot = normalizeSyncRoot(syncRoot);
+  const normalizedFolderName = normalizeRoomFolderName(folderName ?? "");
+  if (!normalizedFolderName) {
+    return normalizedSyncRoot;
+  }
+  if (!normalizedSyncRoot) {
+    return normalizedFolderName;
+  }
+  return (0, import_obsidian2.normalizePath)(`${normalizedSyncRoot}/${normalizedFolderName}`);
+}
+function toLocalPathForRoom(syncRoot, folderName, serverPath) {
+  const roomRoot = getRoomRoot(syncRoot, folderName);
+  const normalizedServerPath = (0, import_obsidian2.normalizePath)(serverPath);
+  if (!roomRoot) {
+    return normalizedServerPath;
+  }
+  if (!normalizedServerPath) {
+    return roomRoot;
+  }
+  return (0, import_obsidian2.normalizePath)(`${roomRoot}/${normalizedServerPath}`);
+}
+function toServerPathForRoom(localPath, syncRoot, folderName) {
+  const normalizedLocalPath = (0, import_obsidian2.normalizePath)(localPath);
+  const roomRoot = getRoomRoot(syncRoot, folderName);
+  if (!roomRoot) {
+    return normalizedLocalPath;
+  }
+  if (normalizedLocalPath === roomRoot) {
+    return "";
+  }
+  if (!normalizedLocalPath.startsWith(`${roomRoot}/`)) {
+    return null;
+  }
+  return normalizedLocalPath.slice(roomRoot.length + 1);
+}
+function isManagedPathForRoom(localPath, syncRoot, folderName) {
+  const normalizedLocalPath = (0, import_obsidian2.normalizePath)(localPath);
+  const roomRoot = getRoomRoot(syncRoot, folderName);
+  if (!roomRoot) {
+    return true;
+  }
+  return normalizedLocalPath === roomRoot || normalizedLocalPath.startsWith(`${roomRoot}/`);
+}
+
+// src/obsidian/file-bridge.ts
+var FileBridge = class {
+  constructor(config) {
+    this.suppressedPrefixes = /* @__PURE__ */ new Map();
+    this.app = config.app;
+    this.getSyncRoot = config.getSyncRoot;
+    this.getFolderName = config.getFolderName;
+    this.getDownloadedRooms = config.getDownloadedRooms;
+    this.getEntryByPath = config.getEntryByPath;
+    this.log = config.log;
+    this.onCreateFolder = config.onCreateFolder;
+    this.onCreateMarkdown = config.onCreateMarkdown;
+    this.onRenameOrMove = config.onRenameOrMove;
+    this.onDeleteEntry = config.onDeleteEntry;
+  }
+  async applySnapshot(snapshot, previousEntries) {
+    const folderName = this.getFolderName(snapshot.workspace.id);
+    if (!folderName) {
+      return;
+    }
+    const roomRoot = this.getRoomRoot(folderName);
+    if (roomRoot) {
+      await this.ensureFolderExists(roomRoot);
+    }
+    const previousById = new Map(previousEntries.map((entry) => [entry.id, entry]));
+    const nextById = new Map(snapshot.entries.map((entry) => [entry.id, entry]));
+    const renamedEntries = snapshot.entries.filter((entry) => !entry.deleted).filter((entry) => {
+      const previous = previousById.get(entry.id);
+      return previous && !previous.deleted && previous.path !== entry.path;
+    });
+    for (const entry of renamedEntries) {
+      const previous = previousById.get(entry.id);
+      if (previous) {
+        await this.safeApply(`rename local ${previous.path} -> ${entry.path}`, async () => {
+          await this.renameLocalPath(folderName, previous.path, entry.path);
+        });
+      }
+    }
+    const activeEntries = snapshot.entries.filter((entry) => !entry.deleted).sort(compareEntriesForMaterialization);
+    for (const entry of activeEntries) {
+      await this.safeApply(`materialize ${entry.path}`, async () => {
+        await this.ensureLocalEntry(folderName, entry);
+      });
+    }
+    const deletedEntries = previousEntries.filter((previous) => {
+      if (previous.deleted) {
+        return false;
+      }
+      const next = nextById.get(previous.id);
+      return !next || next.deleted;
+    });
+    for (const entry of deletedEntries.sort(compareEntriesForDeletion)) {
+      await this.safeApply(`trash ${entry.path}`, async () => {
+        await this.trashLocalEntry(folderName, entry.path);
+      });
+    }
+  }
+  async handleVaultCreate(file) {
+    const resolved = this.resolveRoomPath(file.path);
+    if (!resolved || this.isSuppressedPath(file.path)) {
+      return;
+    }
+    if (this.getEntryByPath(resolved.workspaceId, resolved.serverPath)) {
+      return;
+    }
+    if (file instanceof import_obsidian3.TFolder) {
+      await this.onCreateFolder(resolved.workspaceId, resolved.serverPath);
+      return;
+    }
+    if (file instanceof import_obsidian3.TFile && file.extension === "md") {
+      await this.onCreateMarkdown(
+        resolved.workspaceId,
+        resolved.serverPath,
+        await this.readMarkdownFile(file)
+      );
+      return;
+    }
+    this.log(`Ignoring unsupported local create for ${file.path}. Blob upload is not implemented yet.`);
+  }
+  async handleVaultRename(file, oldPath) {
+    if (this.isSuppressedPath(oldPath) || this.isSuppressedPath(file.path)) {
+      return;
+    }
+    const oldResolved = this.resolveRoomPath(oldPath);
+    const newResolved = this.resolveRoomPath(file.path);
+    if (!oldResolved && !newResolved) {
+      return;
+    }
+    if (!oldResolved && newResolved) {
+      await this.handleVaultCreate(file);
+      return;
+    }
+    if (oldResolved && !newResolved) {
+      const entry2 = this.getEntryByPath(oldResolved.workspaceId, oldResolved.serverPath);
+      if (!entry2) {
+        return;
+      }
+      await this.onDeleteEntry(oldResolved.workspaceId, entry2);
+      return;
+    }
+    if (!oldResolved || !newResolved) {
+      return;
+    }
+    if (oldResolved.workspaceId !== newResolved.workspaceId) {
+      this.log(`Managed path ${oldPath} was moved across room roots. Cross-room moves are not supported.`);
+      return;
+    }
+    const entry = this.getEntryByPath(oldResolved.workspaceId, oldResolved.serverPath);
+    if (!entry) {
+      return;
+    }
+    const type = getParentPath(oldResolved.serverPath) === getParentPath(newResolved.serverPath) ? "rename_entry" : "move_entry";
+    await this.onRenameOrMove(oldResolved.workspaceId, entry, newResolved.serverPath, type);
+  }
+  async handleVaultDelete(file) {
+    const resolved = this.resolveRoomPath(file.path);
+    if (!resolved || this.isSuppressedPath(file.path)) {
+      return;
+    }
+    const roomRoot = this.getRoomRoot(resolved.folderName);
+    if (!this.app.vault.getAbstractFileByPath(roomRoot)) {
+      this.log(`Skipping remote delete for ${file.path} because the local room root is no longer installed.`);
+      return;
+    }
+    const entry = this.getEntryByPath(resolved.workspaceId, resolved.serverPath);
+    if (!entry) {
+      return;
+    }
+    await this.onDeleteEntry(resolved.workspaceId, entry);
+  }
+  toLocalPath(workspaceId, serverPath) {
+    const folderName = this.getFolderName(workspaceId);
+    if (!folderName) {
+      return null;
+    }
+    return toLocalPathForRoom(this.getSyncRoot(), folderName, serverPath);
+  }
+  resolveRoomPath(localPath) {
+    for (const room of this.getDownloadedRooms()) {
+      if (!isManagedPathForRoom(localPath, this.getSyncRoot(), room.folderName)) {
+        continue;
+      }
+      const serverPath = toServerPathForRoom(localPath, this.getSyncRoot(), room.folderName);
+      if (serverPath === null) {
+        continue;
+      }
+      return {
+        ...room,
+        serverPath
+      };
+    }
+    return null;
+  }
+  async renameLocalPath(folderName, oldServerPath, newServerPath) {
+    const oldLocalPath = toLocalPathForRoom(this.getSyncRoot(), folderName, oldServerPath);
+    const newLocalPath = toLocalPathForRoom(this.getSyncRoot(), folderName, newServerPath);
+    if (oldLocalPath === newLocalPath) {
+      return;
+    }
+    const existing = this.app.vault.getAbstractFileByPath(oldLocalPath);
+    if (!existing) {
+      return;
+    }
+    const destination = this.app.vault.getAbstractFileByPath(newLocalPath);
+    if (destination && destination.path !== existing.path) {
+      this.log(`Skipped local rename to ${newLocalPath} because that path already exists.`);
+      return;
+    }
+    await this.ensureFolderExists(getParentPath(newLocalPath));
+    await this.withSuppressedPaths([oldLocalPath, newLocalPath], async () => {
+      await this.app.fileManager.renameFile(existing, newLocalPath);
+    });
+  }
+  async ensureLocalEntry(folderName, entry) {
+    const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, entry.path);
+    const existing = this.app.vault.getAbstractFileByPath(localPath);
+    if (entry.kind === "folder") {
+      await this.ensureFolderExists(localPath);
+      return;
+    }
+    await this.ensureFolderExists(getParentPath(localPath));
+    if (existing) {
+      return;
+    }
+    if (entry.kind === "markdown") {
+      await this.withSuppressedPaths([localPath], async () => {
+        await this.app.vault.create(localPath, "");
+      });
+      return;
+    }
+    this.log(`Skipping binary materialization for ${entry.path} until blob download is implemented.`);
+  }
+  async trashLocalEntry(folderName, serverPath) {
+    const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, serverPath);
+    const existing = this.app.vault.getAbstractFileByPath(localPath);
+    if (!existing) {
+      return;
+    }
+    await this.withSuppressedPaths([localPath], async () => {
+      await this.app.vault.trash(existing, false);
+    });
+  }
+  async ensureFolderExists(folderPath) {
+    const normalizedFolderPath = (0, import_obsidian3.normalizePath)(folderPath);
+    if (!normalizedFolderPath) {
+      return;
+    }
+    const segments = normalizedFolderPath.split("/");
+    let currentPath = "";
+    for (const segment of segments) {
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+      const existing = this.app.vault.getAbstractFileByPath(currentPath);
+      if (existing instanceof import_obsidian3.TFolder) {
+        continue;
+      }
+      if (existing) {
+        throw new Error(`Expected folder at ${currentPath}, but a file already exists there.`);
+      }
+      await this.withSuppressedPaths([currentPath], async () => {
+        await this.app.vault.createFolder(currentPath);
+      });
+    }
+  }
+  getRoomRoot(folderName) {
+    return getRoomRoot(this.getSyncRoot(), folderName);
+  }
+  async readMarkdownFile(file) {
+    try {
+      return await this.app.vault.cachedRead(file);
+    } catch (error) {
+      this.log(`Failed to read markdown content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
+      return "";
+    }
+  }
+  isSuppressedPath(path) {
+    const normalizedPath = (0, import_obsidian3.normalizePath)(path);
+    for (const prefix of this.suppressedPrefixes.keys()) {
+      if (normalizedPath === prefix || normalizedPath.startsWith(`${prefix}/`)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  async withSuppressedPaths(paths, work) {
+    const normalizedPaths = [...new Set(paths.map((path) => (0, import_obsidian3.normalizePath)(path)).filter(Boolean))];
+    for (const path of normalizedPaths) {
+      this.incrementSuppression(path);
+    }
+    try {
+      await work();
+    } finally {
+      window.setTimeout(() => {
+        for (const path of normalizedPaths) {
+          this.decrementSuppression(path);
+        }
+      }, 750);
+    }
+  }
+  async runWithSuppressedPaths(paths, work) {
+    await this.withSuppressedPaths(paths, work);
+  }
+  incrementSuppression(path) {
+    this.suppressedPrefixes.set(path, (this.suppressedPrefixes.get(path) ?? 0) + 1);
+  }
+  decrementSuppression(path) {
+    const currentCount = this.suppressedPrefixes.get(path);
+    if (!currentCount) {
+      return;
+    }
+    if (currentCount <= 1) {
+      this.suppressedPrefixes.delete(path);
+      return;
+    }
+    this.suppressedPrefixes.set(path, currentCount - 1);
+  }
+  async safeApply(label, work) {
+    try {
+      await work();
+    } catch (error) {
+      this.log(`${label} failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+};
+function getParentPath(path) {
+  const normalized = (0, import_obsidian3.normalizePath)(path);
+  const separatorIndex = normalized.lastIndexOf("/");
+  return separatorIndex === -1 ? "" : normalized.slice(0, separatorIndex);
+}
+function compareEntriesForMaterialization(left, right) {
+  if (left.kind === "folder" && right.kind !== "folder") {
+    return -1;
+  }
+  if (left.kind !== "folder" && right.kind === "folder") {
+    return 1;
+  }
+  return left.path.localeCompare(right.path);
+}
+function compareEntriesForDeletion(left, right) {
+  return right.path.length - left.path.length;
+}
+
+// node_modules/@hocuspocus/common/dist/hocuspocus-common.esm.js
+var floor2 = Math.floor;
+var min2 = (a, b) => a < b ? a : b;
+var max2 = (a, b) => a > b ? a : b;
+var BIT82 = 128;
+var BITS72 = 127;
+var MAX_SAFE_INTEGER2 = Number.MAX_SAFE_INTEGER;
+var _encodeUtf8Polyfill2 = (str) => {
+  const encodedString = unescape(encodeURIComponent(str));
+  const len = encodedString.length;
+  const buf = new Uint8Array(len);
+  for (let i = 0; i < len; i++) {
+    buf[i] = /** @type {number} */
+    encodedString.codePointAt(i);
+  }
+  return buf;
+};
+var utf8TextEncoder2 = (
+  /** @type {TextEncoder} */
+  typeof TextEncoder !== "undefined" ? new TextEncoder() : null
+);
+var _encodeUtf8Native2 = (str) => utf8TextEncoder2.encode(str);
+var encodeUtf82 = utf8TextEncoder2 ? _encodeUtf8Native2 : _encodeUtf8Polyfill2;
+var utf8TextDecoder2 = typeof TextDecoder === "undefined" ? null : new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+if (utf8TextDecoder2 && utf8TextDecoder2.decode(new Uint8Array()).length === 1) {
+  utf8TextDecoder2 = null;
+}
+var write2 = (encoder, num) => {
+  const bufferLen = encoder.cbuf.length;
+  if (encoder.cpos === bufferLen) {
+    encoder.bufs.push(encoder.cbuf);
+    encoder.cbuf = new Uint8Array(bufferLen * 2);
+    encoder.cpos = 0;
+  }
+  encoder.cbuf[encoder.cpos++] = num;
+};
+var writeVarUint2 = (encoder, num) => {
+  while (num > BITS72) {
+    write2(encoder, BIT82 | BITS72 & num);
+    num = floor2(num / 128);
+  }
+  write2(encoder, BITS72 & num);
+};
+var _strBuffer2 = new Uint8Array(3e4);
+var _maxStrBSize2 = _strBuffer2.length / 3;
+var _writeVarStringNative2 = (encoder, str) => {
+  if (str.length < _maxStrBSize2) {
+    const written = utf8TextEncoder2.encodeInto(str, _strBuffer2).written || 0;
+    writeVarUint2(encoder, written);
+    for (let i = 0; i < written; i++) {
+      write2(encoder, _strBuffer2[i]);
+    }
+  } else {
+    writeVarUint8Array2(encoder, encodeUtf82(str));
+  }
+};
+var _writeVarStringPolyfill2 = (encoder, str) => {
+  const encodedString = unescape(encodeURIComponent(str));
+  const len = encodedString.length;
+  writeVarUint2(encoder, len);
+  for (let i = 0; i < len; i++) {
+    write2(
+      encoder,
+      /** @type {number} */
+      encodedString.codePointAt(i)
+    );
+  }
+};
+var writeVarString2 = utf8TextEncoder2 && /** @type {any} */
+utf8TextEncoder2.encodeInto ? _writeVarStringNative2 : _writeVarStringPolyfill2;
+var writeUint8Array2 = (encoder, uint8Array) => {
+  const bufferLen = encoder.cbuf.length;
+  const cpos = encoder.cpos;
+  const leftCopyLen = min2(bufferLen - cpos, uint8Array.length);
+  const rightCopyLen = uint8Array.length - leftCopyLen;
+  encoder.cbuf.set(uint8Array.subarray(0, leftCopyLen), cpos);
+  encoder.cpos += leftCopyLen;
+  if (rightCopyLen > 0) {
+    encoder.bufs.push(encoder.cbuf);
+    encoder.cbuf = new Uint8Array(max2(bufferLen * 2, rightCopyLen));
+    encoder.cbuf.set(uint8Array.subarray(leftCopyLen));
+    encoder.cpos = rightCopyLen;
+  }
+};
+var writeVarUint8Array2 = (encoder, uint8Array) => {
+  writeVarUint2(encoder, uint8Array.byteLength);
+  writeUint8Array2(encoder, uint8Array);
+};
+var create7 = (s) => new Error(s);
+var errorUnexpectedEndOfArray2 = create7("Unexpected end of array");
+var errorIntegerOutOfRange2 = create7("Integer out of Range");
+var readUint8Array2 = (decoder, len) => {
+  const view = new Uint8Array(decoder.arr.buffer, decoder.pos + decoder.arr.byteOffset, len);
+  decoder.pos += len;
+  return view;
+};
+var readVarUint8Array2 = (decoder) => readUint8Array2(decoder, readVarUint2(decoder));
+var readUint82 = (decoder) => decoder.arr[decoder.pos++];
+var readVarUint2 = (decoder) => {
+  let num = 0;
+  let mult = 1;
+  const len = decoder.arr.length;
+  while (decoder.pos < len) {
+    const r = decoder.arr[decoder.pos++];
+    num = num + (r & BITS72) * mult;
+    mult *= 128;
+    if (r < BIT82) {
+      return num;
+    }
+    if (num > MAX_SAFE_INTEGER2) {
+      throw errorIntegerOutOfRange2;
+    }
+  }
+  throw errorUnexpectedEndOfArray2;
+};
+var _readVarStringPolyfill2 = (decoder) => {
+  let remainingLen = readVarUint2(decoder);
+  if (remainingLen === 0) {
+    return "";
+  } else {
+    let encodedString = String.fromCodePoint(readUint82(decoder));
+    if (--remainingLen < 100) {
+      while (remainingLen--) {
+        encodedString += String.fromCodePoint(readUint82(decoder));
+      }
+    } else {
+      while (remainingLen > 0) {
+        const nextLen = remainingLen < 1e4 ? remainingLen : 1e4;
+        const bytes = decoder.arr.subarray(decoder.pos, decoder.pos + nextLen);
+        decoder.pos += nextLen;
+        encodedString += String.fromCodePoint.apply(
+          null,
+          /** @type {any} */
+          bytes
+        );
+        remainingLen -= nextLen;
+      }
+    }
+    return decodeURIComponent(escape(encodedString));
+  }
+};
+var _readVarStringNative2 = (decoder) => (
+  /** @type any */
+  utf8TextDecoder2.decode(readVarUint8Array2(decoder))
+);
+var readVarString2 = utf8TextDecoder2 ? _readVarStringNative2 : _readVarStringPolyfill2;
+var AuthMessageType;
+(function(AuthMessageType2) {
+  AuthMessageType2[AuthMessageType2["Token"] = 0] = "Token";
+  AuthMessageType2[AuthMessageType2["PermissionDenied"] = 1] = "PermissionDenied";
+  AuthMessageType2[AuthMessageType2["Authenticated"] = 2] = "Authenticated";
+})(AuthMessageType || (AuthMessageType = {}));
+var writeAuthentication = (encoder, auth) => {
+  writeVarUint2(encoder, AuthMessageType.Token);
+  writeVarString2(encoder, auth);
+};
+var readAuthMessage = (decoder, sendToken, permissionDeniedHandler, authenticatedHandler) => {
+  switch (readVarUint2(decoder)) {
+    case AuthMessageType.Token: {
+      sendToken();
+      break;
+    }
+    case AuthMessageType.PermissionDenied: {
+      permissionDeniedHandler(readVarString2(decoder));
+      break;
+    }
+    case AuthMessageType.Authenticated: {
+      authenticatedHandler(readVarString2(decoder));
+      break;
+    }
+  }
+};
+var awarenessStatesToArray = (states) => {
+  return Array.from(states.entries()).map(([key, value]) => {
+    return {
+      clientId: key,
+      ...value
+    };
+  });
+};
+var WsReadyStates;
+(function(WsReadyStates2) {
+  WsReadyStates2[WsReadyStates2["Connecting"] = 0] = "Connecting";
+  WsReadyStates2[WsReadyStates2["Open"] = 1] = "Open";
+  WsReadyStates2[WsReadyStates2["Closing"] = 2] = "Closing";
+  WsReadyStates2[WsReadyStates2["Closed"] = 3] = "Closed";
+})(WsReadyStates || (WsReadyStates = {}));
 
 // node_modules/@lifeomic/attempt/dist/es6/src/index.js
 function applyDefaults(options) {
@@ -11199,7 +11209,7 @@ var CrdtSessionManager = class {
     await seedRemoteMarkdownContent({
       wsUrl: bootstrap.wsUrl,
       docId: bootstrap.docId,
-      token: bootstrap.token,
+      token: createCrdtTokenSupplier(this.apiClient, entry.id, bootstrap.token),
       localText,
       log: this.log,
       contextLabel
@@ -11220,7 +11230,7 @@ var CrdtSessionManager = class {
       currentUser,
       bootstrap.docId,
       bootstrap.wsUrl,
-      bootstrap.token,
+      createCrdtTokenSupplier(this.apiClient, entry.id, bootstrap.token),
       this.log,
       this.persistCrdtState,
       pendingOfflineUpdate ?? this.pendingOfflineUpdates.get(entry.id) ?? null
@@ -11315,7 +11325,12 @@ var BoundCrdtSession = class {
         this.log(`CRDT websocket disconnected for ${this.file.path}.`);
         this.clearRemotePresence();
       },
-      onAuthenticationFailed: () => {
+      onAuthenticationFailed: ({ reason }) => {
+        this.log(`CRDT auth failed for ${this.file.path}: ${reason}`);
+        this.clearLocalPresence();
+        this.clearRemotePresence();
+        this.provider?.disconnect();
+        this.status = "offline";
         new import_obsidian5.Notice(`Rolay CRDT auth failed for ${this.file.path}.`);
       }
     });
@@ -11589,6 +11604,18 @@ function parseRemotePresenceState(clientId, state) {
 function isRecord(value) {
   return Boolean(value) && typeof value === "object";
 }
+function createCrdtTokenSupplier(apiClient, entryId, initialToken) {
+  let nextToken = initialToken;
+  return async () => {
+    if (nextToken) {
+      const token = nextToken;
+      nextToken = null;
+      return token;
+    }
+    const bootstrap = await apiClient.createCrdtToken(entryId);
+    return bootstrap.token;
+  };
+}
 async function seedRemoteMarkdownContent(options) {
   if (!options.localText) {
     return;
@@ -11651,13 +11678,16 @@ async function seedRemoteMarkdownContent(options) {
 
 // src/settings/data.ts
 var import_obsidian6 = require("obsidian");
+var ROLAY_SERVER_URL = "http://46.16.36.87:3000";
+var ROLAY_DEVICE_NAME = import_obsidian6.Platform.isMobile ? "Obsidian Mobile" : "Obsidian Desktop";
+var ROLAY_AUTO_CONNECT = true;
 var DEFAULT_SETTINGS = {
-  serverUrl: "http://46.16.36.87:3000",
+  serverUrl: ROLAY_SERVER_URL,
   username: "",
   password: "",
   syncRoot: "Rolay",
-  deviceName: import_obsidian6.Platform.isMobile ? "Obsidian Mobile" : "Obsidian Desktop",
-  autoConnect: true,
+  deviceName: ROLAY_DEVICE_NAME,
+  autoConnect: ROLAY_AUTO_CONNECT,
   roomBindings: {}
 };
 function normalizeServerUrl(serverUrl) {
@@ -11680,6 +11710,7 @@ function createDefaultPluginData() {
     crdtCache: {
       entries: {}
     },
+    pendingMarkdownCreates: {},
     deviceId: createDeviceId(),
     logs: []
   };
@@ -11691,7 +11722,10 @@ function mergePluginData(rawData) {
   const normalizedSettings = {
     ...defaults.settings,
     ...rawSettings,
+    serverUrl: ROLAY_SERVER_URL,
     syncRoot: (rawSettings.syncRoot ?? defaults.settings.syncRoot).trim(),
+    deviceName: ROLAY_DEVICE_NAME,
+    autoConnect: ROLAY_AUTO_CONNECT,
     roomBindings: normalizeRoomBindings(rawSettings)
   };
   const normalizedSession = rawSession ? {
@@ -11707,6 +11741,7 @@ function mergePluginData(rawData) {
       rooms: normalizeRoomSyncMap(rawData?.sync)
     },
     crdtCache: normalizeCrdtCacheState(rawData?.crdtCache),
+    pendingMarkdownCreates: normalizePendingMarkdownCreates(rawData?.pendingMarkdownCreates),
     deviceId: rawData?.deviceId ?? defaults.deviceId,
     logs: Array.isArray(rawData?.logs) ? rawData.logs.slice(-100) : defaults.logs
   };
@@ -11800,6 +11835,33 @@ function normalizeCrdtCacheState(rawCache) {
   }
   return { entries };
 }
+function normalizePendingMarkdownCreates(rawPendingCreates) {
+  if (!rawPendingCreates || typeof rawPendingCreates !== "object") {
+    return {};
+  }
+  const entries = {};
+  for (const [rawLocalPath, rawPendingCreate] of Object.entries(rawPendingCreates)) {
+    if (!rawPendingCreate || typeof rawPendingCreate !== "object") {
+      continue;
+    }
+    const candidate = rawPendingCreate;
+    const localPath = normalizeStoredPath(candidate.localPath ?? rawLocalPath);
+    const serverPath = normalizeStoredPath(candidate.serverPath ?? "");
+    const workspaceId = typeof candidate.workspaceId === "string" ? candidate.workspaceId.trim() : "";
+    if (!localPath || !serverPath || !workspaceId) {
+      continue;
+    }
+    entries[localPath] = {
+      workspaceId,
+      localPath,
+      serverPath,
+      createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : (/* @__PURE__ */ new Date()).toISOString(),
+      lastAttemptAt: typeof candidate.lastAttemptAt === "string" ? candidate.lastAttemptAt : null,
+      lastError: typeof candidate.lastError === "string" ? candidate.lastError : null
+    };
+  }
+  return entries;
+}
 function normalizeUser(user) {
   if (!user) {
     return null;
@@ -11821,6 +11883,9 @@ function createDeviceId() {
     return globalThis.crypto.randomUUID();
   }
   return `rolay-device-${Date.now()}`;
+}
+function normalizeStoredPath(path) {
+  return path.trim().replace(/\\/g, "/");
 }
 
 // src/settings/tab.ts
@@ -11889,6 +11954,7 @@ function openTextInputModal(app, options) {
 var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
+    this.activeView = "general";
     this.plugin = plugin;
   }
   display() {
@@ -11896,38 +11962,50 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
     const settings = this.plugin.getSettings();
     const status = this.plugin.getStatusSnapshot();
     const currentUser = this.plugin.getCurrentUser();
-    const rooms = this.plugin.getRoomCardStates();
-    const managedUserDraft = this.plugin.getManagedUserDraft();
-    const createRoomDraft = this.plugin.getCreateRoomDraft();
-    const joinRoomDraft = this.plugin.getJoinRoomDraft();
-    const adminRoomDraft = this.plugin.getAdminRoomMemberDraft();
-    const adminRooms = this.plugin.getAdminRooms();
-    const adminRoomMembers = this.plugin.getAdminRoomMembers();
-    const adminSelectedRoomId = this.plugin.getAdminSelectedRoomId();
-    const selectedAdminRoom = adminRooms.find((room) => room.workspace.id === adminSelectedRoomId) ?? null;
+    const isAdmin = Boolean(currentUser?.isAdmin);
+    if (!isAdmin && this.activeView === "admin") {
+      this.activeView = "general";
+    }
     containerEl.empty();
     containerEl.createEl("h2", { text: "Rolay" });
-    containerEl.createEl("p", {
-      text: "Configure Rolay auth, room folder bindings, live sync, and admin controls."
+    if (isAdmin) {
+      this.renderTabSwitcher(containerEl);
+    }
+    if (this.activeView === "admin" && isAdmin) {
+      this.renderAdminView(containerEl);
+      return;
+    }
+    this.renderGeneralView(containerEl, settings, status, currentUser);
+  }
+  renderTabSwitcher(containerEl) {
+    const tabsEl = containerEl.createDiv({ cls: "rolay-settings-tabs" });
+    this.createTabButton(tabsEl, "General", "general");
+    this.createTabButton(tabsEl, "Admin", "admin");
+  }
+  createTabButton(containerEl, label, view) {
+    const button = containerEl.createEl("button", {
+      cls: "rolay-settings-tab-button",
+      text: label
     });
-    new import_obsidian8.Setting(containerEl).setName("Server URL").setDesc("Base URL of the Rolay server.").addText((text2) => {
-      text2.setPlaceholder("http://46.16.36.87:3000").setValue(settings.serverUrl).onChange(async (value) => {
-        await this.plugin.updateSettings({
-          serverUrl: normalizeServerUrl(value)
-        });
-      });
+    if (this.activeView === view) {
+      button.classList.add("mod-cta");
+    }
+    button.addEventListener("click", () => {
+      if (this.activeView === view) {
+        return;
+      }
+      this.activeView = view;
+      this.display();
     });
+  }
+  renderGeneralView(containerEl, settings, status, currentUser) {
+    const rooms = this.plugin.getRoomCardStates();
+    const createRoomDraft = this.plugin.getCreateRoomDraft();
+    const joinRoomDraft = this.plugin.getJoinRoomDraft();
     new import_obsidian8.Setting(containerEl).setName("Sync Root").setDesc("Base vault folder under which installed room folders are created.").addText((text2) => {
       text2.setPlaceholder("Rolay").setValue(settings.syncRoot).onChange(async (value) => {
         await this.plugin.updateSettings({
           syncRoot: value.trim()
-        });
-      });
-    });
-    new import_obsidian8.Setting(containerEl).setName("Device Name").setDesc("Sent during login and shown server-side as the session label.").addText((text2) => {
-      text2.setValue(settings.deviceName).onChange(async (value) => {
-        await this.plugin.updateSettings({
-          deviceName: value.trim()
         });
       });
     });
@@ -11946,52 +12024,48 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
         });
       });
     });
-    new import_obsidian8.Setting(containerEl).setName("Auto-connect on startup").setDesc("If auth is available, resume sync for every room that already has an installed local folder.").addToggle((toggle) => {
-      toggle.setValue(settings.autoConnect).onChange(async (value) => {
-        await this.plugin.updateSettings({
-          autoConnect: value
+    const authSetting = new import_obsidian8.Setting(containerEl).setName("Auth").setDesc(currentUser ? `Currently signed in as @${currentUser.username}.` : "Use the stored username and password to log into Rolay.");
+    if (currentUser) {
+      authSetting.addButton((button) => {
+        button.setWarning().setButtonText("Logout").onClick(async () => {
+          await this.plugin.logout();
+          new import_obsidian8.Notice("Rolay session cleared.");
+          this.display();
         });
       });
-    });
-    new import_obsidian8.Setting(containerEl).setName("Auth").setDesc("Login, refresh, or clear the current Rolay session.").addButton((button) => {
-      button.setButtonText("Login").onClick(async () => {
-        await this.plugin.loginWithSettings();
-        this.display();
+    } else {
+      authSetting.addButton((button) => {
+        button.setCta().setButtonText("Login").onClick(async () => {
+          await this.plugin.loginWithSettings();
+          this.display();
+        });
       });
-    }).addButton((button) => {
-      button.setButtonText("Refresh").onClick(async () => {
-        await this.plugin.refreshSession();
-        this.display();
+    }
+    if (currentUser) {
+      new import_obsidian8.Setting(containerEl).setName("Current profile").setDesc("Reload `GET /v1/auth/me` and refresh room state from the server.").addButton((button) => {
+        button.setButtonText("Reload profile").onClick(async () => {
+          await this.plugin.fetchCurrentUser(true);
+          this.display();
+        });
       });
-    }).addButton((button) => {
-      button.setButtonText("Logout").setWarning().onClick(async () => {
-        await this.plugin.logout();
-        new import_obsidian8.Notice("Rolay session cleared.");
-        this.display();
-      });
-    });
-    new import_obsidian8.Setting(containerEl).setName("Current profile").setDesc("Reload `GET /v1/auth/me` and refresh room/admin state from the server.").addButton((button) => {
-      button.setButtonText("Reload profile").onClick(async () => {
-        await this.plugin.fetchCurrentUser(true);
-        this.display();
-      });
-    });
+    }
     containerEl.createEl("h3", { text: "Logged-in Profile" });
     const profileContainer = containerEl.createDiv({ cls: "rolay-settings-status" });
     this.addInfoLine(profileContainer, "Login", currentUser?.username ?? "not authenticated");
     this.addInfoLine(profileContainer, "Display name", currentUser?.displayName ?? "not authenticated");
-    this.addInfoLine(profileContainer, "Global role", currentUser?.globalRole ?? "not authenticated");
-    this.addInfoLine(profileContainer, "Admin privileges", currentUser ? currentUser.isAdmin ? "yes" : "no" : "not authenticated");
-    new import_obsidian8.Setting(containerEl).setName("Display Name").setDesc("Every user can update their own display name through `PATCH /v1/auth/me/profile`.").addText((text2) => {
-      text2.setPlaceholder(currentUser?.displayName ?? "Display name").setValue(this.plugin.getProfileDraftDisplayName()).onChange((value) => {
-        this.plugin.setProfileDraftDisplayName(value);
+    this.addInfoLine(profileContainer, "Role", currentUser ? currentUser.isAdmin ? "admin" : "user" : "not authenticated");
+    if (currentUser) {
+      new import_obsidian8.Setting(containerEl).setName("Display Name").setDesc("Every user can update their own display name through `PATCH /v1/auth/me/profile`.").addText((text2) => {
+        text2.setPlaceholder(currentUser.displayName || "Display name").setValue(this.plugin.getProfileDraftDisplayName()).onChange((value) => {
+          this.plugin.setProfileDraftDisplayName(value);
+        });
+      }).addButton((button) => {
+        button.setButtonText("Save name").onClick(async () => {
+          await this.plugin.updateOwnDisplayName();
+          this.display();
+        });
       });
-    }).addButton((button) => {
-      button.setButtonText("Save name").onClick(async () => {
-        await this.plugin.updateOwnDisplayName();
-        this.display();
-      });
-    });
+    }
     containerEl.createEl("h3", { text: "Rooms" });
     new import_obsidian8.Setting(containerEl).setName("Room list").setDesc("Reload all rooms available to the current user. Room membership is gained only by invite key or admin assignment.").addButton((button) => {
       button.setButtonText("Refresh rooms").onClick(async () => {
@@ -12026,111 +12100,6 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
         this.display();
       });
     });
-    if (status.isAdmin) {
-      containerEl.createEl("h3", { text: "Admin Users" });
-      new import_obsidian8.Setting(containerEl).setName("Managed users").setDesc("Reload the global user list.").addButton((button) => {
-        button.setButtonText("Refresh users").onClick(async () => {
-          await this.plugin.refreshManagedUsers(true);
-          this.display();
-        });
-      });
-      new import_obsidian8.Setting(containerEl).setName("New username").setDesc("Username for the managed account.").addText((text2) => {
-        text2.setPlaceholder("student1").setValue(managedUserDraft.username).onChange((value) => {
-          this.plugin.updateManagedUserDraft({
-            username: value.trim()
-          });
-        });
-      });
-      new import_obsidian8.Setting(containerEl).setName("Temporary password").setDesc("Required for admin-created users.").addText((text2) => {
-        text2.inputEl.type = "password";
-        text2.setPlaceholder("temporary-password").setValue(managedUserDraft.password).onChange((value) => {
-          this.plugin.updateManagedUserDraft({
-            password: value
-          });
-        });
-      });
-      new import_obsidian8.Setting(containerEl).setName("Initial display name").setDesc("Optional. If empty, the server can fall back to the username.").addText((text2) => {
-        text2.setPlaceholder("Student One").setValue(managedUserDraft.displayName ?? "").onChange((value) => {
-          this.plugin.updateManagedUserDraft({
-            displayName: value
-          });
-        });
-      });
-      new import_obsidian8.Setting(containerEl).setName("Managed user role").setDesc("Admin-created users currently support `writer` and `reader`.").addDropdown((dropdown) => {
-        dropdown.addOption("writer", "writer").addOption("reader", "reader").setValue(managedUserDraft.globalRole ?? "reader").onChange((value) => {
-          this.plugin.updateManagedUserDraft({
-            globalRole: value
-          });
-        });
-      }).addButton((button) => {
-        button.setCta().setButtonText("Create user").onClick(async () => {
-          await this.plugin.createManagedUserFromDraft();
-          this.display();
-        });
-      });
-      this.renderManagedUsers(containerEl, this.plugin.getManagedUsers(), currentUser?.id ?? null);
-      containerEl.createEl("h3", { text: "Admin Rooms" });
-      new import_obsidian8.Setting(containerEl).setName("Admin room list").setDesc("Reload all rooms visible to admin.").addButton((button) => {
-        button.setButtonText("Refresh admin rooms").onClick(async () => {
-          await this.plugin.refreshAdminRooms(true);
-          this.display();
-        });
-      });
-      new import_obsidian8.Setting(containerEl).setName("Selected admin room").setDesc("Choose which room to inspect for members or room deletion.").addDropdown((dropdown) => {
-        dropdown.addOption("", "Select room");
-        for (const room of adminRooms) {
-          dropdown.addOption(room.workspace.id, `${room.workspace.name} (${room.workspace.id})`);
-        }
-        dropdown.setValue(adminSelectedRoomId).onChange((value) => {
-          this.plugin.setAdminSelectedRoomId(value);
-          this.display();
-        });
-      }).addButton((button) => {
-        button.setButtonText("Load members").onClick(async () => {
-          await this.plugin.refreshAdminRoomMembers(true);
-          this.display();
-        });
-      }).addButton((button) => {
-        button.setWarning().setButtonText("Delete room").onClick(async () => {
-          if (!selectedAdminRoom) {
-            new import_obsidian8.Notice("Select an admin room first.");
-            return;
-          }
-          if (!window.confirm(`Delete room ${selectedAdminRoom.workspace.name} (${selectedAdminRoom.workspace.id})? Local folder will not be deleted automatically.`)) {
-            return;
-          }
-          await this.plugin.deleteAdminRoom();
-          this.display();
-        });
-      });
-      this.renderAdminRooms(containerEl, adminRooms, adminSelectedRoomId);
-      if (selectedAdminRoom) {
-        const adminRoomInfo = containerEl.createDiv({ cls: "rolay-settings-status" });
-        this.addInfoLine(adminRoomInfo, "Selected room", `${selectedAdminRoom.workspace.name} (${selectedAdminRoom.workspace.id})`);
-        this.addInfoLine(adminRoomInfo, "Owners", String(selectedAdminRoom.ownerCount));
-        this.addInfoLine(adminRoomInfo, "Members", String(selectedAdminRoom.memberCount));
-        new import_obsidian8.Setting(containerEl).setName("Username to add").setDesc("Add an existing user to the selected room by username.").addText((text2) => {
-          text2.setPlaceholder("student1").setValue(adminRoomDraft.username).onChange((value) => {
-            this.plugin.updateAdminRoomMemberDraft({
-              username: value.trim()
-            });
-          });
-        });
-        new import_obsidian8.Setting(containerEl).setName("Membership role").setDesc("Role inside the selected room.").addDropdown((dropdown) => {
-          dropdown.addOption("member", "member").addOption("owner", "owner").setValue(adminRoomDraft.role ?? "member").onChange((value) => {
-            this.plugin.updateAdminRoomMemberDraft({
-              role: value
-            });
-          });
-        }).addButton((button) => {
-          button.setButtonText("Add to room").onClick(async () => {
-            await this.plugin.addUserToSelectedAdminRoom();
-            this.display();
-          });
-        });
-        this.renderRoomMembers(containerEl, adminRoomMembers);
-      }
-    }
     containerEl.createEl("h3", { text: "Status" });
     const statusContainer = containerEl.createDiv({ cls: "rolay-settings-status" });
     this.addInfoLine(statusContainer, "Authenticated user", status.userLabel);
@@ -12139,6 +12108,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
     this.addInfoLine(statusContainer, "Installed rooms", String(status.downloadedRoomCount));
     this.addInfoLine(statusContainer, "Open streams", String(status.activeStreamCount));
     this.addInfoLine(statusContainer, "Sync root", settings.syncRoot || "/");
+    this.addInfoLine(statusContainer, "Log file", status.persistentLogPath);
     this.addInfoLine(statusContainer, "CRDT session", status.crdtLabel);
     containerEl.createEl("h3", { text: "Recent sync log" });
     const logLines = status.recentLogs.length > 0 ? status.recentLogs.join("\n") : "No sync activity recorded yet.";
@@ -12146,6 +12116,118 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       cls: "rolay-settings-log",
       text: logLines
     });
+  }
+  renderAdminView(containerEl) {
+    const currentUser = this.plugin.getCurrentUser();
+    const managedUserDraft = this.plugin.getManagedUserDraft();
+    const adminRoomDraft = this.plugin.getAdminRoomMemberDraft();
+    const adminRooms = this.plugin.getAdminRooms();
+    const adminRoomMembers = this.plugin.getAdminRoomMembers();
+    const adminSelectedRoomId = this.plugin.getAdminSelectedRoomId();
+    const selectedAdminRoom = adminRooms.find((room) => room.workspace.id === adminSelectedRoomId) ?? null;
+    containerEl.createEl("h3", { text: "Admin Users" });
+    new import_obsidian8.Setting(containerEl).setName("Managed users").setDesc("Reload the global user list.").addButton((button) => {
+      button.setButtonText("Refresh users").onClick(async () => {
+        await this.plugin.refreshManagedUsers(true);
+        this.display();
+      });
+    });
+    new import_obsidian8.Setting(containerEl).setName("New username").setDesc("Username for the managed account.").addText((text2) => {
+      text2.setPlaceholder("student1").setValue(managedUserDraft.username).onChange((value) => {
+        this.plugin.updateManagedUserDraft({
+          username: value.trim()
+        });
+      });
+    });
+    new import_obsidian8.Setting(containerEl).setName("Temporary password").setDesc("Required for admin-created users.").addText((text2) => {
+      text2.inputEl.type = "password";
+      text2.setPlaceholder("temporary-password").setValue(managedUserDraft.password).onChange((value) => {
+        this.plugin.updateManagedUserDraft({
+          password: value
+        });
+      });
+    });
+    new import_obsidian8.Setting(containerEl).setName("Initial display name").setDesc("Optional. If empty, the server can fall back to the username.").addText((text2) => {
+      text2.setPlaceholder("Student One").setValue(managedUserDraft.displayName ?? "").onChange((value) => {
+        this.plugin.updateManagedUserDraft({
+          displayName: value
+        });
+      });
+    });
+    new import_obsidian8.Setting(containerEl).setName("Managed user role").setDesc("Admin-created users currently support `writer` and `reader`.").addDropdown((dropdown) => {
+      dropdown.addOption("writer", "writer").addOption("reader", "reader").setValue(managedUserDraft.globalRole ?? "reader").onChange((value) => {
+        this.plugin.updateManagedUserDraft({
+          globalRole: value
+        });
+      });
+    }).addButton((button) => {
+      button.setCta().setButtonText("Create user").onClick(async () => {
+        await this.plugin.createManagedUserFromDraft();
+        this.display();
+      });
+    });
+    this.renderManagedUsers(containerEl, this.plugin.getManagedUsers(), currentUser?.id ?? null);
+    containerEl.createEl("h3", { text: "Admin Rooms" });
+    new import_obsidian8.Setting(containerEl).setName("Admin room list").setDesc("Reload all rooms visible to admin.").addButton((button) => {
+      button.setButtonText("Refresh admin rooms").onClick(async () => {
+        await this.plugin.refreshAdminRooms(true);
+        this.display();
+      });
+    });
+    new import_obsidian8.Setting(containerEl).setName("Selected admin room").setDesc("Choose which room to inspect for members or room deletion.").addDropdown((dropdown) => {
+      dropdown.addOption("", "Select room");
+      for (const room of adminRooms) {
+        dropdown.addOption(room.workspace.id, `${room.workspace.name} (${room.workspace.id})`);
+      }
+      dropdown.setValue(adminSelectedRoomId).onChange((value) => {
+        this.plugin.setAdminSelectedRoomId(value);
+        this.display();
+      });
+    }).addButton((button) => {
+      button.setButtonText("Load members").onClick(async () => {
+        await this.plugin.refreshAdminRoomMembers(true);
+        this.display();
+      });
+    }).addButton((button) => {
+      button.setWarning().setButtonText("Delete room").onClick(async () => {
+        if (!selectedAdminRoom) {
+          new import_obsidian8.Notice("Select an admin room first.");
+          return;
+        }
+        if (!window.confirm(`Delete room ${selectedAdminRoom.workspace.name} (${selectedAdminRoom.workspace.id})? Local folder will not be deleted automatically.`)) {
+          return;
+        }
+        await this.plugin.deleteAdminRoom();
+        this.display();
+      });
+    });
+    this.renderAdminRooms(containerEl, adminRooms, adminSelectedRoomId);
+    if (selectedAdminRoom) {
+      const adminRoomInfo = containerEl.createDiv({ cls: "rolay-settings-status" });
+      this.addInfoLine(adminRoomInfo, "Selected room", `${selectedAdminRoom.workspace.name} (${selectedAdminRoom.workspace.id})`);
+      this.addInfoLine(adminRoomInfo, "Owners", String(selectedAdminRoom.ownerCount));
+      this.addInfoLine(adminRoomInfo, "Members", String(selectedAdminRoom.memberCount));
+      new import_obsidian8.Setting(containerEl).setName("Username to add").setDesc("Add an existing user to the selected room by username.").addText((text2) => {
+        text2.setPlaceholder("student1").setValue(adminRoomDraft.username).onChange((value) => {
+          this.plugin.updateAdminRoomMemberDraft({
+            username: value.trim()
+          });
+        });
+      });
+      new import_obsidian8.Setting(containerEl).setName("Membership role").setDesc("Role inside the selected room.").addDropdown((dropdown) => {
+        dropdown.addOption("member", "member").addOption("owner", "owner").setValue(adminRoomDraft.role ?? "member").onChange((value) => {
+          this.plugin.updateAdminRoomMemberDraft({
+            role: value
+          });
+        });
+      }).addButton((button) => {
+        button.setButtonText("Add to room").onClick(async () => {
+          await this.plugin.addUserToSelectedAdminRoom();
+          this.display();
+        });
+      });
+      this.renderRoomMembers(containerEl, adminRoomMembers);
+    }
   }
   renderRoomCards(containerEl, rooms) {
     const listEl = containerEl.createDiv({ cls: "rolay-settings-status" });
@@ -12167,6 +12249,8 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       this.addInfoLine(itemEl, "Last cursor", card.lastCursorLabel);
       this.addInfoLine(itemEl, "Last snapshot", card.lastSnapshotLabel);
       this.addInfoLine(itemEl, "Entries", String(card.entryCount));
+      this.addInfoLine(itemEl, "Markdown files", String(card.markdownEntryCount));
+      this.addInfoLine(itemEl, "CRDT cache", card.crdtCacheLabel);
       new import_obsidian8.Setting(itemEl).setName("Local folder binding").setDesc(card.downloaded ? "This room already has a local folder binding. Use `Rename` to move it to another local folder name without changing the room on the server." : "Install this room into a local vault folder. The default folder name is the room name.").addButton((button) => {
         if (!card.downloaded) {
           button.setCta();
@@ -12670,15 +12754,22 @@ var OperationsQueue = class {
       }
       await this.onAfterApply?.(workspaceId, reason);
       if (failed) {
-        throw new Error(
-          `Rolay server returned ${failed.status} for ${operation.type}: ${failed.reason ?? "unknown"}`
-        );
+        throw new RolayOperationError(workspaceId, opWithId, failed);
       }
       return response;
     };
     const task = this.chain.then(queued, queued);
     this.chain = task.then(() => void 0, () => void 0);
     return task;
+  }
+};
+var RolayOperationError = class extends Error {
+  constructor(workspaceId, operation, result) {
+    super(`Rolay server returned ${result.status} for ${operation.type}: ${result.reason ?? "unknown"}`);
+    this.name = "RolayOperationError";
+    this.workspaceId = workspaceId;
+    this.operation = operation;
+    this.result = result;
   }
 };
 function createOperationId() {
@@ -12716,7 +12807,9 @@ var TreeStore = class {
     this.entriesByPath.clear();
     for (const entry of snapshot.entries) {
       this.entriesById.set(entry.id, entry);
-      this.entriesByPath.set(normalizePath3(entry.path), entry);
+      if (!entry.deleted) {
+        this.entriesByPath.set(normalizePath3(entry.path), entry);
+      }
     }
   }
   recordCursor(cursor) {
@@ -12739,6 +12832,27 @@ var TreeStore = class {
   }
   getEntryByPath(path) {
     return this.entriesByPath.get(normalizePath3(path)) ?? null;
+  }
+  upsertEntry(entry) {
+    const previousEntry = this.entriesById.get(entry.id);
+    if (previousEntry) {
+      this.entriesByPath.delete(normalizePath3(previousEntry.path));
+    }
+    this.entriesById.set(entry.id, entry);
+    if (!entry.deleted) {
+      this.entriesByPath.set(normalizePath3(entry.path), entry);
+    }
+  }
+  markEntryDeleted(entryId) {
+    const existingEntry = this.entriesById.get(entryId);
+    if (!existingEntry) {
+      return;
+    }
+    this.entriesByPath.delete(normalizePath3(existingEntry.path));
+    this.entriesById.set(entryId, {
+      ...existingEntry,
+      deleted: true
+    });
   }
 };
 function normalizePath3(path) {
@@ -12776,6 +12890,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.managedUsers = [];
     this.adminSelectedRoomId = "";
     this.adminRoomMembers = [];
+    this.logFlushHandle = null;
+    this.logFileWrite = Promise.resolve();
+    this.pendingLogLines = [];
     this.profileDraftDisplayName = "";
     this.createRoomDraft = {
       name: ""
@@ -12876,6 +12993,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       if (this.persistHandle !== null) {
         window.clearTimeout(this.persistHandle);
       }
+      if (this.logFlushHandle !== null) {
+        window.clearTimeout(this.logFlushHandle);
+      }
       for (const runtime of this.roomRuntime.values()) {
         if (runtime.snapshotRefreshHandle !== null) {
           window.clearTimeout(runtime.snapshotRefreshHandle);
@@ -12883,14 +13003,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       }
     });
     this.recordLog("plugin", "Rolay plugin loaded.");
-    if (this.data.settings.autoConnect) {
-      await this.bootstrapSync("startup");
-    }
+    await this.bootstrapSync("startup");
   }
   async onunload() {
     this.stopAllRoomEventStreams();
     await this.crdtManager.disconnect();
     await this.persistNow();
+    await this.flushLogFile();
   }
   getSettings() {
     return this.data.settings;
@@ -12909,6 +13028,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       const roomSync = getRoomSyncState(this.data.sync, room.workspace.id);
       const runtime = this.roomRuntime.get(room.workspace.id);
       const treeStore = runtime?.treeStore ?? null;
+      const markdownEntries = treeStore?.getEntries().filter((entry) => !entry.deleted && entry.kind === "markdown") ?? [];
+      const cachedMarkdownCount = markdownEntries.filter((entry) => this.hasPersistedCrdtCache(entry.id)).length;
       return {
         room,
         folderName,
@@ -12919,6 +13040,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         lastCursorLabel: roomSync.lastCursor === null ? "none" : String(roomSync.lastCursor),
         lastSnapshotLabel: roomSync.lastSnapshotAt ?? "never",
         entryCount: treeStore?.getEntries().length ?? 0,
+        markdownEntryCount: markdownEntries.length,
+        cachedMarkdownCount,
+        crdtCacheLabel: this.formatRoomCrdtCacheLabel(runtime?.markdownBootstrap, markdownEntries.length, cachedMarkdownCount),
         invite: this.roomInvites.get(room.workspace.id) ?? null
       };
     });
@@ -13000,6 +13124,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       downloadedRoomCount: downloadedRooms.length,
       activeStreamCount: activeStreams,
       crdtLabel: crdtState ? `${crdtState.status} for ${crdtState.filePath}` : "inactive (open a markdown note inside a downloaded room folder)",
+      persistentLogPath: this.getPersistentLogFilePath(),
       recentLogs: this.data.logs.slice(-12).map((entry) => {
         return `[${entry.at}] ${entry.scope}/${entry.level}: ${entry.message}`;
       })
@@ -13009,12 +13134,15 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.data.settings = {
       ...this.data.settings,
       ...update,
+      serverUrl: ROLAY_SERVER_URL,
+      deviceName: ROLAY_DEVICE_NAME,
+      autoConnect: ROLAY_AUTO_CONNECT,
       roomBindings: {
         ...this.data.settings.roomBindings,
         ...update.roomBindings ?? {}
       }
     };
-    this.data.settings.serverUrl = normalizeServerUrl(this.data.settings.serverUrl);
+    this.data.settings.serverUrl = normalizeServerUrl(ROLAY_SERVER_URL);
     this.data.settings.syncRoot = this.data.settings.syncRoot.trim();
     await this.persistNow();
     this.updateStatusBar();
@@ -13030,7 +13158,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     });
   }
   async loginWithSettings(showNotice = true) {
-    const { username, password, deviceName } = this.data.settings;
+    const { username, password } = this.data.settings;
     if (!username || !password) {
       throw this.notifyError("Username and password are required before login.");
     }
@@ -13038,7 +13166,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       const response = await this.apiClient.login({
         username,
         password,
-        deviceName: deviceName || "Obsidian Desktop"
+        deviceName: ROLAY_DEVICE_NAME
       });
       await this.applySessionUser(response.user);
       await this.refreshPostAuthState();
@@ -13476,6 +13604,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         "tree",
         `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
       );
+      await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
+      await this.reconcilePendingMarkdownCreates(room.workspace.id, reason);
       await this.persistNow();
       this.updateStatusBar();
       await this.bindActiveMarkdownToCrdt();
@@ -13525,6 +13655,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     if (!runtime) {
       return;
     }
+    this.cancelRoomMarkdownBootstrap(workspaceId);
     runtime.eventStream?.stop();
     runtime.eventStream = null;
     runtime.streamStatus = "stopped";
@@ -13553,7 +13684,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     if (!this.canAttemptAuth()) {
       this.recordLog(
         "startup",
-        `Skipping ${reason} auto-connect because auth settings are incomplete.`
+        `Skipping ${reason} sync bootstrap because auth settings are incomplete.`
       );
       return;
     }
@@ -13639,6 +13770,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async handleVaultRename(file, oldPath) {
     try {
+      this.handlePendingMarkdownCreateRename(oldPath, file.path);
       await this.fileBridge.handleVaultRename(file, oldPath);
     } catch (error) {
       this.handleError(`Local rename sync failed for ${oldPath}`, error, false);
@@ -13646,6 +13778,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async handleVaultDelete(file) {
     try {
+      this.clearPendingMarkdownCreate(file.path);
       if (await this.handlePotentialRoomRootRemoval(file.path, "delete")) {
         return;
       }
@@ -13724,7 +13857,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       message
     };
     this.data.logs = [...this.data.logs.slice(-99), entry];
+    this.pendingLogLines.push(formatPersistentLogLine(entry));
     this.schedulePersist();
+    this.scheduleLogFlush();
     console[level === "error" ? "error" : "info"](`[Rolay] ${scope}: ${message}`);
     this.updateStatusBar();
   }
@@ -13754,6 +13889,73 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       this.persistHandle = null;
     }
     await this.saveData(this.data);
+    await this.flushLogFile();
+  }
+  scheduleLogFlush() {
+    if (this.logFlushHandle !== null) {
+      return;
+    }
+    this.logFlushHandle = window.setTimeout(() => {
+      this.logFlushHandle = null;
+      void this.flushLogFile();
+    }, 250);
+  }
+  async flushLogFile() {
+    if (this.logFlushHandle !== null) {
+      window.clearTimeout(this.logFlushHandle);
+      this.logFlushHandle = null;
+    }
+    const nextBatch = this.pendingLogLines.splice(0).join("");
+    if (!nextBatch) {
+      await this.logFileWrite;
+      return;
+    }
+    this.logFileWrite = this.logFileWrite.then(async () => {
+      try {
+        await this.ensurePersistentLogFolderExists();
+        const adapter = this.app.vault.adapter;
+        const logFilePath = this.getPersistentLogFilePath();
+        if (await adapter.exists(logFilePath)) {
+          await adapter.append(logFilePath, nextBatch);
+        } else {
+          await adapter.write(logFilePath, nextBatch);
+        }
+        await this.trimPersistentLogFileIfNeeded(logFilePath);
+      } catch (error) {
+        console.error("[Rolay] failed to write persistent log file", error);
+      }
+    });
+    await this.logFileWrite;
+  }
+  getPersistentLogFilePath() {
+    return (0, import_obsidian9.normalizePath)(`${this.app.vault.configDir}/plugins/${this.manifest.id}/${_RolayPlugin.LOG_FILE_NAME}`);
+  }
+  getPersistentLogFolderPath() {
+    return (0, import_obsidian9.normalizePath)(`${this.app.vault.configDir}/plugins/${this.manifest.id}`);
+  }
+  async ensurePersistentLogFolderExists() {
+    const adapter = this.app.vault.adapter;
+    const folderPath = this.getPersistentLogFolderPath();
+    const segments = folderPath.split("/").filter(Boolean);
+    let currentPath = "";
+    for (const segment of segments) {
+      currentPath = currentPath ? `${currentPath}/${segment}` : segment;
+      if (await adapter.exists(currentPath)) {
+        continue;
+      }
+      await adapter.mkdir(currentPath);
+    }
+  }
+  async trimPersistentLogFileIfNeeded(logFilePath) {
+    const stat = await this.app.vault.adapter.stat(logFilePath);
+    if (!stat || stat.size <= _RolayPlugin.MAX_LOG_FILE_BYTES) {
+      return;
+    }
+    const fileContents = await this.app.vault.adapter.read(logFilePath);
+    const keptTail = fileContents.slice(-Math.floor(_RolayPlugin.MAX_LOG_FILE_BYTES / 2));
+    const trimmedContents = `... trimmed older Rolay log lines ...
+${keptTail}`;
+    await this.app.vault.adapter.write(logFilePath, trimmedContents);
   }
   requireAdmin() {
     if (!this.data.session?.user?.isAdmin) {
@@ -13815,13 +14017,28 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       treeStore: new TreeStore(),
       eventStream: null,
       streamStatus: "stopped",
-      snapshotRefreshHandle: null
+      snapshotRefreshHandle: null,
+      markdownBootstrap: {
+        status: "idle",
+        totalTargets: 0,
+        completedTargets: 0,
+        lastRunAt: null,
+        lastError: null,
+        rerunRequested: false,
+        runToken: 0
+      }
     };
     this.roomRuntime.set(workspaceId, runtime);
     return runtime;
   }
   getRoomStore(workspaceId) {
     return this.roomRuntime.get(workspaceId)?.treeStore ?? null;
+  }
+  optimisticUpsertRoomEntry(workspaceId, entry) {
+    this.getRoomStore(workspaceId)?.upsertEntry(entry);
+  }
+  optimisticDeleteRoomEntry(workspaceId, entryId) {
+    this.getRoomStore(workspaceId)?.markEntryDeleted(entryId);
   }
   async saveRoomBinding(workspaceId, nextBinding) {
     const current = this.getStoredRoomBinding(workspaceId) ?? {
@@ -13878,6 +14095,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
     this.roomRuntime.delete(workspaceId);
     this.roomInvites.delete(workspaceId);
+    this.clearPendingMarkdownCreatesForWorkspace(workspaceId);
     const binding = this.getStoredRoomBinding(workspaceId);
     if (binding?.downloaded) {
       await this.saveRoomBinding(workspaceId, {
@@ -13971,6 +14189,84 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.adminRoomMembers = [];
     this.clearAdminRoomMemberDraft();
   }
+  getPendingMarkdownCreatesForWorkspace(workspaceId) {
+    return Object.values(this.data.pendingMarkdownCreates).filter((entry) => entry.workspaceId === workspaceId).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  }
+  handlePendingMarkdownCreateRename(oldPath, newPath) {
+    const normalizedOldPath = (0, import_obsidian9.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian9.normalizePath)(newPath);
+    const pendingCreate = this.data.pendingMarkdownCreates[normalizedOldPath];
+    if (!pendingCreate) {
+      return;
+    }
+    delete this.data.pendingMarkdownCreates[normalizedOldPath];
+    const nextServerPath = this.resolvePendingMarkdownServerPath(
+      pendingCreate.workspaceId,
+      normalizedNewPath,
+      pendingCreate.serverPath
+    );
+    if (!nextServerPath) {
+      this.schedulePersist();
+      this.recordLog(
+        "ops",
+        `[${pendingCreate.workspaceId}] Cleared pending markdown create for ${normalizedOldPath} because it moved outside the downloaded room.`
+      );
+      return;
+    }
+    this.data.pendingMarkdownCreates[normalizedNewPath] = {
+      ...pendingCreate,
+      localPath: normalizedNewPath,
+      serverPath: nextServerPath
+    };
+    this.schedulePersist();
+  }
+  clearPendingMarkdownCreate(localPath) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    if (!(normalizedLocalPath in this.data.pendingMarkdownCreates)) {
+      return;
+    }
+    delete this.data.pendingMarkdownCreates[normalizedLocalPath];
+    this.schedulePersist();
+  }
+  clearPendingMarkdownCreatesForWorkspace(workspaceId) {
+    let changed = false;
+    for (const [localPath, pendingCreate] of Object.entries(this.data.pendingMarkdownCreates)) {
+      if (pendingCreate.workspaceId !== workspaceId) {
+        continue;
+      }
+      delete this.data.pendingMarkdownCreates[localPath];
+      changed = true;
+    }
+    if (changed) {
+      this.schedulePersist();
+    }
+  }
+  async rememberPendingMarkdownCreate(workspaceId, localPath, serverPath, error) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const existing = this.data.pendingMarkdownCreates[normalizedLocalPath];
+    this.data.pendingMarkdownCreates[normalizedLocalPath] = {
+      workspaceId,
+      localPath: normalizedLocalPath,
+      serverPath,
+      createdAt: existing?.createdAt ?? (/* @__PURE__ */ new Date()).toISOString(),
+      lastAttemptAt: (/* @__PURE__ */ new Date()).toISOString(),
+      lastError: errorMessage
+    };
+    this.schedulePersist();
+    this.recordLog(
+      "ops",
+      `[${workspaceId}] Keeping local markdown create for ${serverPath} pending until the next successful room refresh/connect: ${errorMessage}`,
+      "error"
+    );
+  }
+  resolvePendingMarkdownServerPath(workspaceId, localPath, fallbackServerPath) {
+    const folderName = this.getDownloadedFolderName(workspaceId);
+    if (!folderName) {
+      return fallbackServerPath;
+    }
+    return toServerPathForRoom(localPath, this.data.settings.syncRoot, folderName) ?? null;
+  }
   resolveEntryByLocalPath(localPath) {
     const downloadedRooms = this.getDownloadedRooms().sort((left, right) => right.folderName.length - left.folderName.length);
     for (const room of downloadedRooms) {
@@ -13985,9 +14281,16 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
     return null;
   }
+  hasPersistedCrdtCache(entryId) {
+    return Boolean(this.findPersistedCrdtCacheEntry(entryId));
+  }
+  findPersistedCrdtCacheEntry(entryId) {
+    const cacheKey = this.getCrdtCacheKey(entryId);
+    return this.data.crdtCache.entries[cacheKey] ?? this.data.crdtCache.entries[entryId] ?? null;
+  }
   getPersistedCrdtState(entryId) {
     const cacheKey = this.getCrdtCacheKey(entryId);
-    const cached = this.data.crdtCache.entries[cacheKey] ?? this.data.crdtCache.entries[entryId];
+    const cached = this.findPersistedCrdtCacheEntry(entryId);
     if (!cached) {
       return null;
     }
@@ -14029,6 +14332,116 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   getCrdtCacheKey(entryId) {
     const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl);
     return normalizedServerUrl ? `${normalizedServerUrl}::${entryId}` : entryId;
+  }
+  formatRoomCrdtCacheLabel(bootstrap, markdownEntryCount, cachedMarkdownCount) {
+    if (markdownEntryCount === 0) {
+      return "no markdown files yet";
+    }
+    if (!bootstrap || bootstrap.status === "idle") {
+      return `${cachedMarkdownCount}/${markdownEntryCount} cached`;
+    }
+    if (bootstrap.status === "loading") {
+      return `bootstrapping ${cachedMarkdownCount}/${markdownEntryCount} cached (${bootstrap.completedTargets}/${bootstrap.totalTargets} stored)`;
+    }
+    if (bootstrap.status === "error") {
+      return `partial ${cachedMarkdownCount}/${markdownEntryCount} cached (${bootstrap.lastError ?? "bootstrap error"})`;
+    }
+    return `${cachedMarkdownCount}/${markdownEntryCount} cached`;
+  }
+  cancelRoomMarkdownBootstrap(workspaceId) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+    runtime.markdownBootstrap.runToken += 1;
+    runtime.markdownBootstrap.rerunRequested = false;
+    runtime.markdownBootstrap.status = "idle";
+    runtime.markdownBootstrap.totalTargets = 0;
+    runtime.markdownBootstrap.completedTargets = 0;
+    runtime.markdownBootstrap.lastError = null;
+  }
+  async bootstrapRoomMarkdownCache(workspaceId, entries, reason) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+    const markdownEntries = entries.filter((entry) => !entry.deleted && entry.kind === "markdown");
+    const uncachedEntries = markdownEntries.filter((entry) => !this.hasPersistedCrdtCache(entry.id));
+    if (runtime.markdownBootstrap.status === "loading") {
+      runtime.markdownBootstrap.rerunRequested = true;
+      return;
+    }
+    runtime.markdownBootstrap.runToken += 1;
+    const runToken = runtime.markdownBootstrap.runToken;
+    runtime.markdownBootstrap.rerunRequested = false;
+    runtime.markdownBootstrap.totalTargets = uncachedEntries.length;
+    runtime.markdownBootstrap.completedTargets = 0;
+    runtime.markdownBootstrap.lastRunAt = (/* @__PURE__ */ new Date()).toISOString();
+    runtime.markdownBootstrap.lastError = null;
+    runtime.markdownBootstrap.status = uncachedEntries.length > 0 ? "loading" : "ready";
+    this.updateStatusBar();
+    if (uncachedEntries.length === 0) {
+      return;
+    }
+    this.recordLog(
+      "crdt",
+      `[${workspaceId}] Bootstrapping CRDT cache for ${uncachedEntries.length} markdown document(s) via HTTP (${reason}).`
+    );
+    try {
+      const response = await this.apiClient.getWorkspaceMarkdownBootstrap(workspaceId, {
+        entryIds: uncachedEntries.map((entry) => entry.id)
+      });
+      if (runtime.markdownBootstrap.runToken !== runToken) {
+        return;
+      }
+      if (response.encoding !== "base64") {
+        throw new Error(`Unsupported markdown bootstrap encoding: ${response.encoding}`);
+      }
+      const responseByEntryId = new Map(response.documents.map((document2) => [document2.entryId, document2]));
+      for (const entry of uncachedEntries) {
+        const document2 = responseByEntryId.get(entry.id);
+        if (!document2) {
+          continue;
+        }
+        const normalizedState = normalizeBootstrapState(document2.state);
+        const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
+        this.persistCrdtState(entry.id, localPath, normalizedState);
+        runtime.markdownBootstrap.completedTargets += 1;
+      }
+      const missingEntryCount = uncachedEntries.length - runtime.markdownBootstrap.completedTargets;
+      runtime.markdownBootstrap.lastError = missingEntryCount > 0 ? `server returned ${response.documents.length}/${uncachedEntries.length} bootstrap document(s)` : null;
+      runtime.markdownBootstrap.status = missingEntryCount > 0 ? "error" : "ready";
+      this.updateStatusBar();
+      if (missingEntryCount === 0) {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets} document(s).`
+        );
+      } else {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets}/${uncachedEntries.length} document(s).`,
+          "error"
+        );
+      }
+    } catch (error) {
+      if (runtime.markdownBootstrap.runToken !== runToken) {
+        return;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      runtime.markdownBootstrap.lastError = message;
+      runtime.markdownBootstrap.status = "error";
+      this.recordLog(
+        "crdt",
+        `[${workspaceId}] HTTP markdown bootstrap failed: ${message}`,
+        "error"
+      );
+      this.updateStatusBar();
+    }
+    if (runtime.markdownBootstrap.rerunRequested) {
+      runtime.markdownBootstrap.rerunRequested = false;
+      await this.bootstrapRoomMarkdownCache(workspaceId, runtime.treeStore.getEntries(), "rerun");
+    }
   }
   isLiveSyncEnabledForLocalPath(localPath) {
     for (const room of this.getDownloadedRooms()) {
@@ -14089,7 +14502,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     });
   }
   async queueCreateFolder(workspaceId, path) {
-    await this.operationsQueue.enqueue(
+    const response = await this.operationsQueue.enqueue(
       workspaceId,
       {
         type: "create_folder",
@@ -14097,40 +14510,183 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       },
       `local folder create ${path}`
     );
+    const createdEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+    if (createdEntry) {
+      this.optimisticUpsertRoomEntry(workspaceId, createdEntry);
+    }
   }
   async queueCreateMarkdown(workspaceId, path, localContent = "") {
-    const response = await this.operationsQueue.enqueue(
+    const localPath = this.fileBridge.toLocalPath(workspaceId, path) ?? path;
+    await this.syncMarkdownCreate(workspaceId, path, localPath, localContent, 0);
+  }
+  async syncMarkdownCreate(workspaceId, path, localPath, localContent = "", conflictDepth = 0) {
+    try {
+      const response = await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type: "create_markdown",
+          path
+        },
+        `local markdown create ${path}`
+      );
+      const appliedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+      if (appliedEntry) {
+        this.optimisticUpsertRoomEntry(workspaceId, appliedEntry);
+      }
+      this.clearPendingMarkdownCreate(localPath);
+      this.recordLog(
+        "ops",
+        `[${workspaceId}] Markdown entry created for ${path}. Existing local text will be pushed into the remote CRDT doc when possible.`
+      );
+      let createdEntry = appliedEntry;
+      if (!createdEntry) {
+        await this.refreshRoomSnapshot(workspaceId, "markdown-create-seed");
+        createdEntry = this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null;
+      }
+      if (!createdEntry || createdEntry.kind !== "markdown") {
+        return;
+      }
+      const currentLocalContent = await this.readLocalMarkdownContent(localPath, localContent);
+      if (!currentLocalContent) {
+        return;
+      }
+      try {
+        const activeFile = this.app.workspace.getActiveFile();
+        if (activeFile?.path === localPath && this.isLiveSyncEnabledForLocalPath(localPath)) {
+          await this.bindActiveMarkdownToCrdt();
+          const activeCrdtState = this.crdtManager.getState();
+          if (activeCrdtState?.entryId === createdEntry.id) {
+            this.recordLog(
+              "crdt",
+              `[${workspaceId}] Skipped one-shot markdown seed for ${path} because the live CRDT session is already attached.`
+            );
+            return;
+          }
+        }
+        await this.crdtManager.seedRemoteMarkdown(createdEntry, currentLocalContent, path);
+        this.scheduleSnapshotRefresh(workspaceId, "markdown-seed");
+      } catch (error) {
+        this.handleError(`Remote markdown seed failed for ${path}`, error, false);
+      }
+    } catch (error) {
+      if (error instanceof RolayOperationError && error.result.status === "conflict" && error.result.reason === "path_already_exists") {
+        await this.resolveMarkdownCreatePathConflict(
+          workspaceId,
+          path,
+          localPath,
+          localContent,
+          error.result.suggestedPath,
+          conflictDepth
+        );
+        return;
+      }
+      await this.rememberPendingMarkdownCreate(workspaceId, localPath, path, error);
+      throw error;
+    }
+  }
+  async resolveMarkdownCreatePathConflict(workspaceId, originalServerPath, originalLocalPath, fallbackLocalContent, suggestedPath, conflictDepth) {
+    if (conflictDepth >= 8) {
+      throw new Error(`Too many markdown rename retries for ${originalServerPath}.`);
+    }
+    const localFile = this.app.vault.getAbstractFileByPath(originalLocalPath);
+    if (!(localFile instanceof import_obsidian9.TFile) || localFile.extension !== "md") {
+      this.clearPendingMarkdownCreate(originalLocalPath);
+      this.recordLog(
+        "ops",
+        `[${workspaceId}] Dropped conflicting local markdown create for ${originalServerPath} because the local file is gone.`,
+        "error"
+      );
+      return;
+    }
+    const replacementServerPath = this.findAvailableMarkdownConflictPath(
       workspaceId,
-      {
-        type: "create_markdown",
-        path
-      },
-      `local markdown create ${path}`
+      suggestedPath?.trim() || originalServerPath
     );
+    const replacementLocalPath = this.fileBridge.toLocalPath(workspaceId, replacementServerPath) ?? replacementServerPath;
+    if (replacementLocalPath === originalLocalPath) {
+      throw new Error(`No available fallback markdown path for ${originalServerPath}.`);
+    }
+    await this.fileBridge.runWithSuppressedPaths([originalLocalPath, replacementLocalPath], async () => {
+      await this.app.fileManager.renameFile(localFile, replacementLocalPath);
+    });
+    const conflictMessage = `[${workspaceId}] Local markdown ${originalServerPath} conflicted with an existing server path. Renamed local file to ${replacementServerPath} so both copies survive.`;
+    this.recordLog("ops", conflictMessage, "error");
+    new import_obsidian9.Notice(`Rolay kept your offline note as ${replacementServerPath}.`);
+    const latestLocalContent = await this.readLocalMarkdownContent(replacementLocalPath, fallbackLocalContent);
+    await this.rememberPendingMarkdownCreate(
+      workspaceId,
+      replacementLocalPath,
+      replacementServerPath,
+      new Error(conflictMessage)
+    );
+    await this.syncMarkdownCreate(
+      workspaceId,
+      replacementServerPath,
+      replacementLocalPath,
+      latestLocalContent,
+      conflictDepth + 1
+    );
+  }
+  async reconcilePendingMarkdownCreates(workspaceId, reason) {
+    const pendingCreates = this.getPendingMarkdownCreatesForWorkspace(workspaceId);
+    if (pendingCreates.length === 0) {
+      return;
+    }
     this.recordLog(
       "ops",
-      `[${workspaceId}] Markdown entry created for ${path}. Existing local text will be pushed into the remote CRDT doc when possible.`
+      `[${workspaceId}] Replaying ${pendingCreates.length} pending local markdown create(s) after ${reason}.`
     );
-    if (!localContent) {
-      return;
-    }
-    let createdEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
-    if (!createdEntry) {
-      await this.refreshRoomSnapshot(workspaceId, "markdown-create-seed");
-      createdEntry = this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null;
-    }
-    if (!createdEntry || createdEntry.kind !== "markdown") {
-      return;
-    }
-    try {
-      await this.crdtManager.seedRemoteMarkdown(createdEntry, localContent, path);
-      this.scheduleSnapshotRefresh(workspaceId, "markdown-seed");
-    } catch (error) {
-      this.handleError(`Remote markdown seed failed for ${path}`, error, false);
+    for (const pendingCreate of pendingCreates) {
+      const currentFile = this.app.vault.getAbstractFileByPath(pendingCreate.localPath);
+      if (!(currentFile instanceof import_obsidian9.TFile) || currentFile.extension !== "md") {
+        this.clearPendingMarkdownCreate(pendingCreate.localPath);
+        this.recordLog(
+          "ops",
+          `[${workspaceId}] Cleared pending markdown create for ${pendingCreate.localPath} because the local file no longer exists.`
+        );
+        continue;
+      }
+      const currentServerPath = toServerPathForRoom(
+        pendingCreate.localPath,
+        this.data.settings.syncRoot,
+        this.getDownloadedFolderName(workspaceId)
+      );
+      if (currentServerPath === null) {
+        this.clearPendingMarkdownCreate(pendingCreate.localPath);
+        this.recordLog(
+          "ops",
+          `[${workspaceId}] Cleared pending markdown create for ${pendingCreate.localPath} because it is no longer inside the room root.`
+        );
+        continue;
+      }
+      const remoteEntry = this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
+      if (remoteEntry) {
+        const currentLocalContent = await this.readLocalMarkdownContent(pendingCreate.localPath, "");
+        await this.resolveMarkdownCreatePathConflict(
+          workspaceId,
+          currentServerPath,
+          pendingCreate.localPath,
+          currentLocalContent,
+          void 0,
+          0
+        );
+        continue;
+      }
+      try {
+        const currentLocalContent = await this.readLocalMarkdownContent(pendingCreate.localPath, "");
+        await this.syncMarkdownCreate(
+          workspaceId,
+          currentServerPath,
+          pendingCreate.localPath,
+          currentLocalContent,
+          0
+        );
+      } catch {
+      }
     }
   }
   async queueRenameOrMove(workspaceId, entry, newPath, type) {
-    await this.operationsQueue.enqueue(
+    const response = await this.operationsQueue.enqueue(
       workspaceId,
       {
         type,
@@ -14143,9 +14699,14 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       },
       `${type} ${entry.path} -> ${newPath}`
     );
+    const updatedEntry = response.results.find((result) => result.status === "applied")?.entry ?? {
+      ...entry,
+      path: newPath
+    };
+    this.optimisticUpsertRoomEntry(workspaceId, updatedEntry);
   }
   async queueDeleteEntry(workspaceId, entry) {
-    await this.operationsQueue.enqueue(
+    const response = await this.operationsQueue.enqueue(
       workspaceId,
       {
         type: "delete_entry",
@@ -14157,9 +14718,57 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       },
       `delete ${entry.path}`
     );
+    const deletedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+    if (deletedEntry) {
+      this.optimisticUpsertRoomEntry(workspaceId, deletedEntry);
+      return;
+    }
+    this.optimisticDeleteRoomEntry(workspaceId, entry.id);
+  }
+  findAvailableMarkdownConflictPath(workspaceId, desiredServerPath) {
+    const normalizedDesiredPath = desiredServerPath.replace(/\\/g, "/");
+    const directoryPath = getParentPath2(normalizedDesiredPath);
+    const fileName = getFileName(normalizedDesiredPath);
+    const extension = getFileExtension(fileName);
+    const stem = extension ? fileName.slice(0, -(extension.length + 1)) : fileName;
+    const candidates = [normalizedDesiredPath];
+    for (let index = 1; index <= 999; index += 1) {
+      const candidateFileName = extension ? `${stem}(${index}).${extension}` : `${stem}(${index})`;
+      candidates.push(directoryPath ? `${directoryPath}/${candidateFileName}` : candidateFileName);
+    }
+    for (const candidatePath of candidates) {
+      const remoteExists = Boolean(this.getRoomStore(workspaceId)?.getEntryByPath(candidatePath));
+      if (remoteExists) {
+        continue;
+      }
+      const candidateLocalPath = this.fileBridge.toLocalPath(workspaceId, candidatePath) ?? candidatePath;
+      if (this.app.vault.getAbstractFileByPath(candidateLocalPath)) {
+        continue;
+      }
+      return candidatePath;
+    }
+    throw new Error(`No free conflict-safe path is available for ${desiredServerPath}.`);
+  }
+  async readLocalMarkdownContent(localPath, fallback = "") {
+    const localFile = this.app.vault.getAbstractFileByPath(localPath);
+    if (!(localFile instanceof import_obsidian9.TFile) || localFile.extension !== "md") {
+      return fallback;
+    }
+    try {
+      return await this.app.vault.cachedRead(localFile);
+    } catch (error) {
+      this.recordLog(
+        "bridge",
+        `Failed to read local markdown content for ${localPath}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+      return fallback;
+    }
   }
 };
 _RolayPlugin.MAX_PERSISTED_CRDT_DOCS = 64;
+_RolayPlugin.MAX_LOG_FILE_BYTES = 512 * 1024;
+_RolayPlugin.LOG_FILE_NAME = "rolay-sync.log";
 var RolayPlugin = _RolayPlugin;
 function compareRoomsByName(left, right) {
   const nameComparison = left.workspace.name.localeCompare(right.workspace.name);
@@ -14174,6 +14783,36 @@ function compareRoomMembers(left, right) {
   }
   return left.user.username.localeCompare(right.user.username);
 }
+function normalizeBootstrapState(encodedState) {
+  const decodedState = decodeBase64(encodedState);
+  const yDocument = new Doc();
+  try {
+    applyUpdate(yDocument, decodedState, "rolay-http-bootstrap");
+    return encodeStateAsUpdate(yDocument);
+  } finally {
+    yDocument.destroy();
+  }
+}
 function compareCrdtCacheEntries(left, right) {
   return left.updatedAt.localeCompare(right.updatedAt);
+}
+function formatPersistentLogLine(entry) {
+  const sanitizedMessage = entry.message.replace(/\r?\n/g, " ");
+  return `[${entry.at}] ${entry.scope}/${entry.level}: ${sanitizedMessage}
+`;
+}
+function getFileName(path) {
+  const separatorIndex = path.lastIndexOf("/");
+  return separatorIndex === -1 ? path : path.slice(separatorIndex + 1);
+}
+function getParentPath2(path) {
+  const separatorIndex = path.lastIndexOf("/");
+  return separatorIndex === -1 ? "" : path.slice(0, separatorIndex);
+}
+function getFileExtension(fileName) {
+  const dotIndex = fileName.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === fileName.length - 1) {
+    return "";
+  }
+  return fileName.slice(dotIndex + 1);
 }

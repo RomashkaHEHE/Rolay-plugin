@@ -1,6 +1,10 @@
 import { Platform } from "obsidian";
 import type { GlobalRole, User } from "../types/protocol";
 
+export const ROLAY_SERVER_URL = "http://46.16.36.87:3000";
+export const ROLAY_DEVICE_NAME = Platform.isMobile ? "Obsidian Mobile" : "Obsidian Desktop";
+export const ROLAY_AUTO_CONNECT = true;
+
 export interface RolayRoomBindingSettings {
   folderName: string;
   downloaded: boolean;
@@ -49,11 +53,21 @@ export interface RolayCrdtCacheState {
   entries: Record<string, RolayCrdtCacheEntry>;
 }
 
+export interface RolayPendingMarkdownCreateEntry {
+  workspaceId: string;
+  localPath: string;
+  serverPath: string;
+  createdAt: string;
+  lastAttemptAt: string | null;
+  lastError: string | null;
+}
+
 export interface RolayPluginData {
   settings: RolayPluginSettings;
   session: RolaySessionState | null;
   sync: RolaySyncState;
   crdtCache: RolayCrdtCacheState;
+  pendingMarkdownCreates: Record<string, RolayPendingMarkdownCreateEntry>;
   deviceId: string;
   logs: RolayLogEntry[];
 }
@@ -75,12 +89,12 @@ interface LegacyRolayPluginSettings {
 }
 
 export const DEFAULT_SETTINGS: RolayPluginSettings = {
-  serverUrl: "http://46.16.36.87:3000",
+  serverUrl: ROLAY_SERVER_URL,
   username: "",
   password: "",
   syncRoot: "Rolay",
-  deviceName: Platform.isMobile ? "Obsidian Mobile" : "Obsidian Desktop",
-  autoConnect: true,
+  deviceName: ROLAY_DEVICE_NAME,
+  autoConnect: ROLAY_AUTO_CONNECT,
   roomBindings: {}
 };
 
@@ -107,6 +121,7 @@ export function createDefaultPluginData(): RolayPluginData {
     crdtCache: {
       entries: {}
     },
+    pendingMarkdownCreates: {},
     deviceId: createDeviceId(),
     logs: []
   };
@@ -119,7 +134,10 @@ export function mergePluginData(rawData: Partial<RolayPluginData> | null | undef
   const normalizedSettings: RolayPluginSettings = {
     ...defaults.settings,
     ...rawSettings,
+    serverUrl: ROLAY_SERVER_URL,
     syncRoot: (rawSettings.syncRoot ?? defaults.settings.syncRoot).trim(),
+    deviceName: ROLAY_DEVICE_NAME,
+    autoConnect: ROLAY_AUTO_CONNECT,
     roomBindings: normalizeRoomBindings(rawSettings)
   };
   const normalizedSession = rawSession
@@ -138,6 +156,7 @@ export function mergePluginData(rawData: Partial<RolayPluginData> | null | undef
       rooms: normalizeRoomSyncMap(rawData?.sync)
     },
     crdtCache: normalizeCrdtCacheState(rawData?.crdtCache),
+    pendingMarkdownCreates: normalizePendingMarkdownCreates(rawData?.pendingMarkdownCreates),
     deviceId: rawData?.deviceId ?? defaults.deviceId,
     logs: Array.isArray(rawData?.logs) ? rawData.logs.slice(-100) : defaults.logs
   };
@@ -262,6 +281,40 @@ function normalizeCrdtCacheState(rawCache: unknown): RolayCrdtCacheState {
   return { entries };
 }
 
+function normalizePendingMarkdownCreates(
+  rawPendingCreates: unknown
+): Record<string, RolayPendingMarkdownCreateEntry> {
+  if (!rawPendingCreates || typeof rawPendingCreates !== "object") {
+    return {};
+  }
+
+  const entries: Record<string, RolayPendingMarkdownCreateEntry> = {};
+  for (const [rawLocalPath, rawPendingCreate] of Object.entries(rawPendingCreates)) {
+    if (!rawPendingCreate || typeof rawPendingCreate !== "object") {
+      continue;
+    }
+
+    const candidate = rawPendingCreate as Partial<RolayPendingMarkdownCreateEntry>;
+    const localPath = normalizeStoredPath(candidate.localPath ?? rawLocalPath);
+    const serverPath = normalizeStoredPath(candidate.serverPath ?? "");
+    const workspaceId = typeof candidate.workspaceId === "string" ? candidate.workspaceId.trim() : "";
+    if (!localPath || !serverPath || !workspaceId) {
+      continue;
+    }
+
+    entries[localPath] = {
+      workspaceId,
+      localPath,
+      serverPath,
+      createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : new Date().toISOString(),
+      lastAttemptAt: typeof candidate.lastAttemptAt === "string" ? candidate.lastAttemptAt : null,
+      lastError: typeof candidate.lastError === "string" ? candidate.lastError : null
+    };
+  }
+
+  return entries;
+}
+
 function normalizeUser(user: User | null | undefined): User | null {
   if (!user) {
     return null;
@@ -288,4 +341,8 @@ function createDeviceId(): string {
   }
 
   return `rolay-device-${Date.now()}`;
+}
+
+function normalizeStoredPath(path: string): string {
+  return path.trim().replace(/\\/g, "/");
 }

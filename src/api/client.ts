@@ -17,6 +17,8 @@ import type {
   JoinRoomRequest,
   LoginRequest,
   LoginResponse,
+  MarkdownBootstrapRequest,
+  MarkdownBootstrapResponse,
   ManagedUserResponse,
   RefreshRequest,
   RefreshResponse,
@@ -253,6 +255,17 @@ export class RolayApiClient {
     return this.requestJson<CrdtTokenResponse>(
       "POST",
       `/v1/files/${encodeURIComponent(entryId)}/crdt-token`
+    );
+  }
+
+  async getWorkspaceMarkdownBootstrap(
+    workspaceId: string,
+    body?: MarkdownBootstrapRequest
+  ): Promise<MarkdownBootstrapResponse> {
+    return this.requestJson<MarkdownBootstrapResponse>(
+      "POST",
+      `/v1/workspaces/${encodeURIComponent(workspaceId)}/markdown/bootstrap`,
+      body
     );
   }
 

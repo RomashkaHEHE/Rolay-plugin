@@ -21,7 +21,9 @@ export class TreeStore {
 
     for (const entry of snapshot.entries) {
       this.entriesById.set(entry.id, entry);
-      this.entriesByPath.set(normalizePath(entry.path), entry);
+      if (!entry.deleted) {
+        this.entriesByPath.set(normalizePath(entry.path), entry);
+      }
     }
   }
 
@@ -51,6 +53,31 @@ export class TreeStore {
 
   getEntryByPath(path: string): FileEntry | null {
     return this.entriesByPath.get(normalizePath(path)) ?? null;
+  }
+
+  upsertEntry(entry: FileEntry): void {
+    const previousEntry = this.entriesById.get(entry.id);
+    if (previousEntry) {
+      this.entriesByPath.delete(normalizePath(previousEntry.path));
+    }
+
+    this.entriesById.set(entry.id, entry);
+    if (!entry.deleted) {
+      this.entriesByPath.set(normalizePath(entry.path), entry);
+    }
+  }
+
+  markEntryDeleted(entryId: string): void {
+    const existingEntry = this.entriesById.get(entryId);
+    if (!existingEntry) {
+      return;
+    }
+
+    this.entriesByPath.delete(normalizePath(existingEntry.path));
+    this.entriesById.set(entryId, {
+      ...existingEntry,
+      deleted: true
+    });
   }
 }
 

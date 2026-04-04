@@ -51,9 +51,7 @@ export class OperationsQueue {
       await this.onAfterApply?.(workspaceId, reason);
 
       if (failed) {
-        throw new Error(
-          `Rolay server returned ${failed.status} for ${operation.type}: ${failed.reason ?? "unknown"}`
-        );
+        throw new RolayOperationError(workspaceId, opWithId, failed);
       }
 
       return response;
@@ -62,6 +60,20 @@ export class OperationsQueue {
     const task = this.chain.then(queued, queued);
     this.chain = task.then(() => undefined, () => undefined);
     return task;
+  }
+}
+
+export class RolayOperationError extends Error {
+  readonly workspaceId: string;
+  readonly operation: TreeOperation;
+  readonly result: OperationResult;
+
+  constructor(workspaceId: string, operation: TreeOperation, result: OperationResult) {
+    super(`Rolay server returned ${result.status} for ${operation.type}: ${result.reason ?? "unknown"}`);
+    this.name = "RolayOperationError";
+    this.workspaceId = workspaceId;
+    this.operation = operation;
+    this.result = result;
   }
 }
 

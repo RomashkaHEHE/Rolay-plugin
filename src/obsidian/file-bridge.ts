@@ -91,7 +91,7 @@ export class FileBridge {
       .filter((entry) => !entry.deleted)
       .filter((entry) => {
         const previous = previousById.get(entry.id);
-        return previous && previous.path !== entry.path;
+        return previous && !previous.deleted && previous.path !== entry.path;
       });
 
     for (const entry of renamedEntries) {
@@ -114,6 +114,10 @@ export class FileBridge {
     }
 
     const deletedEntries = previousEntries.filter((previous) => {
+      if (previous.deleted) {
+        return false;
+      }
+
       const next = nextById.get(previous.id);
       return !next || next.deleted;
     });

@@ -34,4 +34,8 @@ When the plugin receives a conflict or ambiguous tree event, it should:
 3. retry only when the rule is deterministic
 4. keep a local sync log for debugging and user support
 
-The current MVP starts that logging surface through plugin status and recent sync log entries. Offline op replay and conflict-copy materialization are still planned work.
+Current plugin behavior:
+
+- Recent sync activity is still shown in plugin settings, but it is also mirrored into `.obsidian/plugins/rolay/rolay-sync.log`.
+- Failed local markdown creates are tracked as pending work and retried on the next authoritative room refresh/connect.
+- If a pending local markdown create collides with an already existing server path, the client renames the local note to the next free filename (for example `file.md` -> `file(1).md`) before retrying, so neither copy is lost.

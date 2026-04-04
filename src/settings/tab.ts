@@ -7,10 +7,12 @@ import type {
   RoomMember
 } from "../types/protocol";
 import { openTextInputModal } from "../ui/text-input-modal";
-import { normalizeServerUrl } from "./data";
+
+type SettingsView = "general" | "admin";
 
 export class RolaySettingTab extends PluginSettingTab {
   private readonly plugin: RolayPlugin;
+  private activeView: SettingsView = "general";
 
   constructor(app: App, plugin: RolayPlugin) {
     super(app, plugin);
@@ -22,35 +24,62 @@ export class RolaySettingTab extends PluginSettingTab {
     const settings = this.plugin.getSettings();
     const status = this.plugin.getStatusSnapshot();
     const currentUser = this.plugin.getCurrentUser();
-    const rooms = this.plugin.getRoomCardStates();
-    const managedUserDraft = this.plugin.getManagedUserDraft();
-    const createRoomDraft = this.plugin.getCreateRoomDraft();
-    const joinRoomDraft = this.plugin.getJoinRoomDraft();
-    const adminRoomDraft = this.plugin.getAdminRoomMemberDraft();
-    const adminRooms = this.plugin.getAdminRooms();
-    const adminRoomMembers = this.plugin.getAdminRoomMembers();
-    const adminSelectedRoomId = this.plugin.getAdminSelectedRoomId();
-    const selectedAdminRoom = adminRooms.find((room) => room.workspace.id === adminSelectedRoomId) ?? null;
+    const isAdmin = Boolean(currentUser?.isAdmin);
+
+    if (!isAdmin && this.activeView === "admin") {
+      this.activeView = "general";
+    }
 
     containerEl.empty();
     containerEl.createEl("h2", { text: "Rolay" });
-    containerEl.createEl("p", {
-      text: "Configure Rolay auth, room folder bindings, live sync, and admin controls."
+
+    if (isAdmin) {
+      this.renderTabSwitcher(containerEl);
+    }
+
+    if (this.activeView === "admin" && isAdmin) {
+      this.renderAdminView(containerEl);
+      return;
+    }
+
+    this.renderGeneralView(containerEl, settings, status, currentUser);
+  }
+
+  private renderTabSwitcher(containerEl: HTMLElement): void {
+    const tabsEl = containerEl.createDiv({ cls: "rolay-settings-tabs" });
+    this.createTabButton(tabsEl, "General", "general");
+    this.createTabButton(tabsEl, "Admin", "admin");
+  }
+
+  private createTabButton(containerEl: HTMLElement, label: string, view: SettingsView): void {
+    const button = containerEl.createEl("button", {
+      cls: "rolay-settings-tab-button",
+      text: label
     });
 
-    new Setting(containerEl)
-      .setName("Server URL")
-      .setDesc("Base URL of the Rolay server.")
-      .addText((text) => {
-        text
-          .setPlaceholder("http://46.16.36.87:3000")
-          .setValue(settings.serverUrl)
-          .onChange(async (value) => {
-            await this.plugin.updateSettings({
-              serverUrl: normalizeServerUrl(value)
-            });
-          });
-      });
+    if (this.activeView === view) {
+      button.classList.add("mod-cta");
+    }
+
+    button.addEventListener("click", () => {
+      if (this.activeView === view) {
+        return;
+      }
+
+      this.activeView = view;
+      this.display();
+    });
+  }
+
+  private renderGeneralView(
+    containerEl: HTMLElement,
+    settings: ReturnType<RolayPlugin["getSettings"]>,
+    status: ReturnType<RolayPlugin["getStatusSnapshot"]>,
+    currentUser: ReturnType<RolayPlugin["getCurrentUser"]>
+  ): void {
+    const rooms = this.plugin.getRoomCardStates();
+    const createRoomDraft = this.plugin.getCreateRoomDraft();
+    const joinRoomDraft = this.plugin.getJoinRoomDraft();
 
     new Setting(containerEl)
       .setName("Sync Root")
@@ -62,19 +91,6 @@ export class RolaySettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             await this.plugin.updateSettings({
               syncRoot: value.trim()
-            });
-          });
-      });
-
-    new Setting(containerEl)
-      .setName("Device Name")
-      .setDesc("Sent during login and shown server-side as the session label.")
-      .addText((text) => {
-        text
-          .setValue(settings.deviceName)
-          .onChange(async (value) => {
-            await this.plugin.updateSettings({
-              deviceName: value.trim()
             });
           });
       });
@@ -106,76 +122,66 @@ export class RolaySettingTab extends PluginSettingTab {
           });
       });
 
-    new Setting(containerEl)
-      .setName("Auto-connect on startup")
-      .setDesc("If auth is available, resume sync for every room that already has an installed local folder.")
-      .addToggle((toggle) => {
-        toggle
-          .setValue(settings.autoConnect)
-          .onChange(async (value) => {
-            await this.plugin.updateSettings({
-              autoConnect: value
-            });
-          });
-      });
-
-    new Setting(containerEl)
+    const authSetting = new Setting(containerEl)
       .setName("Auth")
-      .setDesc("Login, refresh, or clear the current Rolay session.")
-      .addButton((button) => {
-        button.setButtonText("Login").onClick(async () => {
-          await this.plugin.loginWithSettings();
-          this.display();
-        });
-      })
-      .addButton((button) => {
-        button.setButtonText("Refresh").onClick(async () => {
-          await this.plugin.refreshSession();
-          this.display();
-        });
-      })
-      .addButton((button) => {
-        button.setButtonText("Logout").setWarning().onClick(async () => {
+      .setDesc(currentUser
+        ? `Currently signed in as @${currentUser.username}.`
+        : "Use the stored username and password to log into Rolay.");
+
+    if (currentUser) {
+      authSetting.addButton((button) => {
+        button.setWarning().setButtonText("Logout").onClick(async () => {
           await this.plugin.logout();
           new Notice("Rolay session cleared.");
           this.display();
         });
       });
-
-    new Setting(containerEl)
-      .setName("Current profile")
-      .setDesc("Reload `GET /v1/auth/me` and refresh room/admin state from the server.")
-      .addButton((button) => {
-        button.setButtonText("Reload profile").onClick(async () => {
-          await this.plugin.fetchCurrentUser(true);
+    } else {
+      authSetting.addButton((button) => {
+        button.setCta().setButtonText("Login").onClick(async () => {
+          await this.plugin.loginWithSettings();
           this.display();
         });
       });
+    }
+
+    if (currentUser) {
+      new Setting(containerEl)
+        .setName("Current profile")
+        .setDesc("Reload `GET /v1/auth/me` and refresh room state from the server.")
+        .addButton((button) => {
+          button.setButtonText("Reload profile").onClick(async () => {
+            await this.plugin.fetchCurrentUser(true);
+            this.display();
+          });
+        });
+    }
 
     containerEl.createEl("h3", { text: "Logged-in Profile" });
     const profileContainer = containerEl.createDiv({ cls: "rolay-settings-status" });
     this.addInfoLine(profileContainer, "Login", currentUser?.username ?? "not authenticated");
     this.addInfoLine(profileContainer, "Display name", currentUser?.displayName ?? "not authenticated");
-    this.addInfoLine(profileContainer, "Global role", currentUser?.globalRole ?? "not authenticated");
-    this.addInfoLine(profileContainer, "Admin privileges", currentUser ? (currentUser.isAdmin ? "yes" : "no") : "not authenticated");
+    this.addInfoLine(profileContainer, "Role", currentUser ? (currentUser.isAdmin ? "admin" : "user") : "not authenticated");
 
-    new Setting(containerEl)
-      .setName("Display Name")
-      .setDesc("Every user can update their own display name through `PATCH /v1/auth/me/profile`.")
-      .addText((text) => {
-        text
-          .setPlaceholder(currentUser?.displayName ?? "Display name")
-          .setValue(this.plugin.getProfileDraftDisplayName())
-          .onChange((value) => {
-            this.plugin.setProfileDraftDisplayName(value);
+    if (currentUser) {
+      new Setting(containerEl)
+        .setName("Display Name")
+        .setDesc("Every user can update their own display name through `PATCH /v1/auth/me/profile`.")
+        .addText((text) => {
+          text
+            .setPlaceholder(currentUser.displayName || "Display name")
+            .setValue(this.plugin.getProfileDraftDisplayName())
+            .onChange((value) => {
+              this.plugin.setProfileDraftDisplayName(value);
+            });
+        })
+        .addButton((button) => {
+          button.setButtonText("Save name").onClick(async () => {
+            await this.plugin.updateOwnDisplayName();
+            this.display();
           });
-      })
-      .addButton((button) => {
-        button.setButtonText("Save name").onClick(async () => {
-          await this.plugin.updateOwnDisplayName();
-          this.display();
         });
-      });
+    }
 
     containerEl.createEl("h3", { text: "Rooms" });
     new Setting(containerEl)
@@ -232,179 +238,6 @@ export class RolaySettingTab extends PluginSettingTab {
         });
       });
 
-    if (status.isAdmin) {
-      containerEl.createEl("h3", { text: "Admin Users" });
-      new Setting(containerEl)
-        .setName("Managed users")
-        .setDesc("Reload the global user list.")
-        .addButton((button) => {
-          button.setButtonText("Refresh users").onClick(async () => {
-            await this.plugin.refreshManagedUsers(true);
-            this.display();
-          });
-        });
-
-      new Setting(containerEl)
-        .setName("New username")
-        .setDesc("Username for the managed account.")
-        .addText((text) => {
-          text
-            .setPlaceholder("student1")
-            .setValue(managedUserDraft.username)
-            .onChange((value) => {
-              this.plugin.updateManagedUserDraft({
-                username: value.trim()
-              });
-            });
-        });
-
-      new Setting(containerEl)
-        .setName("Temporary password")
-        .setDesc("Required for admin-created users.")
-        .addText((text) => {
-          text.inputEl.type = "password";
-          text
-            .setPlaceholder("temporary-password")
-            .setValue(managedUserDraft.password)
-            .onChange((value) => {
-              this.plugin.updateManagedUserDraft({
-                password: value
-              });
-            });
-        });
-
-      new Setting(containerEl)
-        .setName("Initial display name")
-        .setDesc("Optional. If empty, the server can fall back to the username.")
-        .addText((text) => {
-          text
-            .setPlaceholder("Student One")
-            .setValue(managedUserDraft.displayName ?? "")
-            .onChange((value) => {
-              this.plugin.updateManagedUserDraft({
-                displayName: value
-              });
-            });
-        });
-
-      new Setting(containerEl)
-        .setName("Managed user role")
-        .setDesc("Admin-created users currently support `writer` and `reader`.")
-        .addDropdown((dropdown) => {
-          dropdown
-            .addOption("writer", "writer")
-            .addOption("reader", "reader")
-            .setValue(managedUserDraft.globalRole ?? "reader")
-            .onChange((value) => {
-              this.plugin.updateManagedUserDraft({
-                globalRole: value as "writer" | "reader"
-              });
-            });
-        })
-        .addButton((button) => {
-          button.setCta().setButtonText("Create user").onClick(async () => {
-            await this.plugin.createManagedUserFromDraft();
-            this.display();
-          });
-        });
-
-      this.renderManagedUsers(containerEl, this.plugin.getManagedUsers(), currentUser?.id ?? null);
-
-      containerEl.createEl("h3", { text: "Admin Rooms" });
-      new Setting(containerEl)
-        .setName("Admin room list")
-        .setDesc("Reload all rooms visible to admin.")
-        .addButton((button) => {
-          button.setButtonText("Refresh admin rooms").onClick(async () => {
-            await this.plugin.refreshAdminRooms(true);
-            this.display();
-          });
-        });
-
-      new Setting(containerEl)
-        .setName("Selected admin room")
-        .setDesc("Choose which room to inspect for members or room deletion.")
-        .addDropdown((dropdown) => {
-          dropdown.addOption("", "Select room");
-          for (const room of adminRooms) {
-            dropdown.addOption(room.workspace.id, `${room.workspace.name} (${room.workspace.id})`);
-          }
-          dropdown
-            .setValue(adminSelectedRoomId)
-            .onChange((value) => {
-              this.plugin.setAdminSelectedRoomId(value);
-              this.display();
-            });
-        })
-        .addButton((button) => {
-          button.setButtonText("Load members").onClick(async () => {
-            await this.plugin.refreshAdminRoomMembers(true);
-            this.display();
-          });
-        })
-        .addButton((button) => {
-          button.setWarning().setButtonText("Delete room").onClick(async () => {
-            if (!selectedAdminRoom) {
-              new Notice("Select an admin room first.");
-              return;
-            }
-
-            if (!window.confirm(`Delete room ${selectedAdminRoom.workspace.name} (${selectedAdminRoom.workspace.id})? Local folder will not be deleted automatically.`)) {
-              return;
-            }
-
-            await this.plugin.deleteAdminRoom();
-            this.display();
-          });
-        });
-
-      this.renderAdminRooms(containerEl, adminRooms, adminSelectedRoomId);
-
-      if (selectedAdminRoom) {
-        const adminRoomInfo = containerEl.createDiv({ cls: "rolay-settings-status" });
-        this.addInfoLine(adminRoomInfo, "Selected room", `${selectedAdminRoom.workspace.name} (${selectedAdminRoom.workspace.id})`);
-        this.addInfoLine(adminRoomInfo, "Owners", String(selectedAdminRoom.ownerCount));
-        this.addInfoLine(adminRoomInfo, "Members", String(selectedAdminRoom.memberCount));
-
-        new Setting(containerEl)
-          .setName("Username to add")
-          .setDesc("Add an existing user to the selected room by username.")
-          .addText((text) => {
-            text
-              .setPlaceholder("student1")
-              .setValue(adminRoomDraft.username)
-              .onChange((value) => {
-                this.plugin.updateAdminRoomMemberDraft({
-                  username: value.trim()
-                });
-              });
-          });
-
-        new Setting(containerEl)
-          .setName("Membership role")
-          .setDesc("Role inside the selected room.")
-          .addDropdown((dropdown) => {
-            dropdown
-              .addOption("member", "member")
-              .addOption("owner", "owner")
-              .setValue(adminRoomDraft.role ?? "member")
-              .onChange((value) => {
-                this.plugin.updateAdminRoomMemberDraft({
-                  role: value as "owner" | "member"
-                });
-              });
-          })
-          .addButton((button) => {
-            button.setButtonText("Add to room").onClick(async () => {
-              await this.plugin.addUserToSelectedAdminRoom();
-              this.display();
-            });
-          });
-
-        this.renderRoomMembers(containerEl, adminRoomMembers);
-      }
-    }
-
     containerEl.createEl("h3", { text: "Status" });
     const statusContainer = containerEl.createDiv({ cls: "rolay-settings-status" });
     this.addInfoLine(statusContainer, "Authenticated user", status.userLabel);
@@ -413,6 +246,7 @@ export class RolaySettingTab extends PluginSettingTab {
     this.addInfoLine(statusContainer, "Installed rooms", String(status.downloadedRoomCount));
     this.addInfoLine(statusContainer, "Open streams", String(status.activeStreamCount));
     this.addInfoLine(statusContainer, "Sync root", settings.syncRoot || "/");
+    this.addInfoLine(statusContainer, "Log file", status.persistentLogPath);
     this.addInfoLine(statusContainer, "CRDT session", status.crdtLabel);
 
     containerEl.createEl("h3", { text: "Recent sync log" });
@@ -421,6 +255,187 @@ export class RolaySettingTab extends PluginSettingTab {
       cls: "rolay-settings-log",
       text: logLines
     });
+  }
+
+  private renderAdminView(containerEl: HTMLElement): void {
+    const currentUser = this.plugin.getCurrentUser();
+    const managedUserDraft = this.plugin.getManagedUserDraft();
+    const adminRoomDraft = this.plugin.getAdminRoomMemberDraft();
+    const adminRooms = this.plugin.getAdminRooms();
+    const adminRoomMembers = this.plugin.getAdminRoomMembers();
+    const adminSelectedRoomId = this.plugin.getAdminSelectedRoomId();
+    const selectedAdminRoom = adminRooms.find((room) => room.workspace.id === adminSelectedRoomId) ?? null;
+
+    containerEl.createEl("h3", { text: "Admin Users" });
+    new Setting(containerEl)
+      .setName("Managed users")
+      .setDesc("Reload the global user list.")
+      .addButton((button) => {
+        button.setButtonText("Refresh users").onClick(async () => {
+          await this.plugin.refreshManagedUsers(true);
+          this.display();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("New username")
+      .setDesc("Username for the managed account.")
+      .addText((text) => {
+        text
+          .setPlaceholder("student1")
+          .setValue(managedUserDraft.username)
+          .onChange((value) => {
+            this.plugin.updateManagedUserDraft({
+              username: value.trim()
+            });
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Temporary password")
+      .setDesc("Required for admin-created users.")
+      .addText((text) => {
+        text.inputEl.type = "password";
+        text
+          .setPlaceholder("temporary-password")
+          .setValue(managedUserDraft.password)
+          .onChange((value) => {
+            this.plugin.updateManagedUserDraft({
+              password: value
+            });
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Initial display name")
+      .setDesc("Optional. If empty, the server can fall back to the username.")
+      .addText((text) => {
+        text
+          .setPlaceholder("Student One")
+          .setValue(managedUserDraft.displayName ?? "")
+          .onChange((value) => {
+            this.plugin.updateManagedUserDraft({
+              displayName: value
+            });
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Managed user role")
+      .setDesc("Admin-created users currently support `writer` and `reader`.")
+      .addDropdown((dropdown) => {
+        dropdown
+          .addOption("writer", "writer")
+          .addOption("reader", "reader")
+          .setValue(managedUserDraft.globalRole ?? "reader")
+          .onChange((value) => {
+            this.plugin.updateManagedUserDraft({
+              globalRole: value as "writer" | "reader"
+            });
+          });
+      })
+      .addButton((button) => {
+        button.setCta().setButtonText("Create user").onClick(async () => {
+          await this.plugin.createManagedUserFromDraft();
+          this.display();
+        });
+      });
+
+    this.renderManagedUsers(containerEl, this.plugin.getManagedUsers(), currentUser?.id ?? null);
+
+    containerEl.createEl("h3", { text: "Admin Rooms" });
+    new Setting(containerEl)
+      .setName("Admin room list")
+      .setDesc("Reload all rooms visible to admin.")
+      .addButton((button) => {
+        button.setButtonText("Refresh admin rooms").onClick(async () => {
+          await this.plugin.refreshAdminRooms(true);
+          this.display();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Selected admin room")
+      .setDesc("Choose which room to inspect for members or room deletion.")
+      .addDropdown((dropdown) => {
+        dropdown.addOption("", "Select room");
+        for (const room of adminRooms) {
+          dropdown.addOption(room.workspace.id, `${room.workspace.name} (${room.workspace.id})`);
+        }
+        dropdown
+          .setValue(adminSelectedRoomId)
+          .onChange((value) => {
+            this.plugin.setAdminSelectedRoomId(value);
+            this.display();
+          });
+      })
+      .addButton((button) => {
+        button.setButtonText("Load members").onClick(async () => {
+          await this.plugin.refreshAdminRoomMembers(true);
+          this.display();
+        });
+      })
+      .addButton((button) => {
+        button.setWarning().setButtonText("Delete room").onClick(async () => {
+          if (!selectedAdminRoom) {
+            new Notice("Select an admin room first.");
+            return;
+          }
+
+          if (!window.confirm(`Delete room ${selectedAdminRoom.workspace.name} (${selectedAdminRoom.workspace.id})? Local folder will not be deleted automatically.`)) {
+            return;
+          }
+
+          await this.plugin.deleteAdminRoom();
+          this.display();
+        });
+      });
+
+    this.renderAdminRooms(containerEl, adminRooms, adminSelectedRoomId);
+
+    if (selectedAdminRoom) {
+      const adminRoomInfo = containerEl.createDiv({ cls: "rolay-settings-status" });
+      this.addInfoLine(adminRoomInfo, "Selected room", `${selectedAdminRoom.workspace.name} (${selectedAdminRoom.workspace.id})`);
+      this.addInfoLine(adminRoomInfo, "Owners", String(selectedAdminRoom.ownerCount));
+      this.addInfoLine(adminRoomInfo, "Members", String(selectedAdminRoom.memberCount));
+
+      new Setting(containerEl)
+        .setName("Username to add")
+        .setDesc("Add an existing user to the selected room by username.")
+        .addText((text) => {
+          text
+            .setPlaceholder("student1")
+            .setValue(adminRoomDraft.username)
+            .onChange((value) => {
+              this.plugin.updateAdminRoomMemberDraft({
+                username: value.trim()
+              });
+            });
+        });
+
+      new Setting(containerEl)
+        .setName("Membership role")
+        .setDesc("Role inside the selected room.")
+        .addDropdown((dropdown) => {
+          dropdown
+            .addOption("member", "member")
+            .addOption("owner", "owner")
+            .setValue(adminRoomDraft.role ?? "member")
+            .onChange((value) => {
+              this.plugin.updateAdminRoomMemberDraft({
+                role: value as "owner" | "member"
+              });
+            });
+        })
+        .addButton((button) => {
+          button.setButtonText("Add to room").onClick(async () => {
+            await this.plugin.addUserToSelectedAdminRoom();
+            this.display();
+          });
+        });
+
+      this.renderRoomMembers(containerEl, adminRoomMembers);
+    }
   }
 
   private renderRoomCards(containerEl: HTMLElement, rooms: RoomCardState[]): void {
@@ -444,6 +459,8 @@ export class RolaySettingTab extends PluginSettingTab {
       this.addInfoLine(itemEl, "Last cursor", card.lastCursorLabel);
       this.addInfoLine(itemEl, "Last snapshot", card.lastSnapshotLabel);
       this.addInfoLine(itemEl, "Entries", String(card.entryCount));
+      this.addInfoLine(itemEl, "Markdown files", String(card.markdownEntryCount));
+      this.addInfoLine(itemEl, "CRDT cache", card.crdtCacheLabel);
 
       new Setting(itemEl)
         .setName("Local folder binding")
@@ -456,28 +473,28 @@ export class RolaySettingTab extends PluginSettingTab {
           }
 
           button.setButtonText(card.downloaded ? "Rename" : "Install").onClick(async () => {
-              const nextFolderName = await openTextInputModal(this.app, {
-                title: card.downloaded ? "Rename Rolay Room Folder" : "Install Rolay Room",
-                label: "Local folder name",
-                placeholder: card.room.workspace.name,
-                initialValue: card.folderName || card.room.workspace.name,
-                submitText: card.downloaded ? "Rename" : "Install",
-                description: card.downloaded
-                  ? "Rename only the local vault folder. The room identity on the server stays the same."
-                  : "Install the room into a local vault folder. Installation is blocked if that folder already exists."
-              });
-
-              if (!nextFolderName) {
-                return;
-              }
-
-              if (card.downloaded) {
-                await this.plugin.renameInstalledRoomFolder(card.room.workspace.id, nextFolderName);
-              } else {
-                await this.plugin.installRoom(card.room.workspace.id, nextFolderName);
-              }
-              this.display();
+            const nextFolderName = await openTextInputModal(this.app, {
+              title: card.downloaded ? "Rename Rolay Room Folder" : "Install Rolay Room",
+              label: "Local folder name",
+              placeholder: card.room.workspace.name,
+              initialValue: card.folderName || card.room.workspace.name,
+              submitText: card.downloaded ? "Rename" : "Install",
+              description: card.downloaded
+                ? "Rename only the local vault folder. The room identity on the server stays the same."
+                : "Install the room into a local vault folder. Installation is blocked if that folder already exists."
             });
+
+            if (!nextFolderName) {
+              return;
+            }
+
+            if (card.downloaded) {
+              await this.plugin.renameInstalledRoomFolder(card.room.workspace.id, nextFolderName);
+            } else {
+              await this.plugin.installRoom(card.room.workspace.id, nextFolderName);
+            }
+            this.display();
+          });
         });
 
       const downloadSetting = new Setting(itemEl)

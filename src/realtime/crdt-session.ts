@@ -163,7 +163,7 @@ export class CrdtSessionManager {
     await seedRemoteMarkdownContent({
       wsUrl: bootstrap.wsUrl,
       docId: bootstrap.docId,
-      token: bootstrap.token,
+      token: createCrdtTokenSupplier(this.apiClient, entry.id, bootstrap.token),
       localText,
       log: this.log,
       contextLabel
@@ -187,7 +187,7 @@ export class CrdtSessionManager {
       currentUser,
       bootstrap.docId,
       bootstrap.wsUrl,
-      bootstrap.token,
+      createCrdtTokenSupplier(this.apiClient, entry.id, bootstrap.token),
       this.log,
       this.persistCrdtState,
       pendingOfflineUpdate ?? this.pendingOfflineUpdates.get(entry.id) ?? null
@@ -257,7 +257,7 @@ class BoundCrdtSession {
   private readonly persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void;
   private readonly docId: string;
   private readonly wsUrl: string | null;
-  private readonly token: string | null;
+  private readonly token: string | (() => Promise<string>) | null;
   private readonly awarenessUser: AwarenessUserPayload;
   private readonly yDocument = new Y.Doc();
   private readonly yText: Y.Text;
@@ -277,7 +277,7 @@ class BoundCrdtSession {
     currentUser: User,
     docId: string,
     wsUrl: string | null,
-    token: string | null,
+    token: string | (() => Promise<string>) | null,
     log: (message: string) => void,
     persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void,
     pendingOfflineUpdate: Uint8Array | null = null
@@ -328,7 +328,12 @@ class BoundCrdtSession {
         this.log(`CRDT websocket disconnected for ${this.file.path}.`);
         this.clearRemotePresence();
       },
-      onAuthenticationFailed: () => {
+      onAuthenticationFailed: ({ reason }) => {
+        this.log(`CRDT auth failed for ${this.file.path}: ${reason}`);
+        this.clearLocalPresence();
+        this.clearRemotePresence();
+        this.provider?.disconnect();
+        this.status = "offline";
         new Notice(`Rolay CRDT auth failed for ${this.file.path}.`);
       }
     });
@@ -666,10 +671,29 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object";
 }
 
+function createCrdtTokenSupplier(
+  apiClient: RolayApiClient,
+  entryId: string,
+  initialToken: string
+): () => Promise<string> {
+  let nextToken: string | null = initialToken;
+
+  return async () => {
+    if (nextToken) {
+      const token = nextToken;
+      nextToken = null;
+      return token;
+    }
+
+    const bootstrap = await apiClient.createCrdtToken(entryId);
+    return bootstrap.token;
+  };
+}
+
 interface RemoteMarkdownSeedOptions {
   wsUrl: string;
   docId: string;
-  token: string;
+  token: string | (() => Promise<string>);
   localText: string;
   log: (message: string) => void;
   contextLabel: string;

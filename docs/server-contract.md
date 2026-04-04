@@ -109,6 +109,24 @@ The event stream is ordered per room/workspace. Event IDs increase monotonically
 
 ### Markdown CRDT Bootstrap
 
+- `POST /v1/workspaces/{workspaceId}/markdown/bootstrap`
+
+The room-level bootstrap response provides:
+
+- `workspaceId`
+- `encoding`
+- `documents[]`
+
+Each bootstrap document contains:
+
+- `entryId`
+- `docId`
+- `state` (`base64` encoded Yjs state)
+
+This endpoint is used only for cold start / offline-safe bootstrap of markdown CRDT cache. It does not replace live websocket sync.
+
+### Markdown CRDT Realtime
+
 - `POST /v1/files/{entryId}/crdt-token`
 
 The response provides:
@@ -120,7 +138,7 @@ The response provides:
 - `token`
 - `expiresAt`
 
-The websocket transport is standard Yjs-compatible transport, not a custom binary protocol.
+The websocket transport is standard Yjs-compatible transport, not a custom binary protocol. The plugin first fills local CRDT cache via `/markdown/bootstrap`, then still uses `crdt-token` for live collaborative editing.
 
 ## Tree Mutation Rules
 
@@ -148,11 +166,13 @@ Supported server operation types:
 
 ## Implementation Assumptions In This Repo
 
-- `serverUrl` stays configurable because the live deployment address may change.
+- The plugin uses the fixed live server URL `http://46.16.36.87:3000`.
 - The plugin keeps local state around `workspace.id`, not room name.
 - Each room has its own local folder binding chosen by the user. The default folder name is the room name.
 - Local room files are projected under `syncRoot/<room-folder-name>/...`.
 - A room is not materialized locally until the user explicitly downloads it.
 - Download is rejected if the target folder already exists in the vault.
 - Multiple downloaded rooms are live-synced in parallel.
+- Device label and startup auto-connect behavior are fixed by the plugin instead of being user-configurable.
+- Markdown bootstrap is kept separate from `/tree`; the plugin fetches tree metadata first and then fetches batched markdown Yjs state through `/markdown/bootstrap`.
 - SSE payload shape is treated defensively. The plugin advances cursor state and refreshes the authoritative tree snapshot when tree/blob events arrive instead of assuming a fully materialized `FileEntry` in every SSE payload.
