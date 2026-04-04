@@ -1,0 +1,1766 @@
+import { MarkdownView, Notice, Plugin, TFile, type TAbstractFile } from "obsidian";
+import { RolayApiClient } from "./api/client";
+import { FileBridge } from "./obsidian/file-bridge";
+import { CrdtSessionManager } from "./realtime/crdt-session";
+import { createSharedPresenceExtension } from "./realtime/shared-presence";
+import {
+  getRoomBindingSettings,
+  type RolayCrdtCacheEntry,
+  getRoomSyncState,
+  mergePluginData,
+  normalizeServerUrl,
+  type RolayLogEntry,
+  type RolayPluginData,
+  type RolayPluginSettings,
+  type RolayRoomBindingSettings
+} from "./settings/data";
+import { RolaySettingTab } from "./settings/tab";
+import { WorkspaceEventStream, type WorkspaceEventStreamStatus } from "./sync/event-stream";
+import { OperationsQueue } from "./sync/operations";
+import {
+  getRoomRoot,
+  isValidRoomFolderName,
+  normalizeRoomFolderName,
+  toServerPathForRoom
+} from "./sync/path-mapper";
+import { TreeStore } from "./sync/tree-store";
+import type {
+  AddRoomMemberRequest,
+  AdminRoomListItem,
+  CreateManagedUserRequest,
+  CreateRoomRequest,
+  FileEntry,
+  InviteState,
+  ManagedUser,
+  RoomListItem,
+  RoomMember,
+  User
+} from "./types/protocol";
+import { openTextInputModal } from "./ui/text-input-modal";
+import { decodeBase64, encodeBase64 } from "./utils/base64";
+
+interface RoomRuntimeState {
+  treeStore: TreeStore;
+  eventStream: WorkspaceEventStream | null;
+  streamStatus: WorkspaceEventStreamStatus;
+  snapshotRefreshHandle: number | null;
+}
+
+interface DownloadedRoomDescriptor {
+  workspaceId: string;
+  folderName: string;
+}
+
+export interface RoomCardState {
+  room: RoomListItem;
+  folderName: string;
+  downloaded: boolean;
+  localRoot: string;
+  folderExists: boolean;
+  streamStatus: WorkspaceEventStreamStatus;
+  lastCursorLabel: string;
+  lastSnapshotLabel: string;
+  entryCount: number;
+  invite: InviteState | null;
+}
+
+interface StatusSnapshot {
+  userLabel: string;
+  globalRoleLabel: string;
+  isAdmin: boolean;
+  downloadedRoomCount: number;
+  activeStreamCount: number;
+  crdtLabel: string;
+  recentLogs: string[];
+}
+
+export default class RolayPlugin extends Plugin {
+  private static readonly MAX_PERSISTED_CRDT_DOCS = 64;
+  private data!: RolayPluginData;
+  private apiClient!: RolayApiClient;
+  private crdtManager!: CrdtSessionManager;
+  private operationsQueue!: OperationsQueue;
+  private fileBridge!: FileBridge;
+  private readonly roomRuntime = new Map<string, RoomRuntimeState>();
+  private readonly roomInvites = new Map<string, InviteState>();
+  private persistHandle: number | null = null;
+  private statusBarEl!: HTMLElement;
+  private roomList: RoomListItem[] = [];
+  private adminRoomList: AdminRoomListItem[] = [];
+  private managedUsers: ManagedUser[] = [];
+  private adminSelectedRoomId = "";
+  private adminRoomMembers: RoomMember[] = [];
+  private profileDraftDisplayName = "";
+  private createRoomDraft: CreateRoomRequest = {
+    name: ""
+  };
+  private joinRoomDraft = {
+    code: ""
+  };
+  private managedUserDraft: CreateManagedUserRequest = {
+    username: "",
+    password: "",
+    displayName: "",
+    globalRole: "reader"
+  };
+  private adminRoomMemberDraft: AddRoomMemberRequest = {
+    username: "",
+    role: "member"
+  };
+
+  override async onload(): Promise<void> {
+    this.data = mergePluginData(await this.loadData());
+    this.resetProfileDraft();
+    this.apiClient = new RolayApiClient({
+      getServerUrl: () => normalizeServerUrl(this.data.settings.serverUrl),
+      getSession: () => this.data.session,
+      saveSession: async (session) => {
+        this.data.session = session;
+        await this.persistNow();
+        this.updateStatusBar();
+      }
+    });
+    this.crdtManager = new CrdtSessionManager({
+      app: this.app,
+      apiClient: this.apiClient,
+      getCurrentUser: () => this.getCurrentUser(),
+      isLiveSyncEnabledForLocalPath: (localPath) => this.isLiveSyncEnabledForLocalPath(localPath),
+      getPersistedCrdtState: (entryId) => this.getPersistedCrdtState(entryId),
+      persistCrdtState: (entryId, filePath, state) => this.persistCrdtState(entryId, filePath, state),
+      resolveEntryByLocalPath: (localPath) => this.resolveEntryByLocalPath(localPath),
+      log: (message) => this.recordLog("crdt", message)
+    });
+    this.registerEditorExtension(
+      createSharedPresenceExtension(({ filePath, editor, focused }) => {
+        this.crdtManager.handleEditorSelectionChange(filePath, editor, focused);
+      })
+    );
+    this.operationsQueue = new OperationsQueue({
+      apiClient: this.apiClient,
+      getDeviceId: () => this.data.deviceId,
+      log: (message) => this.recordLog("ops", message),
+      onAfterApply: (workspaceId) => {
+        this.scheduleSnapshotRefresh(workspaceId, "local-op");
+      }
+    });
+    this.fileBridge = new FileBridge({
+      app: this.app,
+      getSyncRoot: () => this.data.settings.syncRoot,
+      getFolderName: (workspaceId) => this.getDownloadedFolderName(workspaceId),
+      getDownloadedRooms: () => this.getDownloadedRooms(),
+      getEntryByPath: (workspaceId, path) => this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null,
+      log: (message) => this.recordLog("bridge", message),
+      onCreateFolder: (workspaceId, path) => this.queueCreateFolder(workspaceId, path),
+      onCreateMarkdown: (workspaceId, path, localContent) => this.queueCreateMarkdown(workspaceId, path, localContent),
+      onRenameOrMove: (workspaceId, entry, newPath, type) => this.queueRenameOrMove(workspaceId, entry, newPath, type),
+      onDeleteEntry: (workspaceId, entry) => this.queueDeleteEntry(workspaceId, entry)
+    });
+
+    this.statusBarEl = this.addStatusBarItem();
+    this.updateStatusBar();
+
+    this.addSettingTab(new RolaySettingTab(this.app, this));
+    this.registerCommands();
+
+    this.registerEvent(
+      this.app.workspace.on("file-open", (file) => {
+        void this.handleFileOpen(file);
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("editor-change", (editor, info) => {
+        if (info instanceof MarkdownView) {
+          this.crdtManager.handleEditorChange(editor, info);
+        }
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("create", (file) => {
+        void this.handleVaultCreate(file);
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("rename", (file, oldPath) => {
+        void this.handleVaultRename(file, oldPath);
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("delete", (file) => {
+        void this.handleVaultDelete(file);
+      })
+    );
+
+    this.register(() => {
+      if (this.persistHandle !== null) {
+        window.clearTimeout(this.persistHandle);
+      }
+
+      for (const runtime of this.roomRuntime.values()) {
+        if (runtime.snapshotRefreshHandle !== null) {
+          window.clearTimeout(runtime.snapshotRefreshHandle);
+        }
+      }
+    });
+
+    this.recordLog("plugin", "Rolay plugin loaded.");
+
+    if (this.data.settings.autoConnect) {
+      await this.bootstrapSync("startup");
+    }
+  }
+
+  override async onunload(): Promise<void> {
+    this.stopAllRoomEventStreams();
+    await this.crdtManager.disconnect();
+    await this.persistNow();
+  }
+
+  getSettings(): RolayPluginSettings {
+    return this.data.settings;
+  }
+
+  getCurrentUser(): User | null {
+    return this.data.session?.user ?? null;
+  }
+
+  getRoomList(): RoomListItem[] {
+    return [...this.roomList];
+  }
+
+  getRoomCardStates(): RoomCardState[] {
+    return this.roomList.map((room) => {
+      const folderName = this.getResolvedRoomFolderName(room.workspace.id, room.workspace.name);
+      const binding = this.getStoredRoomBinding(room.workspace.id);
+      const localRoot = getRoomRoot(this.data.settings.syncRoot, folderName);
+      const roomSync = getRoomSyncState(this.data.sync, room.workspace.id);
+      const runtime = this.roomRuntime.get(room.workspace.id);
+      const treeStore = runtime?.treeStore ?? null;
+
+      return {
+        room,
+        folderName,
+        downloaded: Boolean(binding?.downloaded),
+        localRoot,
+        folderExists: Boolean(localRoot && this.app.vault.getAbstractFileByPath(localRoot)),
+        streamStatus: runtime?.streamStatus ?? "stopped",
+        lastCursorLabel: roomSync.lastCursor === null ? "none" : String(roomSync.lastCursor),
+        lastSnapshotLabel: roomSync.lastSnapshotAt ?? "never",
+        entryCount: treeStore?.getEntries().length ?? 0,
+        invite: this.roomInvites.get(room.workspace.id) ?? null
+      };
+    });
+  }
+
+  getManagedUsers(): ManagedUser[] {
+    return [...this.managedUsers];
+  }
+
+  getAdminRooms(): AdminRoomListItem[] {
+    return [...this.adminRoomList];
+  }
+
+  getAdminSelectedRoomId(): string {
+    return this.adminSelectedRoomId;
+  }
+
+  setAdminSelectedRoomId(roomId: string): void {
+    this.adminSelectedRoomId = roomId.trim();
+    this.adminRoomMembers = [];
+  }
+
+  getAdminRoomMembers(): RoomMember[] {
+    return [...this.adminRoomMembers];
+  }
+
+  getProfileDraftDisplayName(): string {
+    return this.profileDraftDisplayName || this.data.session?.user?.displayName || "";
+  }
+
+  setProfileDraftDisplayName(displayName: string): void {
+    this.profileDraftDisplayName = displayName;
+  }
+
+  getCreateRoomDraft(): CreateRoomRequest {
+    return { ...this.createRoomDraft };
+  }
+
+  updateCreateRoomDraft(update: Partial<CreateRoomRequest>): void {
+    this.createRoomDraft = {
+      ...this.createRoomDraft,
+      ...update
+    };
+  }
+
+  getJoinRoomDraft(): { code: string } {
+    return { ...this.joinRoomDraft };
+  }
+
+  updateJoinRoomDraft(update: Partial<{ code: string }>): void {
+    this.joinRoomDraft = {
+      ...this.joinRoomDraft,
+      ...update
+    };
+  }
+
+  getManagedUserDraft(): CreateManagedUserRequest {
+    return { ...this.managedUserDraft };
+  }
+
+  updateManagedUserDraft(update: Partial<CreateManagedUserRequest>): void {
+    this.managedUserDraft = {
+      ...this.managedUserDraft,
+      ...update
+    };
+  }
+
+  getAdminRoomMemberDraft(): AddRoomMemberRequest {
+    return { ...this.adminRoomMemberDraft };
+  }
+
+  updateAdminRoomMemberDraft(update: Partial<AddRoomMemberRequest>): void {
+    this.adminRoomMemberDraft = {
+      ...this.adminRoomMemberDraft,
+      ...update
+    };
+  }
+
+  canCurrentUserCreateRooms(): boolean {
+    const user = this.getCurrentUser();
+    if (!user) {
+      return false;
+    }
+
+    return user.isAdmin || user.globalRole === "admin" || user.globalRole === "writer";
+  }
+
+  getStatusSnapshot(): StatusSnapshot {
+    const currentUser = this.data.session?.user ?? null;
+    const downloadedRooms = this.getDownloadedRooms();
+    const activeStreams = [...this.roomRuntime.values()].filter((runtime) => runtime.streamStatus === "open").length;
+    const crdtState = this.crdtManager.getState();
+
+    return {
+      userLabel: currentUser
+        ? `${currentUser.displayName} (@${currentUser.username})`
+        : "not authenticated",
+      globalRoleLabel: currentUser?.globalRole ?? "none",
+      isAdmin: Boolean(currentUser?.isAdmin),
+      downloadedRoomCount: downloadedRooms.length,
+      activeStreamCount: activeStreams,
+      crdtLabel: crdtState
+        ? `${crdtState.status} for ${crdtState.filePath}`
+        : "inactive (open a markdown note inside a downloaded room folder)",
+      recentLogs: this.data.logs.slice(-12).map((entry) => {
+        return `[${entry.at}] ${entry.scope}/${entry.level}: ${entry.message}`;
+      })
+    };
+  }
+
+  async updateSettings(update: Partial<RolayPluginSettings>): Promise<void> {
+    this.data.settings = {
+      ...this.data.settings,
+      ...update,
+      roomBindings: {
+        ...this.data.settings.roomBindings,
+        ...(update.roomBindings ?? {})
+      }
+    };
+    this.data.settings.serverUrl = normalizeServerUrl(this.data.settings.serverUrl);
+    this.data.settings.syncRoot = this.data.settings.syncRoot.trim();
+    await this.persistNow();
+    this.updateStatusBar();
+  }
+
+  async setRoomFolderName(workspaceId: string, folderName: string): Promise<void> {
+    const binding = this.getStoredRoomBinding(workspaceId);
+    if (binding?.downloaded) {
+      throw this.notifyError("Folder name is locked after the room has been downloaded.");
+    }
+
+    await this.saveRoomBinding(workspaceId, {
+      folderName: folderName.trim(),
+      downloaded: Boolean(binding?.downloaded)
+    });
+  }
+
+  async loginWithSettings(showNotice = true): Promise<void> {
+    const { username, password, deviceName } = this.data.settings;
+
+    if (!username || !password) {
+      throw this.notifyError("Username and password are required before login.");
+    }
+
+    try {
+      const response = await this.apiClient.login({
+        username,
+        password,
+        deviceName: deviceName || "Obsidian Desktop"
+      });
+
+      await this.applySessionUser(response.user);
+      await this.refreshPostAuthState();
+      await this.resumeDownloadedRooms("login");
+      this.recordLog("auth", `Logged in as ${response.user.username}.`);
+      if (showNotice) {
+        new Notice(`Rolay login successful for ${response.user.username}.`);
+      }
+      this.updateStatusBar();
+    } catch (error) {
+      this.handleError("Login failed", error);
+      throw error;
+    }
+  }
+
+  async refreshSession(showNotice = true): Promise<void> {
+    try {
+      await this.apiClient.refresh();
+      await this.fetchCurrentUser(false);
+      this.recordLog("auth", "Session tokens refreshed.");
+      if (showNotice) {
+        new Notice("Rolay session refreshed.");
+      }
+      this.updateStatusBar();
+    } catch (error) {
+      this.handleError("Refresh failed", error);
+      throw error;
+    }
+  }
+
+  async logout(): Promise<void> {
+    this.stopAllRoomEventStreams();
+    await this.crdtManager.disconnect();
+    this.roomRuntime.clear();
+    this.roomInvites.clear();
+    this.roomList = [];
+    this.adminRoomList = [];
+    this.managedUsers = [];
+    this.adminSelectedRoomId = "";
+    this.adminRoomMembers = [];
+    this.data.session = null;
+    this.resetProfileDraft();
+    this.clearRoomDrafts();
+    this.clearManagedUserDraft();
+    this.clearAdminRoomMemberDraft();
+    this.recordLog("auth", "Session cleared.");
+    await this.persistNow();
+    this.updateStatusBar();
+  }
+
+  async fetchCurrentUser(showNotice = false): Promise<User> {
+    const response = await this.apiClient.getCurrentUser();
+    await this.applySessionUser(response.user);
+    await this.refreshPostAuthState();
+    this.recordLog("auth", `Loaded current user ${response.user.username}.`);
+    if (showNotice) {
+      new Notice(`Current Rolay user: ${response.user.displayName}`);
+    }
+    return response.user;
+  }
+
+  async updateOwnDisplayName(): Promise<void> {
+    const displayName = this.getProfileDraftDisplayName().trim();
+    if (!displayName) {
+      throw this.notifyError("Display name is required.");
+    }
+
+    try {
+      const response = await this.apiClient.updateCurrentUserProfile({ displayName });
+      await this.applySessionUser(response.user);
+      this.recordLog("auth", `Updated display name to ${response.user.displayName}.`);
+      new Notice(`Rolay display name updated to ${response.user.displayName}.`);
+    } catch (error) {
+      this.handleError("Display name update failed", error);
+      throw error;
+    }
+  }
+
+  async refreshRooms(showNotice = false): Promise<RoomListItem[]> {
+    const response = await this.apiClient.listRooms();
+    this.roomList = [...response.workspaces].sort(compareRoomsByName);
+    await this.reconcileDownloadedRooms();
+    await this.reconcileLocalRoomFolders();
+    this.reconcileInviteCache();
+    this.recordLog("rooms", `Loaded ${this.roomList.length} room(s).`);
+    if (showNotice) {
+      new Notice(`Loaded ${this.roomList.length} Rolay room(s).`);
+    }
+    this.updateStatusBar();
+    return this.getRoomList();
+  }
+
+  async createRoomFromDraft(): Promise<void> {
+    if (!this.canCurrentUserCreateRooms()) {
+      throw this.notifyError("Only writer/admin users can create rooms.");
+    }
+
+    const name = this.createRoomDraft.name.trim();
+    if (!name) {
+      throw this.notifyError("Room name is required.");
+    }
+
+    try {
+      await this.ensureAuthenticated(true);
+      const response = await this.apiClient.createRoom({ name });
+      this.clearCreateRoomDraft();
+      await this.refreshRooms(false);
+      this.recordLog("rooms", `Created room ${response.workspace.name} (${response.workspace.id}).`);
+      new Notice(`Rolay room created: ${response.workspace.name}`);
+    } catch (error) {
+      this.handleError("Room creation failed", error);
+      throw error;
+    }
+  }
+
+  async joinRoomFromDraft(): Promise<void> {
+    const code = this.joinRoomDraft.code.trim();
+    if (!code) {
+      throw this.notifyError("Invite key is required.");
+    }
+
+    try {
+      await this.ensureAuthenticated(true);
+      const response = await this.apiClient.joinRoom({ code });
+      this.clearJoinRoomDraft();
+      await this.refreshRooms(false);
+      this.recordLog("rooms", `Joined room ${response.workspace.name} (${response.workspace.id}).`);
+      new Notice(`Joined Rolay room: ${response.workspace.name}`);
+    } catch (error) {
+      this.handleError("Join room failed", error);
+      throw error;
+    }
+  }
+
+  async createRoomFromPrompt(): Promise<void> {
+    const name = await openTextInputModal(this.app, {
+      title: "Create Rolay Room",
+      label: "Room name",
+      placeholder: "Math Group",
+      submitText: "Create",
+      description: "Writers and admins can create rooms. The room folder is not downloaded automatically."
+    });
+
+    if (!name) {
+      return;
+    }
+
+    this.updateCreateRoomDraft({ name });
+    await this.createRoomFromDraft();
+  }
+
+  async joinRoomFromPrompt(): Promise<void> {
+    const code = await openTextInputModal(this.app, {
+      title: "Join Rolay Room",
+      label: "Invite key",
+      placeholder: "paste invite key",
+      submitText: "Join",
+      description: "Joining happens only by invite key or through admin membership management."
+    });
+
+    if (!code) {
+      return;
+    }
+
+    this.updateJoinRoomDraft({ code });
+    await this.joinRoomFromDraft();
+  }
+
+  async downloadRoom(workspaceId: string): Promise<void> {
+    const room = this.requireRoom(workspaceId);
+    const folderName = this.requireFolderNameForRoom(room.workspace.id, room.workspace.name);
+    const localRoot = getRoomRoot(this.data.settings.syncRoot, folderName);
+
+    if (this.isFolderNameUsedByAnotherRoom(room.workspace.id, folderName)) {
+      throw this.notifyError(`Another room is already bound to the folder name "${folderName}".`);
+    }
+
+    if (localRoot && this.app.vault.getAbstractFileByPath(localRoot)) {
+      throw this.notifyError(`Vault already contains the folder "${localRoot}". Choose another folder name before downloading.`);
+    }
+
+    await this.saveRoomBinding(room.workspace.id, {
+      folderName,
+      downloaded: true
+    });
+
+    try {
+      await this.connectRoom(room.workspace.id, false, "download");
+      this.recordLog("rooms", `Installed room ${room.workspace.name} into ${localRoot}.`);
+      new Notice(`Rolay room installed: ${room.workspace.name}`);
+    } catch (error) {
+      this.handleError("Room download failed", error);
+      throw error;
+    }
+  }
+
+  async connectRoom(
+    workspaceId: string,
+    showNotice = true,
+    reason = "manual-connect"
+  ): Promise<void> {
+    const room = this.requireDownloadedRoom(workspaceId);
+    await this.refreshRoomSnapshot(room.workspace.id, reason);
+    await this.startRoomEventStream(room.workspace.id);
+
+    const activeFile = this.app.workspace.getActiveFile();
+    if (activeFile && this.isLocalPathInDownloadedRoom(activeFile.path, room.workspace.id)) {
+      await this.bindActiveMarkdownToCrdt();
+    }
+
+    if (showNotice) {
+      new Notice(`Rolay room connected: ${room.workspace.name}`);
+    }
+  }
+
+  async disconnectRoom(workspaceId: string, showNotice = true): Promise<void> {
+    const room = this.requireDownloadedRoom(workspaceId);
+    this.stopRoomEventStream(room.workspace.id);
+
+    const activeFile = this.app.workspace.getActiveFile();
+    if (activeFile && this.isLocalPathInDownloadedRoom(activeFile.path, room.workspace.id)) {
+      await this.crdtManager.goOffline();
+      this.updateStatusBar();
+    }
+
+    if (showNotice) {
+      new Notice(`Rolay room disconnected: ${room.workspace.name}`);
+    }
+  }
+
+  async installRoom(workspaceId: string, folderName: string): Promise<void> {
+    const room = this.requireRoom(workspaceId);
+    const nextFolderName = normalizeRoomFolderName(folderName || room.workspace.name);
+    if (!isValidRoomFolderName(nextFolderName)) {
+      throw this.notifyError("Room folder name must be non-empty and must not contain '/' or '\\'.");
+    }
+
+    if (this.isFolderNameUsedByAnotherRoom(room.workspace.id, nextFolderName)) {
+      throw this.notifyError(`Another room is already bound to the folder name "${nextFolderName}".`);
+    }
+
+    await this.saveRoomBinding(room.workspace.id, {
+      folderName: nextFolderName,
+      downloaded: false
+    });
+    await this.downloadRoom(room.workspace.id);
+  }
+
+  async renameInstalledRoomFolder(workspaceId: string, folderName: string): Promise<void> {
+    const room = this.requireDownloadedRoom(workspaceId);
+    const currentFolderName = this.getResolvedRoomFolderName(room.workspace.id, room.workspace.name);
+    const nextFolderName = normalizeRoomFolderName(folderName || room.workspace.name);
+
+    if (!isValidRoomFolderName(nextFolderName)) {
+      throw this.notifyError("Room folder name must be non-empty and must not contain '/' or '\\'.");
+    }
+
+    if (nextFolderName === currentFolderName) {
+      return;
+    }
+
+    if (this.isFolderNameUsedByAnotherRoom(room.workspace.id, nextFolderName)) {
+      throw this.notifyError(`Another room is already bound to the folder name "${nextFolderName}".`);
+    }
+
+    const currentRoot = getRoomRoot(this.data.settings.syncRoot, currentFolderName);
+    const nextRoot = getRoomRoot(this.data.settings.syncRoot, nextFolderName);
+    const currentFolder = this.app.vault.getAbstractFileByPath(currentRoot);
+    const nextFolder = this.app.vault.getAbstractFileByPath(nextRoot);
+
+    if (!currentFolder) {
+      await this.deactivateRoomDownload(room.workspace.id, false);
+      throw this.notifyError("The local room folder is missing. The room was detached from the vault.");
+    }
+
+    if (nextFolder && nextFolder.path !== currentRoot) {
+      throw this.notifyError(`Vault already contains the folder "${nextRoot}". Choose another folder name.`);
+    }
+
+    await this.fileBridge.runWithSuppressedPaths([currentRoot, nextRoot], async () => {
+      await this.app.fileManager.renameFile(currentFolder, nextRoot);
+    });
+    await this.saveRoomBinding(room.workspace.id, {
+      folderName: nextFolderName,
+      downloaded: true
+    });
+
+    await this.bindActiveMarkdownToCrdt();
+    this.recordLog("rooms", `Renamed local room folder for ${room.workspace.id} from ${currentFolderName} to ${nextFolderName}.`);
+    new Notice(`Rolay room folder renamed to ${nextFolderName}.`);
+  }
+
+  async refreshRoomInvite(workspaceId: string, showNotice = true): Promise<InviteState> {
+    const room = this.requireOwnerRoom(workspaceId);
+    const response = await this.apiClient.getRoomInvite(room.workspace.id);
+    this.roomInvites.set(room.workspace.id, response.invite);
+    this.patchInviteEnabled(room.workspace.id, response.invite.enabled);
+    this.recordLog("invite", `Loaded invite state for ${room.workspace.id}.`);
+    if (showNotice) {
+      new Notice(`Invite key loaded for ${room.workspace.name}.`);
+    }
+    return response.invite;
+  }
+
+  async setRoomInviteEnabled(workspaceId: string, enabled: boolean): Promise<void> {
+    const room = this.requireOwnerRoom(workspaceId);
+
+    try {
+      const response = await this.apiClient.updateRoomInviteState(room.workspace.id, { enabled });
+      this.roomInvites.set(room.workspace.id, response.invite);
+      this.patchInviteEnabled(room.workspace.id, response.invite.enabled);
+      this.recordLog("invite", `${enabled ? "Enabled" : "Disabled"} invite key for ${room.workspace.id}.`);
+      new Notice(`Invite key ${enabled ? "enabled" : "disabled"} for ${room.workspace.name}.`);
+    } catch (error) {
+      this.handleError("Invite state update failed", error);
+      throw error;
+    }
+  }
+
+  async regenerateRoomInvite(workspaceId: string): Promise<void> {
+    const room = this.requireOwnerRoom(workspaceId);
+
+    try {
+      const response = await this.apiClient.regenerateRoomInvite(room.workspace.id);
+      this.roomInvites.set(room.workspace.id, response.invite);
+      this.patchInviteEnabled(room.workspace.id, response.invite.enabled);
+      this.recordLog("invite", `Regenerated invite key for ${room.workspace.id}.`);
+      new Notice(`Invite key regenerated for ${room.workspace.name}.`);
+    } catch (error) {
+      this.handleError("Invite regenerate failed", error);
+      throw error;
+    }
+  }
+
+  async refreshManagedUsers(showNotice = false): Promise<ManagedUser[]> {
+    this.requireAdmin();
+    const response = await this.apiClient.listManagedUsers();
+    this.managedUsers = [...response.users].sort((left, right) => left.username.localeCompare(right.username));
+    this.recordLog("admin", `Loaded ${this.managedUsers.length} managed user(s).`);
+    if (showNotice) {
+      new Notice(`Loaded ${this.managedUsers.length} managed user(s).`);
+    }
+    return this.getManagedUsers();
+  }
+
+  async createManagedUserFromDraft(): Promise<void> {
+    this.requireAdmin();
+
+    const username = this.managedUserDraft.username.trim();
+    const password = this.managedUserDraft.password;
+    const displayName = this.managedUserDraft.displayName?.trim() || undefined;
+    const globalRole = this.managedUserDraft.globalRole ?? "reader";
+
+    if (!username || !password) {
+      throw this.notifyError("Username and temporary password are required.");
+    }
+
+    try {
+      const response = await this.apiClient.createManagedUser({
+        username,
+        password,
+        displayName,
+        globalRole
+      });
+      this.recordLog(
+        "admin",
+        `Created managed user ${response.user.username} (${response.user.globalRole}).`
+      );
+      new Notice(`Rolay account created: ${response.user.username}`);
+      this.clearManagedUserDraft();
+      await this.refreshManagedUsers(false);
+    } catch (error) {
+      this.handleError("Managed user creation failed", error);
+      throw error;
+    }
+  }
+
+  async deleteManagedUser(userId: string): Promise<void> {
+    this.requireAdmin();
+
+    try {
+      const response = await this.apiClient.deleteManagedUser(userId);
+      this.managedUsers = this.managedUsers.filter((user) => user.id !== userId);
+      this.recordLog("admin", `Deleted managed user ${response.user.username}.`);
+      new Notice(`Rolay account deleted: ${response.user.username}`);
+      if (this.adminRoomMembers.some((member) => member.user.id === userId)) {
+        await this.refreshAdminRoomMembers(false);
+      }
+    } catch (error) {
+      this.handleError("Managed user deletion failed", error);
+      throw error;
+    }
+  }
+
+  async refreshAdminRooms(showNotice = false): Promise<AdminRoomListItem[]> {
+    this.requireAdmin();
+    const response = await this.apiClient.listAllRoomsAsAdmin();
+    this.adminRoomList = [...response.workspaces].sort(compareRoomsByName);
+
+    if (!this.adminSelectedRoomId && this.adminRoomList.length === 1) {
+      this.adminSelectedRoomId = this.adminRoomList[0].workspace.id;
+    } else if (
+      this.adminSelectedRoomId &&
+      !this.adminRoomList.some((room) => room.workspace.id === this.adminSelectedRoomId)
+    ) {
+      this.adminSelectedRoomId = "";
+      this.adminRoomMembers = [];
+    }
+
+    this.recordLog("admin", `Loaded ${this.adminRoomList.length} room(s) in admin scope.`);
+    if (showNotice) {
+      new Notice(`Loaded ${this.adminRoomList.length} admin room(s).`);
+    }
+    return this.getAdminRooms();
+  }
+
+  async refreshAdminRoomMembers(
+    showNotice = false,
+    roomId = this.adminSelectedRoomId
+  ): Promise<RoomMember[]> {
+    this.requireAdmin();
+
+    const targetRoomId = roomId.trim();
+    if (!targetRoomId) {
+      throw this.notifyError("Select an admin room first.");
+    }
+
+    const response = await this.apiClient.listRoomMembersAsAdmin(targetRoomId);
+    this.adminSelectedRoomId = targetRoomId;
+    this.adminRoomMembers = [...response.members].sort(compareRoomMembers);
+    this.recordLog("admin", `Loaded ${this.adminRoomMembers.length} member(s) for room ${targetRoomId}.`);
+    if (showNotice) {
+      new Notice(`Loaded ${this.adminRoomMembers.length} room member(s).`);
+    }
+    return this.getAdminRoomMembers();
+  }
+
+  async addUserToSelectedAdminRoom(): Promise<void> {
+    this.requireAdmin();
+
+    const roomId = this.adminSelectedRoomId.trim();
+    if (!roomId) {
+      throw this.notifyError("Select an admin room first.");
+    }
+
+    const username = this.adminRoomMemberDraft.username.trim();
+    const role = this.adminRoomMemberDraft.role ?? "member";
+    if (!username) {
+      throw this.notifyError("Username is required.");
+    }
+
+    try {
+      const response = await this.apiClient.addRoomMemberAsAdmin(roomId, {
+        username,
+        role
+      });
+      this.recordLog(
+        "admin",
+        `Added ${response.user.username} to room ${response.workspace.id} as ${response.membership.role}.`
+      );
+      new Notice(`Added ${response.user.username} to ${response.workspace.name}.`);
+      this.clearAdminRoomMemberDraft();
+      await this.refreshAdminRoomMembers(false, roomId);
+      await this.refreshAdminRooms(false);
+      await this.refreshRooms(false);
+    } catch (error) {
+      this.handleError("Add room member failed", error);
+      throw error;
+    }
+  }
+
+  async deleteAdminRoom(roomId = this.adminSelectedRoomId): Promise<void> {
+    this.requireAdmin();
+
+    const targetRoomId = roomId.trim();
+    if (!targetRoomId) {
+      throw this.notifyError("Select an admin room first.");
+    }
+
+    try {
+      const response = await this.apiClient.deleteRoomAsAdmin(targetRoomId);
+      this.recordLog("admin", `Deleted room ${response.workspace.name} (${response.workspace.id}).`);
+      new Notice(`Deleted Rolay room: ${response.workspace.name}`);
+
+      await this.deactivateRoomDownload(targetRoomId);
+
+      if (this.adminSelectedRoomId === targetRoomId) {
+        this.adminSelectedRoomId = "";
+        this.adminRoomMembers = [];
+      }
+
+      await this.refreshAdminRooms(false);
+      await this.refreshRooms(false);
+      this.updateStatusBar();
+    } catch (error) {
+      this.handleError("Delete room failed", error);
+      throw error;
+    }
+  }
+
+  async refreshRoomSnapshot(workspaceId: string, reason = "manual"): Promise<void> {
+    const room = this.requireDownloadedRoom(workspaceId);
+    const runtime = this.ensureRoomRuntime(room.workspace.id);
+
+    try {
+      const previousEntries = runtime.treeStore.getEntries();
+      const snapshot = await this.apiClient.getWorkspaceTree(room.workspace.id);
+      runtime.treeStore.applySnapshot(snapshot);
+      await this.fileBridge.applySnapshot(snapshot, previousEntries);
+      this.setRoomSyncState(room.workspace.id, {
+        lastCursor: snapshot.cursor,
+        lastSnapshotAt: new Date().toISOString()
+      });
+      this.recordLog(
+        "tree",
+        `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
+      );
+      await this.persistNow();
+      this.updateStatusBar();
+      await this.bindActiveMarkdownToCrdt();
+    } catch (error) {
+      this.handleError("Tree snapshot failed", error);
+      throw error;
+    }
+  }
+
+  async startRoomEventStream(workspaceId: string): Promise<void> {
+    const room = this.requireDownloadedRoom(workspaceId);
+    const runtime = this.ensureRoomRuntime(room.workspace.id);
+    this.stopRoomEventStream(room.workspace.id);
+
+    const roomSync = getRoomSyncState(this.data.sync, room.workspace.id);
+    const treeCursor = runtime.treeStore.getCursor();
+    if (treeCursor === null && roomSync.lastCursor === null) {
+      await this.refreshRoomSnapshot(room.workspace.id, "pre-sse");
+    }
+
+    const cursor = runtime.treeStore.getCursor() ?? getRoomSyncState(this.data.sync, room.workspace.id).lastCursor;
+    const stream = new WorkspaceEventStream(this.apiClient, (message) => {
+      this.recordLog("sse", `[${room.workspace.id}] ${message}`);
+    });
+    runtime.eventStream = stream;
+
+    stream.start(room.workspace.id, cursor, {
+      onOpen: () => {
+        this.recordLog("sse", `Subscribed to room ${room.workspace.id} events.`);
+      },
+      onEvent: async (event) => {
+        runtime.treeStore.recordCursor(event.id);
+        this.updateRoomSyncCursor(room.workspace.id, event.id);
+        this.schedulePersist();
+        this.recordLog("sse", `[${room.workspace.id}] Event ${event.id}: ${event.event}`);
+        if (event.event.startsWith("tree.") || event.event.startsWith("blob.")) {
+          this.scheduleSnapshotRefresh(room.workspace.id, "event-stream");
+        }
+      },
+      onStatusChange: (status) => {
+        runtime.streamStatus = status;
+        this.updateStatusBar();
+      },
+      onError: (error) => {
+        this.handleError(`Workspace event stream error (${room.workspace.id})`, error, false);
+      }
+    });
+  }
+
+  stopRoomEventStream(workspaceId: string): void {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+
+    runtime.eventStream?.stop();
+    runtime.eventStream = null;
+    runtime.streamStatus = "stopped";
+    this.updateStatusBar();
+  }
+
+  stopAllRoomEventStreams(): void {
+    for (const workspaceId of this.roomRuntime.keys()) {
+      this.stopRoomEventStream(workspaceId);
+    }
+  }
+
+  async bindActiveMarkdownToCrdt(): Promise<void> {
+    try {
+      const activeFile = this.app.workspace.getActiveFile();
+      await this.crdtManager.bindToFile(activeFile);
+      this.updateStatusBar();
+    } catch (error) {
+      this.handleError("CRDT bind failed", error);
+      throw error;
+    }
+  }
+
+  async disconnectCrdt(): Promise<void> {
+    await this.crdtManager.disconnect();
+    this.updateStatusBar();
+  }
+
+  private async bootstrapSync(reason: string): Promise<void> {
+    if (!this.canAttemptAuth()) {
+      this.recordLog(
+        "startup",
+        `Skipping ${reason} auto-connect because auth settings are incomplete.`
+      );
+      return;
+    }
+
+    try {
+      await this.ensureAuthenticated(true);
+      await this.resumeDownloadedRooms(reason);
+    } catch (error) {
+      this.handleError("Startup sync failed", error, false);
+    }
+  }
+
+  private async ensureAuthenticated(silent = false): Promise<void> {
+    if (this.data.session?.refreshToken) {
+      await this.refreshSession(!silent);
+      return;
+    }
+
+    await this.loginWithSettings(!silent);
+  }
+
+  private canAttemptAuth(): boolean {
+    const { serverUrl, username, password } = this.data.settings;
+    return Boolean(serverUrl && ((username && password) || this.data.session?.refreshToken));
+  }
+
+  private registerCommands(): void {
+    this.addCommand({
+      id: "rolay-login",
+      name: "Login with configured credentials",
+      callback: () => {
+        void this.loginWithSettings();
+      }
+    });
+
+    this.addCommand({
+      id: "rolay-refresh-session",
+      name: "Refresh current Rolay session",
+      callback: () => {
+        void this.refreshSession();
+      }
+    });
+
+    this.addCommand({
+      id: "rolay-reload-current-user",
+      name: "Reload current Rolay user profile",
+      callback: () => {
+        void this.fetchCurrentUser(true);
+      }
+    });
+
+    this.addCommand({
+      id: "rolay-refresh-room-list",
+      name: "Refresh room list",
+      callback: () => {
+        void this.refreshRooms(true);
+      }
+    });
+
+    this.addCommand({
+      id: "rolay-connect-active-note",
+      name: "Connect active markdown note to Rolay CRDT",
+      callback: () => {
+        void this.bindActiveMarkdownToCrdt();
+      }
+    });
+
+    this.addCommand({
+      id: "rolay-create-room",
+      name: "Create room",
+      callback: () => {
+        void this.createRoomFromPrompt();
+      }
+    });
+
+    this.addCommand({
+      id: "rolay-join-room",
+      name: "Join room by invite key",
+      callback: () => {
+        void this.joinRoomFromPrompt();
+      }
+    });
+  }
+
+  private async handleFileOpen(file: TFile | null): Promise<void> {
+    await this.crdtManager.bindToFile(file);
+    this.updateStatusBar();
+  }
+
+  private async handleVaultCreate(file: TAbstractFile): Promise<void> {
+    try {
+      await this.fileBridge.handleVaultCreate(file);
+    } catch (error) {
+      this.handleError(`Local create sync failed for ${file.path}`, error, false);
+    }
+  }
+
+  private async handleVaultRename(file: TAbstractFile, oldPath: string): Promise<void> {
+    try {
+      await this.fileBridge.handleVaultRename(file, oldPath);
+    } catch (error) {
+      this.handleError(`Local rename sync failed for ${oldPath}`, error, false);
+    }
+  }
+
+  private async handleVaultDelete(file: TAbstractFile): Promise<void> {
+    try {
+      if (await this.handlePotentialRoomRootRemoval(file.path, "delete")) {
+        return;
+      }
+
+      await this.fileBridge.handleVaultDelete(file);
+    } catch (error) {
+      this.handleError(`Local delete sync failed for ${file.path}`, error, false);
+    }
+  }
+
+  private async refreshPostAuthState(): Promise<void> {
+    try {
+      await this.refreshRooms(false);
+    } catch (error) {
+      this.handleError("Room list refresh failed", error, false);
+    }
+
+    if (this.data.session?.user?.isAdmin) {
+      try {
+        await this.refreshManagedUsers(false);
+      } catch (error) {
+        this.handleError("Admin user list refresh failed", error, false);
+      }
+
+      try {
+        await this.refreshAdminRooms(false);
+      } catch (error) {
+        this.handleError("Admin room list refresh failed", error, false);
+      }
+    } else {
+      this.clearAdminState();
+    }
+  }
+
+  private async resumeDownloadedRooms(reason: string): Promise<void> {
+    await this.reconcileLocalRoomFolders();
+    const downloadedRooms = this.getDownloadedRooms();
+    if (downloadedRooms.length === 0) {
+      this.recordLog("startup", `No downloaded rooms to resume (${reason}).`);
+      return;
+    }
+
+    for (const room of downloadedRooms) {
+      await this.connectRoom(room.workspaceId, false, reason);
+    }
+  }
+
+  private async reconcileDownloadedRooms(): Promise<void> {
+    const availableRoomIds = new Set(this.roomList.map((room) => room.workspace.id));
+
+    for (const [roomId, binding] of Object.entries(this.data.settings.roomBindings)) {
+      if (!binding.downloaded || availableRoomIds.has(roomId)) {
+        continue;
+      }
+
+      await this.deactivateRoomDownload(roomId);
+      this.recordLog("rooms", `Room ${roomId} is no longer available to the current user. Sync was stopped and the download flag was cleared.`);
+    }
+  }
+
+  private reconcileInviteCache(): void {
+    const ownerRoomIds = new Set(
+      this.roomList
+        .filter((room) => room.membershipRole === "owner")
+        .map((room) => room.workspace.id)
+    );
+
+    for (const roomId of [...this.roomInvites.keys()]) {
+      if (!ownerRoomIds.has(roomId)) {
+        this.roomInvites.delete(roomId);
+      }
+    }
+  }
+
+  private scheduleSnapshotRefresh(workspaceId: string, reason = "event-stream"): void {
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    if (runtime.snapshotRefreshHandle !== null) {
+      return;
+    }
+
+    runtime.snapshotRefreshHandle = window.setTimeout(() => {
+      runtime.snapshotRefreshHandle = null;
+      void this.refreshRoomSnapshot(workspaceId, reason);
+    }, 400);
+  }
+
+  private recordLog(scope: string, message: string, level: RolayLogEntry["level"] = "info"): void {
+    const entry: RolayLogEntry = {
+      at: new Date().toISOString(),
+      level,
+      scope,
+      message
+    };
+
+    this.data.logs = [...this.data.logs.slice(-99), entry];
+    this.schedulePersist();
+    console[level === "error" ? "error" : "info"](`[Rolay] ${scope}: ${message}`);
+    this.updateStatusBar();
+  }
+
+  private handleError(title: string, error: unknown, showNotice = true): void {
+    const message = error instanceof Error ? error.message : String(error);
+    this.recordLog("error", `${title}: ${message}`, "error");
+
+    if (showNotice) {
+      new Notice(`${title}: ${message}`);
+    }
+  }
+
+  private notifyError(message: string): Error {
+    new Notice(message);
+    return new Error(message);
+  }
+
+  private schedulePersist(): void {
+    if (this.persistHandle !== null) {
+      window.clearTimeout(this.persistHandle);
+    }
+
+    this.persistHandle = window.setTimeout(() => {
+      this.persistHandle = null;
+      void this.persistNow();
+    }, 300);
+  }
+
+  private async persistNow(): Promise<void> {
+    if (this.persistHandle !== null) {
+      window.clearTimeout(this.persistHandle);
+      this.persistHandle = null;
+    }
+
+    await this.saveData(this.data);
+  }
+
+  private requireAdmin(): void {
+    if (!this.data.session?.user?.isAdmin) {
+      throw this.notifyError("This action is admin-only.");
+    }
+  }
+
+  private requireRoom(workspaceId: string): RoomListItem {
+    const room = this.roomList.find((item) => item.workspace.id === workspaceId);
+    if (!room) {
+      throw this.notifyError("Room is not available in the current membership list.");
+    }
+
+    return room;
+  }
+
+  private requireDownloadedRoom(workspaceId: string): RoomListItem {
+    const room = this.requireRoom(workspaceId);
+    const binding = this.getStoredRoomBinding(workspaceId);
+    if (!binding?.downloaded) {
+      throw this.notifyError("Download the room folder first.");
+    }
+
+    return room;
+  }
+
+  private requireOwnerRoom(workspaceId: string): RoomListItem {
+    const room = this.requireRoom(workspaceId);
+    if (room.membershipRole !== "owner") {
+      throw this.notifyError("Only room owners can manage invite keys.");
+    }
+
+    return room;
+  }
+
+  private getStoredRoomBinding(workspaceId: string): RolayRoomBindingSettings | null {
+    return getRoomBindingSettings(this.data.settings, workspaceId);
+  }
+
+  private getResolvedRoomFolderName(workspaceId: string, fallbackRoomName: string): string {
+    const binding = this.getStoredRoomBinding(workspaceId);
+    return normalizeRoomFolderName(binding?.folderName || fallbackRoomName);
+  }
+
+  private getDownloadedFolderName(workspaceId: string): string | null {
+    const room = this.roomList.find((item) => item.workspace.id === workspaceId);
+    if (!room) {
+      return null;
+    }
+
+    const binding = this.getStoredRoomBinding(workspaceId);
+    if (!binding?.downloaded) {
+      return null;
+    }
+
+    return this.getResolvedRoomFolderName(workspaceId, room.workspace.name);
+  }
+
+  private getDownloadedRooms(): DownloadedRoomDescriptor[] {
+    return this.roomList
+      .filter((room) => Boolean(this.getStoredRoomBinding(room.workspace.id)?.downloaded))
+      .map((room) => ({
+        workspaceId: room.workspace.id,
+        folderName: this.getResolvedRoomFolderName(room.workspace.id, room.workspace.name)
+      }));
+  }
+
+  private ensureRoomRuntime(workspaceId: string): RoomRuntimeState {
+    const existing = this.roomRuntime.get(workspaceId);
+    if (existing) {
+      return existing;
+    }
+
+    const runtime: RoomRuntimeState = {
+      treeStore: new TreeStore(),
+      eventStream: null,
+      streamStatus: "stopped",
+      snapshotRefreshHandle: null
+    };
+    this.roomRuntime.set(workspaceId, runtime);
+    return runtime;
+  }
+
+  private getRoomStore(workspaceId: string): TreeStore | null {
+    return this.roomRuntime.get(workspaceId)?.treeStore ?? null;
+  }
+
+  private async saveRoomBinding(
+    workspaceId: string,
+    nextBinding: Partial<RolayRoomBindingSettings>
+  ): Promise<void> {
+    const current = this.getStoredRoomBinding(workspaceId) ?? {
+      folderName: "",
+      downloaded: false
+    };
+
+    await this.updateSettings({
+      roomBindings: {
+        [workspaceId]: {
+          ...current,
+          ...nextBinding
+        }
+      }
+    });
+  }
+
+  private requireFolderNameForRoom(workspaceId: string, fallbackRoomName: string): string {
+    const folderName = this.getResolvedRoomFolderName(workspaceId, fallbackRoomName);
+    if (!isValidRoomFolderName(folderName)) {
+      throw this.notifyError("Room folder name must be non-empty and must not contain '/' or '\\'.");
+    }
+
+    return folderName;
+  }
+
+  private isLocalPathInDownloadedRoom(localPath: string, workspaceId: string): boolean {
+    const folderName = this.getDownloadedFolderName(workspaceId);
+    if (!folderName) {
+      return false;
+    }
+
+    return toServerPathForRoom(localPath, this.data.settings.syncRoot, folderName) !== null;
+  }
+
+  private isFolderNameUsedByAnotherRoom(workspaceId: string, folderName: string): boolean {
+    for (const room of this.roomList) {
+      if (room.workspace.id === workspaceId) {
+        continue;
+      }
+
+      const otherFolderName = this.getResolvedRoomFolderName(room.workspace.id, room.workspace.name);
+      if (otherFolderName && otherFolderName === folderName) {
+        const binding = this.getStoredRoomBinding(room.workspace.id);
+        if (binding?.downloaded || binding?.folderName) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  private async deactivateRoomDownload(workspaceId: string, showNotice = false): Promise<void> {
+    const activeFile = this.app.workspace.getActiveFile();
+    if (activeFile && this.isLocalPathInDownloadedRoom(activeFile.path, workspaceId)) {
+      await this.crdtManager.disconnect();
+    }
+
+    this.stopRoomEventStream(workspaceId);
+
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (runtime && runtime.snapshotRefreshHandle !== null) {
+      window.clearTimeout(runtime.snapshotRefreshHandle);
+    }
+
+    this.roomRuntime.delete(workspaceId);
+    this.roomInvites.delete(workspaceId);
+
+    const binding = this.getStoredRoomBinding(workspaceId);
+    if (binding?.downloaded) {
+      await this.saveRoomBinding(workspaceId, {
+        downloaded: false
+      });
+    }
+
+    if (showNotice) {
+      new Notice("Rolay room folder detached from the vault.");
+    }
+  }
+
+  private updateStatusBar(): void {
+    if (!this.statusBarEl) {
+      return;
+    }
+
+    const currentUser = this.data.session?.user ?? null;
+    const downloadedRoomCount = this.getDownloadedRooms().length;
+    const activeStreamCount = [...this.roomRuntime.values()].filter((runtime) => runtime.streamStatus === "open").length;
+    const crdt = this.crdtManager?.getState();
+    const authLabel = currentUser
+      ? `${currentUser.username} (${currentUser.globalRole}${currentUser.isAdmin ? ", admin" : ""})`
+      : "signed-out";
+    const crdtLabel = crdt ? crdt.status : "idle";
+    this.statusBarEl.setText(
+      `Rolay: ${authLabel} | rooms ${downloadedRoomCount} downloaded | SSE ${activeStreamCount} open | CRDT ${crdtLabel}`
+    );
+  }
+
+  private async applySessionUser(user: User): Promise<void> {
+    if (!this.data.session) {
+      this.data.session = {
+        accessToken: "",
+        refreshToken: "",
+        user,
+        authenticatedAt: new Date().toISOString()
+      };
+    } else {
+      this.data.session = {
+        ...this.data.session,
+        user
+      };
+    }
+
+    this.resetProfileDraft();
+    await this.persistNow();
+    this.updateStatusBar();
+  }
+
+  private updateRoomSyncCursor(workspaceId: string, cursor: number): void {
+    const current = getRoomSyncState(this.data.sync, workspaceId);
+    this.setRoomSyncState(workspaceId, {
+      ...current,
+      lastCursor: cursor
+    });
+  }
+
+  private setRoomSyncState(
+    workspaceId: string,
+    nextState: { lastCursor: number | null; lastSnapshotAt: string | null }
+  ): void {
+    this.data.sync.rooms = {
+      ...this.data.sync.rooms,
+      [workspaceId]: nextState
+    };
+  }
+
+  private resetProfileDraft(): void {
+    this.profileDraftDisplayName = this.data.session?.user?.displayName ?? "";
+  }
+
+  private clearRoomDrafts(): void {
+    this.clearCreateRoomDraft();
+    this.clearJoinRoomDraft();
+  }
+
+  private clearCreateRoomDraft(): void {
+    this.createRoomDraft = {
+      name: ""
+    };
+  }
+
+  private clearJoinRoomDraft(): void {
+    this.joinRoomDraft = {
+      code: ""
+    };
+  }
+
+  private clearManagedUserDraft(): void {
+    this.managedUserDraft = {
+      username: "",
+      password: "",
+      displayName: "",
+      globalRole: "reader"
+    };
+  }
+
+  private clearAdminRoomMemberDraft(): void {
+    this.adminRoomMemberDraft = {
+      username: "",
+      role: "member"
+    };
+  }
+
+  private clearAdminState(): void {
+    this.adminRoomList = [];
+    this.managedUsers = [];
+    this.adminSelectedRoomId = "";
+    this.adminRoomMembers = [];
+    this.clearAdminRoomMemberDraft();
+  }
+
+  private resolveEntryByLocalPath(localPath: string): FileEntry | null {
+    const downloadedRooms = this.getDownloadedRooms().sort((left, right) => right.folderName.length - left.folderName.length);
+
+    for (const room of downloadedRooms) {
+      const serverPath = toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName);
+      if (serverPath === null) {
+        continue;
+      }
+
+      const entry = this.getRoomStore(room.workspaceId)?.getEntryByPath(serverPath) ?? null;
+      if (entry) {
+        return entry;
+      }
+    }
+
+    return null;
+  }
+
+  private getPersistedCrdtState(entryId: string): Uint8Array | null {
+    const cacheKey = this.getCrdtCacheKey(entryId);
+    const cached = this.data.crdtCache.entries[cacheKey] ?? this.data.crdtCache.entries[entryId];
+    if (!cached) {
+      return null;
+    }
+
+    try {
+      return decodeBase64(cached.encodedState);
+    } catch (error) {
+      delete this.data.crdtCache.entries[cacheKey];
+      delete this.data.crdtCache.entries[entryId];
+      this.recordLog(
+        "crdt",
+        `Dropped invalid persisted CRDT cache for ${entryId}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+      this.schedulePersist();
+      return null;
+    }
+  }
+
+  private persistCrdtState(entryId: string, filePath: string, state: Uint8Array): void {
+    const cacheKey = this.getCrdtCacheKey(entryId);
+    this.data.crdtCache.entries[cacheKey] = {
+      encodedState: encodeBase64(state),
+      filePath,
+      updatedAt: new Date().toISOString()
+    };
+    delete this.data.crdtCache.entries[entryId];
+    this.prunePersistedCrdtCache();
+    this.schedulePersist();
+  }
+
+  private prunePersistedCrdtCache(): void {
+    const entries = Object.entries(this.data.crdtCache.entries);
+    if (entries.length <= RolayPlugin.MAX_PERSISTED_CRDT_DOCS) {
+      return;
+    }
+
+    const sortedEntries = entries
+      .map(([entryId, entry]) => ({ entryId, entry }))
+      .sort((left, right) => compareCrdtCacheEntries(left.entry, right.entry));
+
+    for (const staleEntry of sortedEntries.slice(0, entries.length - RolayPlugin.MAX_PERSISTED_CRDT_DOCS)) {
+      delete this.data.crdtCache.entries[staleEntry.entryId];
+    }
+  }
+
+  private getCrdtCacheKey(entryId: string): string {
+    const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl);
+    return normalizedServerUrl ? `${normalizedServerUrl}::${entryId}` : entryId;
+  }
+
+  private isLiveSyncEnabledForLocalPath(localPath: string): boolean {
+    for (const room of this.getDownloadedRooms()) {
+      const serverPath = toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName);
+      if (serverPath === null) {
+        continue;
+      }
+
+      return (this.roomRuntime.get(room.workspaceId)?.streamStatus ?? "stopped") !== "stopped";
+    }
+
+    return false;
+  }
+
+  private async handlePotentialRoomRootRemoval(
+    localPath: string,
+    reason: "delete" | "missing"
+  ): Promise<boolean> {
+    const room = this.getDownloadedRooms().find((item) => {
+      const roomRoot = getRoomRoot(this.data.settings.syncRoot, item.folderName);
+      return roomRoot === localPath;
+    });
+
+    if (!room) {
+      return false;
+    }
+
+    await this.deactivateRoomDownload(room.workspaceId, false);
+    this.recordLog(
+      "rooms",
+      `Detached local room folder for ${room.workspaceId} after ${reason}. Remote room content was left untouched.`
+    );
+    return true;
+  }
+
+  private async reconcileLocalRoomFolders(): Promise<void> {
+    for (const room of this.getDownloadedRooms()) {
+      const roomRoot = getRoomRoot(this.data.settings.syncRoot, room.folderName);
+      if (this.app.vault.getAbstractFileByPath(roomRoot)) {
+        continue;
+      }
+
+      await this.deactivateRoomDownload(room.workspaceId, false);
+      this.recordLog(
+        "rooms",
+        `Detached room ${room.workspaceId} because the local folder ${roomRoot} is missing. Remote room content was left untouched.`
+      );
+    }
+  }
+
+  private patchInviteEnabled(workspaceId: string, enabled: boolean): void {
+    this.roomList = this.roomList.map((room) => {
+      if (room.workspace.id !== workspaceId) {
+        return room;
+      }
+
+      return {
+        ...room,
+        inviteEnabled: enabled
+      };
+    });
+    this.adminRoomList = this.adminRoomList.map((room) => {
+      if (room.workspace.id !== workspaceId) {
+        return room;
+      }
+
+      return {
+        ...room,
+        inviteEnabled: enabled
+      };
+    });
+  }
+
+  private async queueCreateFolder(workspaceId: string, path: string): Promise<void> {
+    await this.operationsQueue.enqueue(
+      workspaceId,
+      {
+        type: "create_folder",
+        path
+      },
+      `local folder create ${path}`
+    );
+  }
+
+  private async queueCreateMarkdown(
+    workspaceId: string,
+    path: string,
+    localContent = ""
+  ): Promise<void> {
+    const response = await this.operationsQueue.enqueue(
+      workspaceId,
+      {
+        type: "create_markdown",
+        path
+      },
+      `local markdown create ${path}`
+    );
+    this.recordLog(
+      "ops",
+      `[${workspaceId}] Markdown entry created for ${path}. Existing local text will be pushed into the remote CRDT doc when possible.`
+    );
+
+    if (!localContent) {
+      return;
+    }
+
+    let createdEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+    if (!createdEntry) {
+      await this.refreshRoomSnapshot(workspaceId, "markdown-create-seed");
+      createdEntry = this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null;
+    }
+
+    if (!createdEntry || createdEntry.kind !== "markdown") {
+      return;
+    }
+
+    try {
+      await this.crdtManager.seedRemoteMarkdown(createdEntry, localContent, path);
+      this.scheduleSnapshotRefresh(workspaceId, "markdown-seed");
+    } catch (error) {
+      this.handleError(`Remote markdown seed failed for ${path}`, error, false);
+    }
+  }
+
+  private async queueRenameOrMove(
+    workspaceId: string,
+    entry: FileEntry,
+    newPath: string,
+    type: "rename_entry" | "move_entry"
+  ): Promise<void> {
+    await this.operationsQueue.enqueue(
+      workspaceId,
+      {
+        type,
+        entryId: entry.id,
+        newPath,
+        preconditions: {
+          entryVersion: entry.entryVersion,
+          path: entry.path
+        }
+      },
+      `${type} ${entry.path} -> ${newPath}`
+    );
+  }
+
+  private async queueDeleteEntry(workspaceId: string, entry: FileEntry): Promise<void> {
+    await this.operationsQueue.enqueue(
+      workspaceId,
+      {
+        type: "delete_entry",
+        entryId: entry.id,
+        preconditions: {
+          entryVersion: entry.entryVersion,
+          path: entry.path
+        }
+      },
+      `delete ${entry.path}`
+    );
+  }
+}
+
+function compareRoomsByName(left: RoomListItem, right: RoomListItem): number {
+  const nameComparison = left.workspace.name.localeCompare(right.workspace.name);
+  if (nameComparison !== 0) {
+    return nameComparison;
+  }
+
+  return left.workspace.id.localeCompare(right.workspace.id);
+}
+
+function compareRoomMembers(left: RoomMember, right: RoomMember): number {
+  if (left.role !== right.role) {
+    return left.role === "owner" ? -1 : 1;
+  }
+
+  return left.user.username.localeCompare(right.user.username);
+}
+
+function compareCrdtCacheEntries(left: RolayCrdtCacheEntry, right: RolayCrdtCacheEntry): number {
+  return left.updatedAt.localeCompare(right.updatedAt);
+}

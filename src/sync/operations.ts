@@ -1,0 +1,85 @@
+import { RolayApiClient } from "../api/client";
+import type {
+  BatchOperationsResponse,
+  OperationResult,
+  TreeOperation
+} from "../types/protocol";
+
+interface OperationsQueueConfig {
+  apiClient: RolayApiClient;
+  getDeviceId: () => string;
+  log: (message: string) => void;
+  onAfterApply?: (workspaceId: string, reason: string) => Promise<void> | void;
+}
+
+export class OperationsQueue {
+  private readonly apiClient: RolayApiClient;
+  private readonly getDeviceId: () => string;
+  private readonly log: (message: string) => void;
+  private readonly onAfterApply?: (workspaceId: string, reason: string) => Promise<void> | void;
+  private chain: Promise<void> = Promise.resolve();
+
+  constructor(config: OperationsQueueConfig) {
+    this.apiClient = config.apiClient;
+    this.getDeviceId = config.getDeviceId;
+    this.log = config.log;
+    this.onAfterApply = config.onAfterApply;
+  }
+
+  enqueue(
+    workspaceId: string,
+    operation: Omit<TreeOperation, "opId">,
+    reason: string
+  ): Promise<BatchOperationsResponse> {
+    const queued = async (): Promise<BatchOperationsResponse> => {
+      const opWithId: TreeOperation = {
+        ...operation,
+        opId: createOperationId()
+      };
+
+      this.log(`Sending ${operation.type} (${opWithId.opId}) for ${reason}.`);
+      const response = await this.apiClient.applyBatchOperations(workspaceId, {
+        deviceId: this.getDeviceId(),
+        operations: [opWithId]
+      });
+
+      const failed = response.results.find((result) => result.status !== "applied");
+      for (const result of response.results) {
+        this.log(describeResult(result));
+      }
+
+      await this.onAfterApply?.(workspaceId, reason);
+
+      if (failed) {
+        throw new Error(
+          `Rolay server returned ${failed.status} for ${operation.type}: ${failed.reason ?? "unknown"}`
+        );
+      }
+
+      return response;
+    };
+
+    const task = this.chain.then(queued, queued);
+    this.chain = task.then(() => undefined, () => undefined);
+    return task;
+  }
+}
+
+function createOperationId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+
+  return `rolay-op-${Date.now()}`;
+}
+
+function describeResult(result: OperationResult): string {
+  if (result.status === "applied") {
+    return `Operation ${result.opId} applied at event ${result.eventSeq ?? "?"}.`;
+  }
+
+  const suggested = result.suggestedPath ? ` Suggested path: ${result.suggestedPath}.` : "";
+  return `Operation ${result.opId} ${result.status}: ${result.reason ?? "unknown"}.${
+    suggested
+  }`;
+}

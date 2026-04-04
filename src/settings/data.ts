@@ -1,0 +1,291 @@
+import { Platform } from "obsidian";
+import type { GlobalRole, User } from "../types/protocol";
+
+export interface RolayRoomBindingSettings {
+  folderName: string;
+  downloaded: boolean;
+}
+
+export interface RolayPluginSettings {
+  serverUrl: string;
+  username: string;
+  password: string;
+  syncRoot: string;
+  deviceName: string;
+  autoConnect: boolean;
+  roomBindings: Record<string, RolayRoomBindingSettings>;
+}
+
+export interface RolaySessionState {
+  accessToken: string;
+  refreshToken: string;
+  user: User | null;
+  authenticatedAt: string;
+}
+
+export interface RolayRoomSyncState {
+  lastCursor: number | null;
+  lastSnapshotAt: string | null;
+}
+
+export interface RolaySyncState {
+  rooms: Record<string, RolayRoomSyncState>;
+}
+
+export interface RolayLogEntry {
+  at: string;
+  level: "info" | "error";
+  scope: string;
+  message: string;
+}
+
+export interface RolayCrdtCacheEntry {
+  encodedState: string;
+  filePath: string;
+  updatedAt: string;
+}
+
+export interface RolayCrdtCacheState {
+  entries: Record<string, RolayCrdtCacheEntry>;
+}
+
+export interface RolayPluginData {
+  settings: RolayPluginSettings;
+  session: RolaySessionState | null;
+  sync: RolaySyncState;
+  crdtCache: RolayCrdtCacheState;
+  deviceId: string;
+  logs: RolayLogEntry[];
+}
+
+interface LegacyRoomBindingSettings extends Partial<RolayRoomBindingSettings> {
+  localFolderName?: string;
+}
+
+interface LegacyRolayPluginSettings {
+  serverUrl?: string;
+  username?: string;
+  password?: string;
+  syncRoot?: string;
+  deviceName?: string;
+  autoConnect?: boolean;
+  workspaceId?: string;
+  activeRoomId?: string;
+  roomBindings?: Record<string, LegacyRoomBindingSettings>;
+}
+
+export const DEFAULT_SETTINGS: RolayPluginSettings = {
+  serverUrl: "http://46.16.36.87:3000",
+  username: "",
+  password: "",
+  syncRoot: "Rolay",
+  deviceName: Platform.isMobile ? "Obsidian Mobile" : "Obsidian Desktop",
+  autoConnect: true,
+  roomBindings: {}
+};
+
+export function normalizeServerUrl(serverUrl: string): string {
+  const trimmed = serverUrl.trim().replace(/\/+$/, "");
+  if (!trimmed) {
+    return "";
+  }
+
+  if (/^https?:\/\//i.test(trimmed)) {
+    return trimmed;
+  }
+
+  return `http://${trimmed}`;
+}
+
+export function createDefaultPluginData(): RolayPluginData {
+  return {
+    settings: { ...DEFAULT_SETTINGS, roomBindings: {} },
+    session: null,
+    sync: {
+      rooms: {}
+    },
+    crdtCache: {
+      entries: {}
+    },
+    deviceId: createDeviceId(),
+    logs: []
+  };
+}
+
+export function mergePluginData(rawData: Partial<RolayPluginData> | null | undefined): RolayPluginData {
+  const defaults = createDefaultPluginData();
+  const rawSession = rawData?.session ?? null;
+  const rawSettings = (rawData?.settings ?? {}) as LegacyRolayPluginSettings;
+  const normalizedSettings: RolayPluginSettings = {
+    ...defaults.settings,
+    ...rawSettings,
+    syncRoot: (rawSettings.syncRoot ?? defaults.settings.syncRoot).trim(),
+    roomBindings: normalizeRoomBindings(rawSettings)
+  };
+  const normalizedSession = rawSession
+    ? {
+        ...rawSession,
+        user: normalizeUser(rawSession.user)
+      }
+    : defaults.session;
+
+  return {
+    ...defaults,
+    ...rawData,
+    settings: normalizedSettings,
+    session: normalizedSession,
+    sync: {
+      rooms: normalizeRoomSyncMap(rawData?.sync)
+    },
+    crdtCache: normalizeCrdtCacheState(rawData?.crdtCache),
+    deviceId: rawData?.deviceId ?? defaults.deviceId,
+    logs: Array.isArray(rawData?.logs) ? rawData.logs.slice(-100) : defaults.logs
+  };
+}
+
+export function getRoomSyncState(
+  sync: RolaySyncState,
+  roomId: string | null | undefined
+): RolayRoomSyncState {
+  if (!roomId) {
+    return {
+      lastCursor: null,
+      lastSnapshotAt: null
+    };
+  }
+
+  return (
+    sync.rooms[roomId] ?? {
+      lastCursor: null,
+      lastSnapshotAt: null
+    }
+  );
+}
+
+export function getRoomBindingSettings(
+  settings: RolayPluginSettings,
+  roomId: string
+): RolayRoomBindingSettings | null {
+  return settings.roomBindings[roomId] ?? null;
+}
+
+function normalizeRoomBindings(
+  rawSettings: LegacyRolayPluginSettings
+): Record<string, RolayRoomBindingSettings> {
+  const normalized: Record<string, RolayRoomBindingSettings> = {};
+  const rawBindings = rawSettings.roomBindings;
+
+  if (rawBindings && typeof rawBindings === "object") {
+    for (const [roomId, binding] of Object.entries(rawBindings)) {
+      const rawFolderName = (binding.folderName ?? binding.localFolderName ?? "").trim();
+      const folderName = rawFolderName === roomId ? "" : rawFolderName;
+      normalized[roomId] = {
+        folderName,
+        downloaded: Boolean(binding.downloaded)
+      };
+    }
+  }
+
+  const legacyActiveRoomId = (rawSettings.activeRoomId ?? rawSettings.workspaceId ?? "").trim();
+  if (legacyActiveRoomId && !(legacyActiveRoomId in normalized)) {
+    normalized[legacyActiveRoomId] = {
+      folderName: "",
+      downloaded: true
+    };
+  }
+
+  return normalized;
+}
+
+function normalizeRoomSyncMap(
+  rawSync: Partial<RolaySyncState> | undefined
+): Record<string, RolayRoomSyncState> {
+  const rooms: Record<string, RolayRoomSyncState> = {};
+  const rawRooms = rawSync?.rooms;
+
+  if (rawRooms && typeof rawRooms === "object") {
+    for (const [roomId, rawState] of Object.entries(rawRooms)) {
+      rooms[roomId] = normalizeRoomSyncState(rawState);
+    }
+  }
+
+  return rooms;
+}
+
+function normalizeRoomSyncState(rawState: unknown): RolayRoomSyncState {
+  if (!rawState || typeof rawState !== "object") {
+    return {
+      lastCursor: null,
+      lastSnapshotAt: null
+    };
+  }
+
+  const candidate = rawState as { lastCursor?: unknown; lastSnapshotAt?: unknown };
+  return {
+    lastCursor: typeof candidate.lastCursor === "number" ? candidate.lastCursor : null,
+    lastSnapshotAt: typeof candidate.lastSnapshotAt === "string" ? candidate.lastSnapshotAt : null
+  };
+}
+
+function normalizeCrdtCacheState(rawCache: unknown): RolayCrdtCacheState {
+  if (!rawCache || typeof rawCache !== "object") {
+    return {
+      entries: {}
+    };
+  }
+
+  const rawEntries = (rawCache as { entries?: unknown }).entries;
+  if (!rawEntries || typeof rawEntries !== "object") {
+    return {
+      entries: {}
+    };
+  }
+
+  const entries: Record<string, RolayCrdtCacheEntry> = {};
+  for (const [entryId, rawEntry] of Object.entries(rawEntries)) {
+    if (!rawEntry || typeof rawEntry !== "object") {
+      continue;
+    }
+
+    const candidate = rawEntry as Partial<RolayCrdtCacheEntry>;
+    if (typeof candidate.encodedState !== "string" || !candidate.encodedState) {
+      continue;
+    }
+
+    entries[entryId] = {
+      encodedState: candidate.encodedState,
+      filePath: typeof candidate.filePath === "string" ? candidate.filePath : "",
+      updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : new Date(0).toISOString()
+    };
+  }
+
+  return { entries };
+}
+
+function normalizeUser(user: User | null | undefined): User | null {
+  if (!user) {
+    return null;
+  }
+
+  return {
+    ...user,
+    isAdmin: Boolean(user.isAdmin),
+    globalRole: normalizeGlobalRole((user as User).globalRole)
+  };
+}
+
+function normalizeGlobalRole(globalRole: GlobalRole | string | undefined): GlobalRole {
+  if (globalRole === "admin" || globalRole === "writer" || globalRole === "reader") {
+    return globalRole;
+  }
+
+  return "reader";
+}
+
+function createDeviceId(): string {
+  if (typeof globalThis.crypto?.randomUUID === "function") {
+    return globalThis.crypto.randomUUID();
+  }
+
+  return `rolay-device-${Date.now()}`;
+}

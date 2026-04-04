@@ -1,0 +1,29 @@
+{
+  "name": "rolay-obsidian-plugin",
+  "version": "0.1.0",
+  "main": "main.js",
+  "scripts": {
+    "build": "node esbuild.config.mjs production",
+    "check": "tsc --noEmit",
+    "dev": "node esbuild.config.mjs"
+  },
+  "keywords": [
+    "obsidian",
+    "rolay",
+    "yjs"
+  ],
+  "author": "Rolay",
+  "license": "MIT",
+  "description": "Obsidian plugin for Rolay auth, tree sync, SSE events, and CRDT-backed markdown sessions.",
+  "dependencies": {
+    "@hocuspocus/provider": "^3.4.0",
+    "eventsource-parser": "^3.0.6",
+    "yjs": "^13.6.27"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "esbuild": "^0.28.0",
+    "obsidian": "^1.12.3",
+    "typescript": "^6.0.2"
+  }
+}
