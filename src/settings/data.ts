@@ -62,12 +62,23 @@ export interface RolayPendingMarkdownCreateEntry {
   lastError: string | null;
 }
 
+export interface RolayPendingMarkdownMergeEntry {
+  workspaceId: string;
+  entryId: string;
+  localPath: string;
+  filePath: string;
+  createdAt: string;
+  lastAttemptAt: string | null;
+  lastError: string | null;
+}
+
 export interface RolayPluginData {
   settings: RolayPluginSettings;
   session: RolaySessionState | null;
   sync: RolaySyncState;
   crdtCache: RolayCrdtCacheState;
   pendingMarkdownCreates: Record<string, RolayPendingMarkdownCreateEntry>;
+  pendingMarkdownMerges: Record<string, RolayPendingMarkdownMergeEntry>;
   deviceId: string;
   logs: RolayLogEntry[];
 }
@@ -122,6 +133,7 @@ export function createDefaultPluginData(): RolayPluginData {
       entries: {}
     },
     pendingMarkdownCreates: {},
+    pendingMarkdownMerges: {},
     deviceId: createDeviceId(),
     logs: []
   };
@@ -157,6 +169,7 @@ export function mergePluginData(rawData: Partial<RolayPluginData> | null | undef
     },
     crdtCache: normalizeCrdtCacheState(rawData?.crdtCache),
     pendingMarkdownCreates: normalizePendingMarkdownCreates(rawData?.pendingMarkdownCreates),
+    pendingMarkdownMerges: normalizePendingMarkdownMerges(rawData?.pendingMarkdownMerges),
     deviceId: rawData?.deviceId ?? defaults.deviceId,
     logs: Array.isArray(rawData?.logs) ? rawData.logs.slice(-100) : defaults.logs
   };
@@ -306,6 +319,42 @@ function normalizePendingMarkdownCreates(
       workspaceId,
       localPath,
       serverPath,
+      createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : new Date().toISOString(),
+      lastAttemptAt: typeof candidate.lastAttemptAt === "string" ? candidate.lastAttemptAt : null,
+      lastError: typeof candidate.lastError === "string" ? candidate.lastError : null
+    };
+  }
+
+  return entries;
+}
+
+function normalizePendingMarkdownMerges(
+  rawPendingMerges: unknown
+): Record<string, RolayPendingMarkdownMergeEntry> {
+  if (!rawPendingMerges || typeof rawPendingMerges !== "object") {
+    return {};
+  }
+
+  const entries: Record<string, RolayPendingMarkdownMergeEntry> = {};
+  for (const [rawEntryId, rawPendingMerge] of Object.entries(rawPendingMerges)) {
+    if (!rawPendingMerge || typeof rawPendingMerge !== "object") {
+      continue;
+    }
+
+    const candidate = rawPendingMerge as Partial<RolayPendingMarkdownMergeEntry>;
+    const entryId = typeof candidate.entryId === "string" ? candidate.entryId.trim() : rawEntryId.trim();
+    const localPath = normalizeStoredPath(candidate.localPath ?? "");
+    const filePath = normalizeStoredPath(candidate.filePath ?? "");
+    const workspaceId = typeof candidate.workspaceId === "string" ? candidate.workspaceId.trim() : "";
+    if (!entryId || !localPath || !filePath || !workspaceId) {
+      continue;
+    }
+
+    entries[entryId] = {
+      workspaceId,
+      entryId,
+      localPath,
+      filePath,
       createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : new Date().toISOString(),
       lastAttemptAt: typeof candidate.lastAttemptAt === "string" ? candidate.lastAttemptAt : null,
       lastError: typeof candidate.lastError === "string" ? candidate.lastError : null

@@ -4,6 +4,7 @@ import * as Y from "yjs";
 import { RolayApiClient } from "../api/client";
 import {
   getCodeMirrorEditorView,
+  getMarkdownViewsForFile,
   getMarkdownEditorViewsForFile,
   setRemotePresenceDecorations,
   type SharedCursorPresence
@@ -158,13 +159,25 @@ export class CrdtSessionManager {
       return;
     }
 
-    this.log(`Seeding remote markdown content for ${contextLabel}.`);
+    await this.mergeRemoteMarkdownState(entry, createMarkdownTextState(localText), contextLabel);
+  }
+
+  async mergeRemoteMarkdownState(
+    entry: FileEntry,
+    localState: Uint8Array,
+    contextLabel = entry.path
+  ): Promise<void> {
+    if (localState.byteLength === 0) {
+      return;
+    }
+
+    this.log(`Merging local markdown state into remote CRDT doc for ${contextLabel}.`);
     const bootstrap = await this.apiClient.createCrdtToken(entry.id);
-    await seedRemoteMarkdownContent({
+    await mergeRemoteMarkdownState({
       wsUrl: bootstrap.wsUrl,
       docId: bootstrap.docId,
       token: createCrdtTokenSupplier(this.apiClient, entry.id, bootstrap.token),
-      localText,
+      localState,
       log: this.log,
       contextLabel
     });
@@ -462,7 +475,7 @@ class BoundCrdtSession {
         return;
       }
 
-      this.syncRemoteIntoEditor();
+      this.syncRemoteIntoOpenEditors();
     });
   }
 
@@ -477,43 +490,50 @@ class BoundCrdtSession {
     });
   }
 
-  private syncRemoteIntoEditor(): void {
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view?.file || view.file.path !== this.file.path) {
+  private syncRemoteIntoOpenEditors(): void {
+    const views = getMarkdownViewsForFile(this.app, this.file.path);
+    if (views.length === 0) {
       return;
     }
 
     const remoteText = this.yText.toString();
-    const editor = view.editor;
-    const currentText = editor.getValue();
-    if (currentText === remoteText) {
-      return;
-    }
-
     this.applyingRemoteText = true;
     try {
-      applyTextPatchToEditor(editor, currentText, remoteText);
+      for (const view of views) {
+        const currentText = view.editor.getValue();
+        if (currentText === remoteText) {
+          continue;
+        }
+
+        applyTextPatchToEditor(view.editor, currentText, remoteText);
+      }
     } finally {
       this.applyingRemoteText = false;
     }
   }
 
   private seedOrSyncEditor(): void {
-    const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-    if (!view?.file || view.file.path !== this.file.path) {
+    const views = getMarkdownViewsForFile(this.app, this.file.path);
+    if (views.length === 0) {
       return;
     }
 
-    const currentText = view.editor.getValue();
     const remoteText = this.yText.toString();
 
-    if (!remoteText && currentText) {
-      this.log(`Seeding empty CRDT doc from local editor content for ${this.file.path}.`);
-      this.pushLocalText(currentText);
-      return;
+    if (!remoteText) {
+      for (const view of views) {
+        const currentText = view.editor.getValue();
+        if (!currentText) {
+          continue;
+        }
+
+        this.log(`Seeding empty CRDT doc from local editor content for ${this.file.path}.`);
+        this.pushLocalText(currentText);
+        return;
+      }
     }
 
-    this.syncRemoteIntoEditor();
+    this.syncRemoteIntoOpenEditors();
   }
 
   private publishLocalUserPresence(): void {
@@ -694,18 +714,18 @@ interface RemoteMarkdownSeedOptions {
   wsUrl: string;
   docId: string;
   token: string | (() => Promise<string>);
-  localText: string;
+  localState: Uint8Array;
   log: (message: string) => void;
   contextLabel: string;
 }
 
-async function seedRemoteMarkdownContent(options: RemoteMarkdownSeedOptions): Promise<void> {
-  if (!options.localText) {
+async function mergeRemoteMarkdownState(options: RemoteMarkdownSeedOptions): Promise<void> {
+  if (options.localState.byteLength === 0) {
     return;
   }
 
   const yDocument = new Y.Doc();
-  const yText = yDocument.getText("content");
+  Y.applyUpdate(yDocument, options.localState, "rolay-import-bootstrap");
 
   await new Promise<void>((resolve, reject) => {
     let settled = false;
@@ -738,22 +758,9 @@ async function seedRemoteMarkdownContent(options: RemoteMarkdownSeedOptions): Pr
       document: yDocument,
       token: options.token,
       onSynced: () => {
-        const remoteText = yText.toString();
-        if (remoteText) {
-          settle(() => {
-            options.log(`Skipped remote markdown seed for ${options.contextLabel} because the CRDT doc already has content.`);
-            resolve();
-          });
-          return;
-        }
-
-        yDocument.transact(() => {
-          yText.insert(0, options.localText);
-        }, "rolay-import-seed");
-
         window.setTimeout(() => {
           settle(() => {
-            options.log(`Seeded remote markdown content for ${options.contextLabel}.`);
+            options.log(`Merged local markdown state into remote CRDT doc for ${options.contextLabel}.`);
             resolve();
           });
         }, 500);
@@ -765,4 +772,16 @@ async function seedRemoteMarkdownContent(options: RemoteMarkdownSeedOptions): Pr
       }
     });
   });
+}
+
+export function createMarkdownTextState(text: string): Uint8Array {
+  const yDocument = new Y.Doc();
+  try {
+    if (text) {
+      yDocument.getText("content").insert(0, text);
+    }
+    return Y.encodeStateAsUpdate(yDocument);
+  } finally {
+    yDocument.destroy();
+  }
 }

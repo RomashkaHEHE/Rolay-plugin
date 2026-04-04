@@ -8814,6 +8814,9 @@ var FileBridge = class {
     }
     const previousById = new Map(previousEntries.map((entry) => [entry.id, entry]));
     const nextById = new Map(snapshot.entries.map((entry) => [entry.id, entry]));
+    const activePathSet = new Set(
+      snapshot.entries.filter((entry) => !entry.deleted).map((entry) => (0, import_obsidian3.normalizePath)(entry.path))
+    );
     const renamedEntries = snapshot.entries.filter((entry) => !entry.deleted).filter((entry) => {
       const previous = previousById.get(entry.id);
       return previous && !previous.deleted && previous.path !== entry.path;
@@ -8834,6 +8837,9 @@ var FileBridge = class {
     }
     const deletedEntries = previousEntries.filter((previous) => {
       if (previous.deleted) {
+        return false;
+      }
+      if (activePathSet.has((0, import_obsidian3.normalizePath)(previous.path))) {
         return false;
       }
       const next = nextById.get(previous.id);
@@ -10972,7 +10978,10 @@ function getCodeMirrorEditorView(editor) {
   return isEditorView(candidate) ? candidate : null;
 }
 function getMarkdownEditorViewsForFile(app, filePath) {
-  return app.workspace.getLeavesOfType("markdown").map((leaf) => leaf.view).filter((view) => view instanceof import_obsidian4.MarkdownView).filter((view) => view.file?.path === filePath).map((view) => getCodeMirrorEditorView(view.editor)).filter((view) => view !== null);
+  return getMarkdownViewsForFile(app, filePath).map((view) => getCodeMirrorEditorView(view.editor)).filter((view) => view !== null);
+}
+function getMarkdownViewsForFile(app, filePath) {
+  return app.workspace.getLeavesOfType("markdown").map((leaf) => leaf.view).filter((view) => view instanceof import_obsidian4.MarkdownView).filter((view) => view.file?.path === filePath);
 }
 function setRemotePresenceDecorations(view, presences) {
   view.dispatch({
@@ -11204,13 +11213,19 @@ var CrdtSessionManager = class {
     if (!localText) {
       return;
     }
-    this.log(`Seeding remote markdown content for ${contextLabel}.`);
+    await this.mergeRemoteMarkdownState(entry, createMarkdownTextState(localText), contextLabel);
+  }
+  async mergeRemoteMarkdownState(entry, localState, contextLabel = entry.path) {
+    if (localState.byteLength === 0) {
+      return;
+    }
+    this.log(`Merging local markdown state into remote CRDT doc for ${contextLabel}.`);
     const bootstrap = await this.apiClient.createCrdtToken(entry.id);
-    await seedRemoteMarkdownContent({
+    await mergeRemoteMarkdownState({
       wsUrl: bootstrap.wsUrl,
       docId: bootstrap.docId,
       token: createCrdtTokenSupplier(this.apiClient, entry.id, bootstrap.token),
-      localText,
+      localState,
       log: this.log,
       contextLabel
     });
@@ -11435,7 +11450,7 @@ var BoundCrdtSession = class {
       if (transaction.origin === LOCAL_EDITOR_ORIGIN) {
         return;
       }
-      this.syncRemoteIntoEditor();
+      this.syncRemoteIntoOpenEditors();
     });
   }
   bindPersistenceObserver() {
@@ -11447,37 +11462,43 @@ var BoundCrdtSession = class {
       this.schedulePersistedState();
     });
   }
-  syncRemoteIntoEditor() {
-    const view = this.app.workspace.getActiveViewOfType(import_obsidian5.MarkdownView);
-    if (!view?.file || view.file.path !== this.file.path) {
+  syncRemoteIntoOpenEditors() {
+    const views = getMarkdownViewsForFile(this.app, this.file.path);
+    if (views.length === 0) {
       return;
     }
     const remoteText = this.yText.toString();
-    const editor = view.editor;
-    const currentText = editor.getValue();
-    if (currentText === remoteText) {
-      return;
-    }
     this.applyingRemoteText = true;
     try {
-      applyTextPatchToEditor(editor, currentText, remoteText);
+      for (const view of views) {
+        const currentText = view.editor.getValue();
+        if (currentText === remoteText) {
+          continue;
+        }
+        applyTextPatchToEditor(view.editor, currentText, remoteText);
+      }
     } finally {
       this.applyingRemoteText = false;
     }
   }
   seedOrSyncEditor() {
-    const view = this.app.workspace.getActiveViewOfType(import_obsidian5.MarkdownView);
-    if (!view?.file || view.file.path !== this.file.path) {
+    const views = getMarkdownViewsForFile(this.app, this.file.path);
+    if (views.length === 0) {
       return;
     }
-    const currentText = view.editor.getValue();
     const remoteText = this.yText.toString();
-    if (!remoteText && currentText) {
-      this.log(`Seeding empty CRDT doc from local editor content for ${this.file.path}.`);
-      this.pushLocalText(currentText);
-      return;
+    if (!remoteText) {
+      for (const view of views) {
+        const currentText = view.editor.getValue();
+        if (!currentText) {
+          continue;
+        }
+        this.log(`Seeding empty CRDT doc from local editor content for ${this.file.path}.`);
+        this.pushLocalText(currentText);
+        return;
+      }
     }
-    this.syncRemoteIntoEditor();
+    this.syncRemoteIntoOpenEditors();
   }
   publishLocalUserPresence() {
     this.provider?.setAwarenessField("user", this.awarenessUser);
@@ -11616,12 +11637,12 @@ function createCrdtTokenSupplier(apiClient, entryId, initialToken) {
     return bootstrap.token;
   };
 }
-async function seedRemoteMarkdownContent(options) {
-  if (!options.localText) {
+async function mergeRemoteMarkdownState(options) {
+  if (options.localState.byteLength === 0) {
     return;
   }
   const yDocument = new Doc();
-  const yText = yDocument.getText("content");
+  applyUpdate(yDocument, options.localState, "rolay-import-bootstrap");
   await new Promise((resolve, reject) => {
     let settled = false;
     let provider = null;
@@ -11649,20 +11670,9 @@ async function seedRemoteMarkdownContent(options) {
       document: yDocument,
       token: options.token,
       onSynced: () => {
-        const remoteText = yText.toString();
-        if (remoteText) {
-          settle(() => {
-            options.log(`Skipped remote markdown seed for ${options.contextLabel} because the CRDT doc already has content.`);
-            resolve();
-          });
-          return;
-        }
-        yDocument.transact(() => {
-          yText.insert(0, options.localText);
-        }, "rolay-import-seed");
         window.setTimeout(() => {
           settle(() => {
-            options.log(`Seeded remote markdown content for ${options.contextLabel}.`);
+            options.log(`Merged local markdown state into remote CRDT doc for ${options.contextLabel}.`);
             resolve();
           });
         }, 500);
@@ -11674,6 +11684,17 @@ async function seedRemoteMarkdownContent(options) {
       }
     });
   });
+}
+function createMarkdownTextState(text2) {
+  const yDocument = new Doc();
+  try {
+    if (text2) {
+      yDocument.getText("content").insert(0, text2);
+    }
+    return encodeStateAsUpdate(yDocument);
+  } finally {
+    yDocument.destroy();
+  }
 }
 
 // src/settings/data.ts
@@ -11711,6 +11732,7 @@ function createDefaultPluginData() {
       entries: {}
     },
     pendingMarkdownCreates: {},
+    pendingMarkdownMerges: {},
     deviceId: createDeviceId(),
     logs: []
   };
@@ -11742,6 +11764,7 @@ function mergePluginData(rawData) {
     },
     crdtCache: normalizeCrdtCacheState(rawData?.crdtCache),
     pendingMarkdownCreates: normalizePendingMarkdownCreates(rawData?.pendingMarkdownCreates),
+    pendingMarkdownMerges: normalizePendingMarkdownMerges(rawData?.pendingMarkdownMerges),
     deviceId: rawData?.deviceId ?? defaults.deviceId,
     logs: Array.isArray(rawData?.logs) ? rawData.logs.slice(-100) : defaults.logs
   };
@@ -11855,6 +11878,35 @@ function normalizePendingMarkdownCreates(rawPendingCreates) {
       workspaceId,
       localPath,
       serverPath,
+      createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : (/* @__PURE__ */ new Date()).toISOString(),
+      lastAttemptAt: typeof candidate.lastAttemptAt === "string" ? candidate.lastAttemptAt : null,
+      lastError: typeof candidate.lastError === "string" ? candidate.lastError : null
+    };
+  }
+  return entries;
+}
+function normalizePendingMarkdownMerges(rawPendingMerges) {
+  if (!rawPendingMerges || typeof rawPendingMerges !== "object") {
+    return {};
+  }
+  const entries = {};
+  for (const [rawEntryId, rawPendingMerge] of Object.entries(rawPendingMerges)) {
+    if (!rawPendingMerge || typeof rawPendingMerge !== "object") {
+      continue;
+    }
+    const candidate = rawPendingMerge;
+    const entryId = typeof candidate.entryId === "string" ? candidate.entryId.trim() : rawEntryId.trim();
+    const localPath = normalizeStoredPath(candidate.localPath ?? "");
+    const filePath = normalizeStoredPath(candidate.filePath ?? "");
+    const workspaceId = typeof candidate.workspaceId === "string" ? candidate.workspaceId.trim() : "";
+    if (!entryId || !localPath || !filePath || !workspaceId) {
+      continue;
+    }
+    entries[entryId] = {
+      workspaceId,
+      entryId,
+      localPath,
+      filePath,
       createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : (/* @__PURE__ */ new Date()).toISOString(),
       lastAttemptAt: typeof candidate.lastAttemptAt === "string" ? candidate.lastAttemptAt : null,
       lastError: typeof candidate.lastError === "string" ? candidate.lastError : null
@@ -13606,6 +13658,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       );
       await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
       await this.reconcilePendingMarkdownCreates(room.workspace.id, reason);
+      await this.reconcilePendingMarkdownMerges(room.workspace.id, reason);
       await this.persistNow();
       this.updateStatusBar();
       await this.bindActiveMarkdownToCrdt();
@@ -13771,7 +13824,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   async handleVaultRename(file, oldPath) {
     try {
       this.handlePendingMarkdownCreateRename(oldPath, file.path);
+      this.handlePendingMarkdownMergeRename(oldPath, file.path);
       await this.fileBridge.handleVaultRename(file, oldPath);
+      await this.bindActiveMarkdownToCrdt();
     } catch (error) {
       this.handleError(`Local rename sync failed for ${oldPath}`, error, false);
     }
@@ -13779,10 +13834,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   async handleVaultDelete(file) {
     try {
       this.clearPendingMarkdownCreate(file.path);
+      this.clearPendingMarkdownMergesForLocalPath(file.path);
       if (await this.handlePotentialRoomRootRemoval(file.path, "delete")) {
         return;
       }
       await this.fileBridge.handleVaultDelete(file);
+      await this.bindActiveMarkdownToCrdt();
     } catch (error) {
       this.handleError(`Local delete sync failed for ${file.path}`, error, false);
     }
@@ -14096,6 +14153,7 @@ ${keptTail}`;
     this.roomRuntime.delete(workspaceId);
     this.roomInvites.delete(workspaceId);
     this.clearPendingMarkdownCreatesForWorkspace(workspaceId);
+    this.clearPendingMarkdownMergesForWorkspace(workspaceId);
     const binding = this.getStoredRoomBinding(workspaceId);
     if (binding?.downloaded) {
       await this.saveRoomBinding(workspaceId, {
@@ -14192,6 +14250,9 @@ ${keptTail}`;
   getPendingMarkdownCreatesForWorkspace(workspaceId) {
     return Object.values(this.data.pendingMarkdownCreates).filter((entry) => entry.workspaceId === workspaceId).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
+  getPendingMarkdownMergesForWorkspace(workspaceId) {
+    return Object.values(this.data.pendingMarkdownMerges).filter((entry) => entry.workspaceId === workspaceId).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  }
   handlePendingMarkdownCreateRename(oldPath, newPath) {
     const normalizedOldPath = (0, import_obsidian9.normalizePath)(oldPath);
     const normalizedNewPath = (0, import_obsidian9.normalizePath)(newPath);
@@ -14220,6 +14281,39 @@ ${keptTail}`;
     };
     this.schedulePersist();
   }
+  handlePendingMarkdownMergeRename(oldPath, newPath) {
+    const normalizedOldPath = (0, import_obsidian9.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian9.normalizePath)(newPath);
+    let changed = false;
+    for (const [entryId, pendingMerge] of Object.entries(this.data.pendingMarkdownMerges)) {
+      if (pendingMerge.localPath !== normalizedOldPath) {
+        continue;
+      }
+      const nextFilePath = this.resolvePendingMarkdownServerPath(
+        pendingMerge.workspaceId,
+        normalizedNewPath,
+        pendingMerge.filePath
+      );
+      if (!nextFilePath) {
+        delete this.data.pendingMarkdownMerges[entryId];
+        changed = true;
+        this.recordLog(
+          "crdt",
+          `[${pendingMerge.workspaceId}] Cleared pending markdown merge for ${normalizedOldPath} because it moved outside the downloaded room.`
+        );
+        continue;
+      }
+      this.data.pendingMarkdownMerges[entryId] = {
+        ...pendingMerge,
+        localPath: normalizedNewPath,
+        filePath: nextFilePath
+      };
+      changed = true;
+    }
+    if (changed) {
+      this.schedulePersist();
+    }
+  }
   clearPendingMarkdownCreate(localPath) {
     const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
     if (!(normalizedLocalPath in this.data.pendingMarkdownCreates)) {
@@ -14228,6 +14322,20 @@ ${keptTail}`;
     delete this.data.pendingMarkdownCreates[normalizedLocalPath];
     this.schedulePersist();
   }
+  clearPendingMarkdownMergesForLocalPath(localPath) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    let changed = false;
+    for (const [entryId, pendingMerge] of Object.entries(this.data.pendingMarkdownMerges)) {
+      if (pendingMerge.localPath !== normalizedLocalPath) {
+        continue;
+      }
+      delete this.data.pendingMarkdownMerges[entryId];
+      changed = true;
+    }
+    if (changed) {
+      this.schedulePersist();
+    }
+  }
   clearPendingMarkdownCreatesForWorkspace(workspaceId) {
     let changed = false;
     for (const [localPath, pendingCreate] of Object.entries(this.data.pendingMarkdownCreates)) {
@@ -14235,6 +14343,19 @@ ${keptTail}`;
         continue;
       }
       delete this.data.pendingMarkdownCreates[localPath];
+      changed = true;
+    }
+    if (changed) {
+      this.schedulePersist();
+    }
+  }
+  clearPendingMarkdownMergesForWorkspace(workspaceId) {
+    let changed = false;
+    for (const [entryId, pendingMerge] of Object.entries(this.data.pendingMarkdownMerges)) {
+      if (pendingMerge.workspaceId !== workspaceId) {
+        continue;
+      }
+      delete this.data.pendingMarkdownMerges[entryId];
       changed = true;
     }
     if (changed) {
@@ -14259,6 +14380,27 @@ ${keptTail}`;
       `[${workspaceId}] Keeping local markdown create for ${serverPath} pending until the next successful room refresh/connect: ${errorMessage}`,
       "error"
     );
+  }
+  rememberPendingMarkdownMerge(workspaceId, entryId, localPath, filePath, error = null) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    const existing = this.data.pendingMarkdownMerges[entryId];
+    this.data.pendingMarkdownMerges[entryId] = {
+      workspaceId,
+      entryId,
+      localPath: normalizedLocalPath,
+      filePath,
+      createdAt: existing?.createdAt ?? (/* @__PURE__ */ new Date()).toISOString(),
+      lastAttemptAt: (/* @__PURE__ */ new Date()).toISOString(),
+      lastError: error ? error instanceof Error ? error.message : String(error) : null
+    };
+    this.schedulePersist();
+  }
+  clearPendingMarkdownMerge(entryId) {
+    if (!(entryId in this.data.pendingMarkdownMerges)) {
+      return;
+    }
+    delete this.data.pendingMarkdownMerges[entryId];
+    this.schedulePersist();
   }
   resolvePendingMarkdownServerPath(workspaceId, localPath, fallbackServerPath) {
     const folderName = this.getDownloadedFolderName(workspaceId);
@@ -14550,23 +14692,25 @@ ${keptTail}`;
       if (!currentLocalContent) {
         return;
       }
+      const localMarkdownState = createMarkdownTextState(currentLocalContent);
+      this.persistCrdtState(createdEntry.id, localPath, localMarkdownState);
+      this.rememberPendingMarkdownMerge(workspaceId, createdEntry.id, localPath, path);
+      const activeFile = this.app.workspace.getActiveFile();
       try {
-        const activeFile = this.app.workspace.getActiveFile();
         if (activeFile?.path === localPath && this.isLiveSyncEnabledForLocalPath(localPath)) {
           await this.bindActiveMarkdownToCrdt();
           const activeCrdtState = this.crdtManager.getState();
           if (activeCrdtState?.entryId === createdEntry.id) {
-            this.recordLog(
-              "crdt",
-              `[${workspaceId}] Skipped one-shot markdown seed for ${path} because the live CRDT session is already attached.`
-            );
+            this.scheduleSnapshotRefresh(workspaceId, "markdown-live-import");
             return;
           }
         }
-        await this.crdtManager.seedRemoteMarkdown(createdEntry, currentLocalContent, path);
+        await this.crdtManager.mergeRemoteMarkdownState(createdEntry, localMarkdownState, path);
+        this.clearPendingMarkdownMerge(createdEntry.id);
         this.scheduleSnapshotRefresh(workspaceId, "markdown-seed");
       } catch (error) {
-        this.handleError(`Remote markdown seed failed for ${path}`, error, false);
+        this.rememberPendingMarkdownMerge(workspaceId, createdEntry.id, localPath, path, error);
+        this.handleError(`Remote markdown merge failed for ${path}`, error, false);
       }
     } catch (error) {
       if (error instanceof RolayOperationError && error.result.status === "conflict" && error.result.reason === "path_already_exists") {
@@ -14685,6 +14829,67 @@ ${keptTail}`;
       }
     }
   }
+  async reconcilePendingMarkdownMerges(workspaceId, reason) {
+    const pendingMerges = this.getPendingMarkdownMergesForWorkspace(workspaceId);
+    if (pendingMerges.length === 0) {
+      return;
+    }
+    this.recordLog(
+      "crdt",
+      `[${workspaceId}] Replaying ${pendingMerges.length} pending markdown CRDT merge(s) after ${reason}.`
+    );
+    for (const pendingMerge of pendingMerges) {
+      const currentFile = this.app.vault.getAbstractFileByPath(pendingMerge.localPath);
+      if (!(currentFile instanceof import_obsidian9.TFile) || currentFile.extension !== "md") {
+        this.clearPendingMarkdownMerge(pendingMerge.entryId);
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Cleared pending markdown merge for ${pendingMerge.localPath} because the local file no longer exists.`
+        );
+        continue;
+      }
+      const currentServerPath = this.resolvePendingMarkdownServerPath(
+        workspaceId,
+        pendingMerge.localPath,
+        pendingMerge.filePath
+      );
+      if (currentServerPath === null) {
+        this.clearPendingMarkdownMerge(pendingMerge.entryId);
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Cleared pending markdown merge for ${pendingMerge.localPath} because it is no longer inside the room root.`
+        );
+        continue;
+      }
+      const entry = this.getRoomStore(workspaceId)?.getEntryById(pendingMerge.entryId) ?? null;
+      if (!entry || entry.deleted || entry.kind !== "markdown") {
+        this.clearPendingMarkdownMerge(pendingMerge.entryId);
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Cleared pending markdown merge for ${pendingMerge.localPath} because the remote markdown entry is no longer available.`,
+          "error"
+        );
+        continue;
+      }
+      const persistedState = this.getPersistedCrdtState(entry.id);
+      if (!persistedState) {
+        this.clearPendingMarkdownMerge(entry.id);
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Cleared pending markdown merge for ${pendingMerge.localPath} because the local CRDT cache is missing.`,
+          "error"
+        );
+        continue;
+      }
+      this.rememberPendingMarkdownMerge(workspaceId, entry.id, pendingMerge.localPath, currentServerPath);
+      try {
+        await this.crdtManager.mergeRemoteMarkdownState(entry, persistedState, currentServerPath);
+        this.clearPendingMarkdownMerge(entry.id);
+      } catch (error) {
+        this.rememberPendingMarkdownMerge(workspaceId, entry.id, pendingMerge.localPath, currentServerPath, error);
+      }
+    }
+  }
   async queueRenameOrMove(workspaceId, entry, newPath, type) {
     const response = await this.operationsQueue.enqueue(
       workspaceId,
@@ -14730,10 +14935,11 @@ ${keptTail}`;
     const directoryPath = getParentPath2(normalizedDesiredPath);
     const fileName = getFileName(normalizedDesiredPath);
     const extension = getFileExtension(fileName);
-    const stem = extension ? fileName.slice(0, -(extension.length + 1)) : fileName;
+    const rawStem = extension ? fileName.slice(0, -(extension.length + 1)) : fileName;
+    const { baseStem, nextIndex } = parseCopySuffix(rawStem);
     const candidates = [normalizedDesiredPath];
-    for (let index = 1; index <= 999; index += 1) {
-      const candidateFileName = extension ? `${stem}(${index}).${extension}` : `${stem}(${index})`;
+    for (let index = nextIndex; index <= nextIndex + 999; index += 1) {
+      const candidateFileName = extension ? `${baseStem}(${index}).${extension}` : `${baseStem}(${index})`;
       candidates.push(directoryPath ? `${directoryPath}/${candidateFileName}` : candidateFileName);
     }
     for (const candidatePath of candidates) {
@@ -14750,6 +14956,10 @@ ${keptTail}`;
     throw new Error(`No free conflict-safe path is available for ${desiredServerPath}.`);
   }
   async readLocalMarkdownContent(localPath, fallback = "") {
+    const activeView = this.app.workspace.getActiveViewOfType(import_obsidian9.MarkdownView);
+    if (activeView?.file?.path === localPath) {
+      return activeView.editor.getValue();
+    }
     const localFile = this.app.vault.getAbstractFileByPath(localPath);
     if (!(localFile instanceof import_obsidian9.TFile) || localFile.extension !== "md") {
       return fallback;
@@ -14815,4 +15025,17 @@ function getFileExtension(fileName) {
     return "";
   }
   return fileName.slice(dotIndex + 1);
+}
+function parseCopySuffix(stem) {
+  const match2 = stem.match(/^(.*)\((\d+)\)$/);
+  if (!match2) {
+    return {
+      baseStem: stem,
+      nextIndex: 1
+    };
+  }
+  return {
+    baseStem: match2[1],
+    nextIndex: Number(match2[2]) + 1
+  };
 }

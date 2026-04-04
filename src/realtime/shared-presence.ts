@@ -71,13 +71,17 @@ export function getCodeMirrorEditorView(editor: Editor | undefined): EditorView 
 }
 
 export function getMarkdownEditorViewsForFile(app: App, filePath: string): EditorView[] {
+  return getMarkdownViewsForFile(app, filePath)
+    .map((view) => getCodeMirrorEditorView(view.editor))
+    .filter((view): view is EditorView => view !== null);
+}
+
+export function getMarkdownViewsForFile(app: App, filePath: string): MarkdownView[] {
   return app.workspace
     .getLeavesOfType("markdown")
     .map((leaf) => leaf.view)
     .filter((view): view is MarkdownView => view instanceof MarkdownView)
-    .filter((view) => view.file?.path === filePath)
-    .map((view) => getCodeMirrorEditorView(view.editor))
-    .filter((view): view is EditorView => view !== null);
+    .filter((view) => view.file?.path === filePath);
 }
 
 export function setRemotePresenceDecorations(view: EditorView, presences: SharedCursorPresence[]): void {

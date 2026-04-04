@@ -85,6 +85,7 @@ npm run dev
 - After each authoritative room snapshot, the plugin bootstraps missing markdown Yjs state in one HTTP call and stores it in local CRDT cache for safer offline reopen and later merge.
 - Runtime sync logs are mirrored into `.obsidian/plugins/rolay/rolay-sync.log` so support/debugging does not depend only on the in-settings log widget.
 - If a locally created offline markdown note collides with a server path on reconnect, the plugin keeps both by renaming the local file to the next free name such as `file(1).md` before retrying the create.
+- When a markdown file with existing local text is created or moved into a room, the plugin now turns that text into a reusable Yjs update, persists it locally, and retries CRDT merge until the remote document has absorbed it. This avoids the old "empty file first, content only after reopen" race.
 - Admin account creation currently supports `writer` and `reader` global roles.
 - Binary blob download/upload is still future work; markdown CRDT and server-authoritative tree sync are the current focus.
 - Session credentials are still stored in Obsidian plugin data for MVP speed. Hardening storage is future work.

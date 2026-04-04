@@ -39,3 +39,4 @@ Current plugin behavior:
 - Recent sync activity is still shown in plugin settings, but it is also mirrored into `.obsidian/plugins/rolay/rolay-sync.log`.
 - Failed local markdown creates are tracked as pending work and retried on the next authoritative room refresh/connect.
 - If a pending local markdown create collides with an already existing server path, the client renames the local note to the next free filename (for example `file.md` -> `file(1).md`) before retrying, so neither copy is lost.
+- Markdown imports with existing local text are treated as reusable Yjs updates instead of one-shot "seed only if empty" attempts. The plugin keeps retrying that CRDT merge until it succeeds or the local file disappears.

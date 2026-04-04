@@ -86,6 +86,11 @@ export class FileBridge {
 
     const previousById = new Map(previousEntries.map((entry) => [entry.id, entry]));
     const nextById = new Map(snapshot.entries.map((entry) => [entry.id, entry]));
+    const activePathSet = new Set(
+      snapshot.entries
+        .filter((entry) => !entry.deleted)
+        .map((entry) => normalizePath(entry.path))
+    );
 
     const renamedEntries = snapshot.entries
       .filter((entry) => !entry.deleted)
@@ -115,6 +120,10 @@ export class FileBridge {
 
     const deletedEntries = previousEntries.filter((previous) => {
       if (previous.deleted) {
+        return false;
+      }
+
+      if (activePathSet.has(normalizePath(previous.path))) {
         return false;
       }
 
