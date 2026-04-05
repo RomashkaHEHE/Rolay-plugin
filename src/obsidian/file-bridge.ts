@@ -30,6 +30,8 @@ interface FileBridgeConfig {
   getFolderName: (workspaceId: string) => string | null;
   getDownloadedRooms: () => DownloadedRoomContext[];
   getEntryByPath: (workspaceId: string, path: string) => FileEntry | null;
+  hasPendingCreate: (workspaceId: string, path: string) => boolean;
+  hasPendingDelete: (workspaceId: string, path: string) => boolean;
   log: (message: string) => void;
   onCreateFolder: (workspaceId: string, path: string) => Promise<void>;
   onCreateMarkdown: (workspaceId: string, path: string, localContent: string) => Promise<void>;
@@ -40,14 +42,18 @@ interface FileBridgeConfig {
     type: RemotePathChangeType
   ) => Promise<void>;
   onDeleteEntry: (workspaceId: string, entry: FileEntry) => Promise<void>;
+  onRemotePathObserved?: (workspaceId: string, localPath: string, serverPath: string) => void;
 }
 
 export class FileBridge {
+  private static readonly REMOTE_CREATE_GUARD_MS = 10_000;
   private readonly app: App;
   private readonly getSyncRoot: () => string;
   private readonly getFolderName: (workspaceId: string) => string | null;
   private readonly getDownloadedRooms: () => DownloadedRoomContext[];
   private readonly getEntryByPath: (workspaceId: string, path: string) => FileEntry | null;
+  private readonly hasPendingCreate: (workspaceId: string, path: string) => boolean;
+  private readonly hasPendingDelete: (workspaceId: string, path: string) => boolean;
   private readonly log: (message: string) => void;
   private readonly onCreateFolder: (workspaceId: string, path: string) => Promise<void>;
   private readonly onCreateMarkdown: (workspaceId: string, path: string, localContent: string) => Promise<void>;
@@ -58,7 +64,11 @@ export class FileBridge {
     type: RemotePathChangeType
   ) => Promise<void>;
   private readonly onDeleteEntry: (workspaceId: string, entry: FileEntry) => Promise<void>;
+  private readonly onRemotePathObserved?: (workspaceId: string, localPath: string, serverPath: string) => void;
   private readonly suppressedPrefixes = new Map<string, number>();
+  private readonly recentRemoteCreates = new Map<string, number>();
+  private readonly recentRemoteRenames = new Map<string, number>();
+  private readonly recentRemoteDeletes = new Map<string, number>();
 
   constructor(config: FileBridgeConfig) {
     this.app = config.app;
@@ -66,11 +76,14 @@ export class FileBridge {
     this.getFolderName = config.getFolderName;
     this.getDownloadedRooms = config.getDownloadedRooms;
     this.getEntryByPath = config.getEntryByPath;
+    this.hasPendingCreate = config.hasPendingCreate;
+    this.hasPendingDelete = config.hasPendingDelete;
     this.log = config.log;
     this.onCreateFolder = config.onCreateFolder;
     this.onCreateMarkdown = config.onCreateMarkdown;
     this.onRenameOrMove = config.onRenameOrMove;
     this.onDeleteEntry = config.onDeleteEntry;
+    this.onRemotePathObserved = config.onRemotePathObserved;
   }
 
   async applySnapshot(snapshot: TreeSnapshotResponse, previousEntries: FileEntry[]): Promise<void> {
@@ -114,7 +127,7 @@ export class FileBridge {
 
     for (const entry of activeEntries) {
       await this.safeApply(`materialize ${entry.path}`, async () => {
-        await this.ensureLocalEntry(folderName, entry);
+        await this.ensureLocalEntry(snapshot.workspace.id, folderName, entry);
       });
     }
 
@@ -124,6 +137,10 @@ export class FileBridge {
       }
 
       if (activePathSet.has(normalizePath(previous.path))) {
+        return false;
+      }
+
+      if (this.hasPendingCreate(snapshot.workspace.id, previous.path)) {
         return false;
       }
 
@@ -144,7 +161,16 @@ export class FileBridge {
       return;
     }
 
-    if (this.getEntryByPath(resolved.workspaceId, resolved.serverPath)) {
+    if (this.consumeRecentRemoteCreate(file.path)) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+
+    if (
+      this.getEntryByPath(resolved.workspaceId, resolved.serverPath) &&
+      !this.hasPendingDelete(resolved.workspaceId, resolved.serverPath)
+    ) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
       return;
     }
 
@@ -167,6 +193,10 @@ export class FileBridge {
 
   async handleVaultRename(file: TAbstractFile, oldPath: string): Promise<void> {
     if (this.isSuppressedPath(oldPath) || this.isSuppressedPath(file.path)) {
+      return;
+    }
+
+    if (this.consumeRecentRemoteRename(oldPath, file.path)) {
       return;
     }
 
@@ -217,6 +247,10 @@ export class FileBridge {
   async handleVaultDelete(file: TAbstractFile): Promise<void> {
     const resolved = this.resolveRoomPath(file.path);
     if (!resolved || this.isSuppressedPath(file.path)) {
+      return;
+    }
+
+    if (this.consumeRecentRemoteDelete(file.path)) {
       return;
     }
 
@@ -286,12 +320,13 @@ export class FileBridge {
     }
 
     await this.ensureFolderExists(getParentPath(newLocalPath));
+    this.markRecentRemoteRename(oldLocalPath, newLocalPath);
     await this.withSuppressedPaths([oldLocalPath, newLocalPath], async () => {
       await this.app.fileManager.renameFile(existing, newLocalPath);
     });
   }
 
-  private async ensureLocalEntry(folderName: string, entry: FileEntry): Promise<void> {
+  private async ensureLocalEntry(workspaceId: string, folderName: string, entry: FileEntry): Promise<void> {
     const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, entry.path);
     const existing = this.app.vault.getAbstractFileByPath(localPath);
 
@@ -307,6 +342,8 @@ export class FileBridge {
     }
 
     if (entry.kind === "markdown") {
+      this.markRecentRemoteCreate(localPath);
+      this.onRemotePathObserved?.(workspaceId, localPath, entry.path);
       await this.withSuppressedPaths([localPath], async () => {
         await this.app.vault.create(localPath, "");
       });
@@ -323,6 +360,7 @@ export class FileBridge {
       return;
     }
 
+    this.markRecentRemoteDelete(localPath);
     await this.withSuppressedPaths([localPath], async () => {
       await this.app.vault.trash(existing, false);
     });
@@ -349,6 +387,7 @@ export class FileBridge {
         throw new Error(`Expected folder at ${currentPath}, but a file already exists there.`);
       }
 
+      this.markRecentRemoteCreate(currentPath);
       await this.withSuppressedPaths([currentPath], async () => {
         await this.app.vault.createFolder(currentPath);
       });
@@ -425,6 +464,88 @@ export class FileBridge {
     } catch (error) {
       this.log(`${label} failed: ${error instanceof Error ? error.message : String(error)}`);
     }
+  }
+
+  private markRecentRemoteCreate(path: string): void {
+    const normalizedPath = normalizePath(path);
+    const previousHandle = this.recentRemoteCreates.get(normalizedPath);
+    if (previousHandle !== undefined) {
+      window.clearTimeout(previousHandle);
+    }
+
+    const handle = window.setTimeout(() => {
+      this.recentRemoteCreates.delete(normalizedPath);
+    }, FileBridge.REMOTE_CREATE_GUARD_MS);
+    this.recentRemoteCreates.set(normalizedPath, handle);
+  }
+
+  private consumeRecentRemoteCreate(path: string): boolean {
+    const normalizedPath = normalizePath(path);
+    const handle = this.recentRemoteCreates.get(normalizedPath);
+    if (handle === undefined) {
+      return false;
+    }
+
+    window.clearTimeout(handle);
+    this.recentRemoteCreates.delete(normalizedPath);
+    this.log(`Ignored create echo for remotely materialized path ${normalizedPath}.`);
+    return true;
+  }
+
+  private markRecentRemoteRename(oldPath: string, newPath: string): void {
+    const key = this.buildRemoteRenameKey(oldPath, newPath);
+    const previousHandle = this.recentRemoteRenames.get(key);
+    if (previousHandle !== undefined) {
+      window.clearTimeout(previousHandle);
+    }
+
+    const handle = window.setTimeout(() => {
+      this.recentRemoteRenames.delete(key);
+    }, FileBridge.REMOTE_CREATE_GUARD_MS);
+    this.recentRemoteRenames.set(key, handle);
+  }
+
+  private consumeRecentRemoteRename(oldPath: string, newPath: string): boolean {
+    const key = this.buildRemoteRenameKey(oldPath, newPath);
+    const handle = this.recentRemoteRenames.get(key);
+    if (handle === undefined) {
+      return false;
+    }
+
+    window.clearTimeout(handle);
+    this.recentRemoteRenames.delete(key);
+    this.log(`Ignored rename echo for remotely materialized path ${normalizePath(oldPath)} -> ${normalizePath(newPath)}.`);
+    return true;
+  }
+
+  private markRecentRemoteDelete(path: string): void {
+    const normalizedPath = normalizePath(path);
+    const previousHandle = this.recentRemoteDeletes.get(normalizedPath);
+    if (previousHandle !== undefined) {
+      window.clearTimeout(previousHandle);
+    }
+
+    const handle = window.setTimeout(() => {
+      this.recentRemoteDeletes.delete(normalizedPath);
+    }, FileBridge.REMOTE_CREATE_GUARD_MS);
+    this.recentRemoteDeletes.set(normalizedPath, handle);
+  }
+
+  private consumeRecentRemoteDelete(path: string): boolean {
+    const normalizedPath = normalizePath(path);
+    const handle = this.recentRemoteDeletes.get(normalizedPath);
+    if (handle === undefined) {
+      return false;
+    }
+
+    window.clearTimeout(handle);
+    this.recentRemoteDeletes.delete(normalizedPath);
+    this.log(`Ignored delete echo for remotely materialized path ${normalizedPath}.`);
+    return true;
+  }
+
+  private buildRemoteRenameKey(oldPath: string, newPath: string): string {
+    return `${normalizePath(oldPath)}=>${normalizePath(newPath)}`;
   }
 }
 

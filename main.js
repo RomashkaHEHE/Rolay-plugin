@@ -8494,6 +8494,20 @@ var RolayApiClient = class {
       body
     );
   }
+  async changeCurrentUserPassword(body) {
+    const response = await this.requestJson(
+      "PATCH",
+      "/v1/auth/me/password",
+      body
+    );
+    await this.config.saveSession({
+      accessToken: response.accessToken,
+      refreshToken: response.refreshToken,
+      user: response.user,
+      authenticatedAt: (/* @__PURE__ */ new Date()).toISOString()
+    });
+    return response;
+  }
   async listRooms() {
     return this.requestJson(
       "GET",
@@ -8789,19 +8803,25 @@ function isManagedPathForRoom(localPath, syncRoot, folderName) {
 }
 
 // src/obsidian/file-bridge.ts
-var FileBridge = class {
+var _FileBridge = class _FileBridge {
   constructor(config) {
     this.suppressedPrefixes = /* @__PURE__ */ new Map();
+    this.recentRemoteCreates = /* @__PURE__ */ new Map();
+    this.recentRemoteRenames = /* @__PURE__ */ new Map();
+    this.recentRemoteDeletes = /* @__PURE__ */ new Map();
     this.app = config.app;
     this.getSyncRoot = config.getSyncRoot;
     this.getFolderName = config.getFolderName;
     this.getDownloadedRooms = config.getDownloadedRooms;
     this.getEntryByPath = config.getEntryByPath;
+    this.hasPendingCreate = config.hasPendingCreate;
+    this.hasPendingDelete = config.hasPendingDelete;
     this.log = config.log;
     this.onCreateFolder = config.onCreateFolder;
     this.onCreateMarkdown = config.onCreateMarkdown;
     this.onRenameOrMove = config.onRenameOrMove;
     this.onDeleteEntry = config.onDeleteEntry;
+    this.onRemotePathObserved = config.onRemotePathObserved;
   }
   async applySnapshot(snapshot, previousEntries) {
     const folderName = this.getFolderName(snapshot.workspace.id);
@@ -8832,7 +8852,7 @@ var FileBridge = class {
     const activeEntries = snapshot.entries.filter((entry) => !entry.deleted).sort(compareEntriesForMaterialization);
     for (const entry of activeEntries) {
       await this.safeApply(`materialize ${entry.path}`, async () => {
-        await this.ensureLocalEntry(folderName, entry);
+        await this.ensureLocalEntry(snapshot.workspace.id, folderName, entry);
       });
     }
     const deletedEntries = previousEntries.filter((previous) => {
@@ -8840,6 +8860,9 @@ var FileBridge = class {
         return false;
       }
       if (activePathSet.has((0, import_obsidian3.normalizePath)(previous.path))) {
+        return false;
+      }
+      if (this.hasPendingCreate(snapshot.workspace.id, previous.path)) {
         return false;
       }
       const next = nextById.get(previous.id);
@@ -8856,7 +8879,12 @@ var FileBridge = class {
     if (!resolved || this.isSuppressedPath(file.path)) {
       return;
     }
-    if (this.getEntryByPath(resolved.workspaceId, resolved.serverPath)) {
+    if (this.consumeRecentRemoteCreate(file.path)) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+    if (this.getEntryByPath(resolved.workspaceId, resolved.serverPath) && !this.hasPendingDelete(resolved.workspaceId, resolved.serverPath)) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
       return;
     }
     if (file instanceof import_obsidian3.TFolder) {
@@ -8875,6 +8903,9 @@ var FileBridge = class {
   }
   async handleVaultRename(file, oldPath) {
     if (this.isSuppressedPath(oldPath) || this.isSuppressedPath(file.path)) {
+      return;
+    }
+    if (this.consumeRecentRemoteRename(oldPath, file.path)) {
       return;
     }
     const oldResolved = this.resolveRoomPath(oldPath);
@@ -8911,6 +8942,9 @@ var FileBridge = class {
   async handleVaultDelete(file) {
     const resolved = this.resolveRoomPath(file.path);
     if (!resolved || this.isSuppressedPath(file.path)) {
+      return;
+    }
+    if (this.consumeRecentRemoteDelete(file.path)) {
       return;
     }
     const roomRoot = this.getRoomRoot(resolved.folderName);
@@ -8963,11 +8997,12 @@ var FileBridge = class {
       return;
     }
     await this.ensureFolderExists(getParentPath(newLocalPath));
+    this.markRecentRemoteRename(oldLocalPath, newLocalPath);
     await this.withSuppressedPaths([oldLocalPath, newLocalPath], async () => {
       await this.app.fileManager.renameFile(existing, newLocalPath);
     });
   }
-  async ensureLocalEntry(folderName, entry) {
+  async ensureLocalEntry(workspaceId, folderName, entry) {
     const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, entry.path);
     const existing = this.app.vault.getAbstractFileByPath(localPath);
     if (entry.kind === "folder") {
@@ -8979,6 +9014,8 @@ var FileBridge = class {
       return;
     }
     if (entry.kind === "markdown") {
+      this.markRecentRemoteCreate(localPath);
+      this.onRemotePathObserved?.(workspaceId, localPath, entry.path);
       await this.withSuppressedPaths([localPath], async () => {
         await this.app.vault.create(localPath, "");
       });
@@ -8992,6 +9029,7 @@ var FileBridge = class {
     if (!existing) {
       return;
     }
+    this.markRecentRemoteDelete(localPath);
     await this.withSuppressedPaths([localPath], async () => {
       await this.app.vault.trash(existing, false);
     });
@@ -9012,6 +9050,7 @@ var FileBridge = class {
       if (existing) {
         throw new Error(`Expected folder at ${currentPath}, but a file already exists there.`);
       }
+      this.markRecentRemoteCreate(currentPath);
       await this.withSuppressedPaths([currentPath], async () => {
         await this.app.vault.createFolder(currentPath);
       });
@@ -9076,7 +9115,78 @@ var FileBridge = class {
       this.log(`${label} failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
+  markRecentRemoteCreate(path) {
+    const normalizedPath = (0, import_obsidian3.normalizePath)(path);
+    const previousHandle = this.recentRemoteCreates.get(normalizedPath);
+    if (previousHandle !== void 0) {
+      window.clearTimeout(previousHandle);
+    }
+    const handle = window.setTimeout(() => {
+      this.recentRemoteCreates.delete(normalizedPath);
+    }, _FileBridge.REMOTE_CREATE_GUARD_MS);
+    this.recentRemoteCreates.set(normalizedPath, handle);
+  }
+  consumeRecentRemoteCreate(path) {
+    const normalizedPath = (0, import_obsidian3.normalizePath)(path);
+    const handle = this.recentRemoteCreates.get(normalizedPath);
+    if (handle === void 0) {
+      return false;
+    }
+    window.clearTimeout(handle);
+    this.recentRemoteCreates.delete(normalizedPath);
+    this.log(`Ignored create echo for remotely materialized path ${normalizedPath}.`);
+    return true;
+  }
+  markRecentRemoteRename(oldPath, newPath) {
+    const key = this.buildRemoteRenameKey(oldPath, newPath);
+    const previousHandle = this.recentRemoteRenames.get(key);
+    if (previousHandle !== void 0) {
+      window.clearTimeout(previousHandle);
+    }
+    const handle = window.setTimeout(() => {
+      this.recentRemoteRenames.delete(key);
+    }, _FileBridge.REMOTE_CREATE_GUARD_MS);
+    this.recentRemoteRenames.set(key, handle);
+  }
+  consumeRecentRemoteRename(oldPath, newPath) {
+    const key = this.buildRemoteRenameKey(oldPath, newPath);
+    const handle = this.recentRemoteRenames.get(key);
+    if (handle === void 0) {
+      return false;
+    }
+    window.clearTimeout(handle);
+    this.recentRemoteRenames.delete(key);
+    this.log(`Ignored rename echo for remotely materialized path ${(0, import_obsidian3.normalizePath)(oldPath)} -> ${(0, import_obsidian3.normalizePath)(newPath)}.`);
+    return true;
+  }
+  markRecentRemoteDelete(path) {
+    const normalizedPath = (0, import_obsidian3.normalizePath)(path);
+    const previousHandle = this.recentRemoteDeletes.get(normalizedPath);
+    if (previousHandle !== void 0) {
+      window.clearTimeout(previousHandle);
+    }
+    const handle = window.setTimeout(() => {
+      this.recentRemoteDeletes.delete(normalizedPath);
+    }, _FileBridge.REMOTE_CREATE_GUARD_MS);
+    this.recentRemoteDeletes.set(normalizedPath, handle);
+  }
+  consumeRecentRemoteDelete(path) {
+    const normalizedPath = (0, import_obsidian3.normalizePath)(path);
+    const handle = this.recentRemoteDeletes.get(normalizedPath);
+    if (handle === void 0) {
+      return false;
+    }
+    window.clearTimeout(handle);
+    this.recentRemoteDeletes.delete(normalizedPath);
+    this.log(`Ignored delete echo for remotely materialized path ${normalizedPath}.`);
+    return true;
+  }
+  buildRemoteRenameKey(oldPath, newPath) {
+    return `${(0, import_obsidian3.normalizePath)(oldPath)}=>${(0, import_obsidian3.normalizePath)(newPath)}`;
+  }
 };
+_FileBridge.REMOTE_CREATE_GUARD_MS = 1e4;
+var FileBridge = _FileBridge;
 function getParentPath(path) {
   const normalized = (0, import_obsidian3.normalizePath)(path);
   const separatorIndex = normalized.lastIndexOf("/");
@@ -11144,12 +11254,14 @@ var CrdtSessionManager = class {
     }
     const liveSyncEnabled = this.isLiveSyncEnabledForLocalPath(file.path);
     const persistedCrdtState = this.getPersistedCrdtState(entry.id);
+    const localBootstrapState = this.pendingOfflineUpdates.get(entry.id) ?? persistedCrdtState;
+    const hasPendingOfflineState = this.pendingOfflineUpdates.has(entry.id);
     if (this.activeSession?.matches(file, entry)) {
       if (liveSyncEnabled && this.activeSession.isOffline()) {
-        const pendingOfflineUpdate2 = this.detachActiveSession() ?? persistedCrdtState;
+        const nextLocalBootstrapState = this.detachActiveSession() ?? persistedCrdtState;
         await this.activeSession.destroy();
         this.activeSession = null;
-        await this.connect(file, entry, pendingOfflineUpdate2);
+        await this.connect(file, entry, nextLocalBootstrapState);
         return;
       }
       if (!liveSyncEnabled) {
@@ -11160,12 +11272,19 @@ var CrdtSessionManager = class {
     }
     await this.disconnect();
     if (liveSyncEnabled) {
-      await this.connect(file, entry, persistedCrdtState);
+      if (localBootstrapState) {
+        this.log(
+          `Preparing live CRDT bootstrap for ${file.path} from ${hasPendingOfflineState ? "offline state" : "persisted cache"}.`
+        );
+      }
+      await this.connect(file, entry, localBootstrapState);
       return;
     }
-    const pendingOfflineUpdate = this.pendingOfflineUpdates.get(entry.id) ?? persistedCrdtState;
-    if (pendingOfflineUpdate) {
-      await this.openOffline(file, entry, pendingOfflineUpdate);
+    if (localBootstrapState) {
+      this.log(
+        `Opening offline CRDT cache for ${file.path} from ${hasPendingOfflineState ? "offline state" : "persisted cache"}.`
+      );
+      await this.openOffline(file, entry, localBootstrapState);
       return;
     }
     this.log(`No persisted CRDT cache is available for offline markdown ${file.path}. Remote-safe merge will start after the next live sync.`);
@@ -11230,7 +11349,7 @@ var CrdtSessionManager = class {
       contextLabel
     });
   }
-  async connect(file, entry, pendingOfflineUpdate) {
+  async connect(file, entry, initialState) {
     const currentUser = this.getCurrentUser();
     if (!currentUser) {
       this.log(`Skipping CRDT session for ${file.path} because no authenticated user is available.`);
@@ -11248,13 +11367,13 @@ var CrdtSessionManager = class {
       createCrdtTokenSupplier(this.apiClient, entry.id, bootstrap.token),
       this.log,
       this.persistCrdtState,
-      pendingOfflineUpdate ?? this.pendingOfflineUpdates.get(entry.id) ?? null
+      initialState ?? null
     );
     this.activeSession = session;
     await session.open();
     this.pendingOfflineUpdates.delete(entry.id);
   }
-  async openOffline(file, entry, pendingOfflineUpdate) {
+  async openOffline(file, entry, initialState) {
     const currentUser = this.getCurrentUser();
     if (!currentUser) {
       return;
@@ -11269,7 +11388,7 @@ var CrdtSessionManager = class {
       null,
       this.log,
       this.persistCrdtState,
-      pendingOfflineUpdate
+      initialState
     );
     this.activeSession = session;
     await session.openOffline();
@@ -11288,7 +11407,7 @@ var CrdtSessionManager = class {
   }
 };
 var BoundCrdtSession = class {
-  constructor(app, file, entry, currentUser, docId, wsUrl, token, log, persistCrdtState, pendingOfflineUpdate = null) {
+  constructor(app, file, entry, currentUser, docId, wsUrl, token, log, persistCrdtState, initialState = null) {
     this.yDocument = new Doc();
     this.provider = null;
     this.status = "idle";
@@ -11308,7 +11427,10 @@ var BoundCrdtSession = class {
     this.persistCrdtState = persistCrdtState;
     this.awarenessUser = buildAwarenessUserPayload(currentUser);
     this.yText = this.yDocument.getText("content");
-    this.pendingOfflineUpdate = pendingOfflineUpdate;
+    if (initialState && initialState.byteLength > 0) {
+      applyUpdate(this.yDocument, initialState, "rolay-local-bootstrap");
+      this.log(`Loaded local CRDT bootstrap state for ${this.file.path}.`);
+    }
   }
   async open() {
     if (!this.wsUrl || !this.token) {
@@ -11326,17 +11448,24 @@ var BoundCrdtSession = class {
         this.log(`CRDT websocket opened for ${this.file.path}.`);
       },
       onStatus: ({ status }) => {
+        if (status === "connecting" || status === "connected") {
+          if (this.status !== "synced") {
+            this.status = "connecting";
+          }
+        }
         this.log(`CRDT provider status for ${this.file.path}: ${status}.`);
       },
       onSynced: () => {
         this.status = "synced";
-        this.applyPendingOfflineUpdateIfNeeded();
         this.syncEditorContext();
       },
       onAwarenessChange: () => {
         this.renderRemotePresence();
       },
       onDisconnect: () => {
+        if (this.status !== "offline") {
+          this.status = "connecting";
+        }
         this.log(`CRDT websocket disconnected for ${this.file.path}.`);
         this.clearRemotePresence();
       },
@@ -11355,7 +11484,6 @@ var BoundCrdtSession = class {
     this.bindRemoteObserver();
     this.bindPersistenceObserver();
     this.status = "offline";
-    this.applyPendingOfflineUpdateIfNeeded();
     this.syncEditorContext();
   }
   matches(file, entry) {
@@ -11509,14 +11637,6 @@ var BoundCrdtSession = class {
     }
     this.provider.setAwarenessField("selection", null);
     this.lastLocalSelectionKey = null;
-  }
-  applyPendingOfflineUpdateIfNeeded() {
-    if (!this.pendingOfflineUpdate) {
-      return;
-    }
-    applyUpdate(this.yDocument, this.pendingOfflineUpdate, "rolay-pending-offline");
-    this.log(`Applied pending offline markdown changes for ${this.file.path}.`);
-    this.pendingOfflineUpdate = null;
   }
   schedulePersistedState() {
     if (this.persistHandle !== null) {
@@ -12114,6 +12234,39 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       }).addButton((button) => {
         button.setButtonText("Save name").onClick(async () => {
           await this.plugin.updateOwnDisplayName();
+          this.display();
+        });
+      });
+    }
+    if (currentUser) {
+      const passwordDraft = this.plugin.getPasswordChangeDraft();
+      containerEl.createEl("h3", { text: "Security" });
+      new import_obsidian8.Setting(containerEl).setName("Current password").setDesc("Required by the server before rotating the current session.").addText((text2) => {
+        text2.inputEl.type = "password";
+        text2.setPlaceholder("current password").setValue(passwordDraft.currentPassword).onChange((value) => {
+          this.plugin.updatePasswordChangeDraft({
+            currentPassword: value
+          });
+        });
+      });
+      new import_obsidian8.Setting(containerEl).setName("New password").setDesc("After success the plugin stores the new password for future session recovery.").addText((text2) => {
+        text2.inputEl.type = "password";
+        text2.setPlaceholder("new password").setValue(passwordDraft.newPassword).onChange((value) => {
+          this.plugin.updatePasswordChangeDraft({
+            newPassword: value
+          });
+        });
+      });
+      new import_obsidian8.Setting(containerEl).setName("Confirm new password").setDesc("The current Rolay session is rotated immediately after the password changes.").addText((text2) => {
+        text2.inputEl.type = "password";
+        text2.setPlaceholder("repeat new password").setValue(passwordDraft.confirmPassword).onChange((value) => {
+          this.plugin.updatePasswordChangeDraft({
+            confirmPassword: value
+          });
+        });
+      }).addButton((button) => {
+        button.setButtonText("Change password").onClick(async () => {
+          await this.plugin.changeOwnPassword();
           this.display();
         });
       });
@@ -12936,6 +13089,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     super(...arguments);
     this.roomRuntime = /* @__PURE__ */ new Map();
     this.roomInvites = /* @__PURE__ */ new Map();
+    this.pendingLocalCreates = /* @__PURE__ */ new Map();
+    this.pendingLocalDeletes = /* @__PURE__ */ new Set();
+    this.recentRemoteObservedPaths = /* @__PURE__ */ new Map();
     this.persistHandle = null;
     this.roomList = [];
     this.adminRoomList = [];
@@ -12946,6 +13102,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.logFileWrite = Promise.resolve();
     this.pendingLogLines = [];
     this.profileDraftDisplayName = "";
+    this.passwordChangeDraft = {
+      currentPassword: "",
+      newPassword: "",
+      confirmPassword: ""
+    };
     this.createRoomDraft = {
       name: ""
     };
@@ -13004,11 +13165,16 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       getFolderName: (workspaceId) => this.getDownloadedFolderName(workspaceId),
       getDownloadedRooms: () => this.getDownloadedRooms(),
       getEntryByPath: (workspaceId, path) => this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null,
+      hasPendingCreate: (workspaceId, path) => this.hasPendingLocalCreate(workspaceId, path),
+      hasPendingDelete: (workspaceId, path) => this.hasPendingLocalDelete(workspaceId, path),
       log: (message) => this.recordLog("bridge", message),
       onCreateFolder: (workspaceId, path) => this.queueCreateFolder(workspaceId, path),
       onCreateMarkdown: (workspaceId, path, localContent) => this.queueCreateMarkdown(workspaceId, path, localContent),
       onRenameOrMove: (workspaceId, entry, newPath, type) => this.queueRenameOrMove(workspaceId, entry, newPath, type),
-      onDeleteEntry: (workspaceId, entry) => this.queueDeleteEntry(workspaceId, entry)
+      onDeleteEntry: (workspaceId, entry) => this.queueDeleteEntry(workspaceId, entry),
+      onRemotePathObserved: (workspaceId, localPath, serverPath) => {
+        this.noteRemoteObservedPath(workspaceId, localPath, serverPath);
+      }
     });
     this.statusBarEl = this.addStatusBarItem();
     this.updateStatusBar();
@@ -13120,6 +13286,15 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   setProfileDraftDisplayName(displayName) {
     this.profileDraftDisplayName = displayName;
+  }
+  getPasswordChangeDraft() {
+    return { ...this.passwordChangeDraft };
+  }
+  updatePasswordChangeDraft(update) {
+    this.passwordChangeDraft = {
+      ...this.passwordChangeDraft,
+      ...update
+    };
   }
   getCreateRoomDraft() {
     return { ...this.createRoomDraft };
@@ -13259,6 +13434,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.adminRoomMembers = [];
     this.data.session = null;
     this.resetProfileDraft();
+    this.clearPasswordChangeDraft();
     this.clearRoomDrafts();
     this.clearManagedUserDraft();
     this.clearAdminRoomMemberDraft();
@@ -13288,6 +13464,51 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       new import_obsidian9.Notice(`Rolay display name updated to ${response.user.displayName}.`);
     } catch (error) {
       this.handleError("Display name update failed", error);
+      throw error;
+    }
+  }
+  async changeOwnPassword() {
+    if (!this.getCurrentUser()) {
+      throw this.notifyError("Log into Rolay before changing your password.");
+    }
+    const currentPassword = this.passwordChangeDraft.currentPassword;
+    const newPassword = this.passwordChangeDraft.newPassword;
+    const confirmPassword = this.passwordChangeDraft.confirmPassword;
+    if (!currentPassword) {
+      throw this.notifyError("Current password is required.");
+    }
+    if (!newPassword) {
+      throw this.notifyError("New password is required.");
+    }
+    if (!confirmPassword) {
+      throw this.notifyError("Confirm the new password.");
+    }
+    if (newPassword !== confirmPassword) {
+      throw this.notifyError("New password confirmation does not match.");
+    }
+    if (newPassword === currentPassword) {
+      throw this.notifyError("New password must be different from the current password.");
+    }
+    try {
+      const response = await this.apiClient.changeCurrentUserPassword({
+        currentPassword,
+        newPassword
+      });
+      this.resetProfileDraft();
+      this.clearPasswordChangeDraft();
+      await this.updateSettings({
+        password: newPassword
+      });
+      this.recordLog("auth", `Changed password for ${response.user.username}. Session tokens were rotated.`);
+      new import_obsidian9.Notice("Rolay password updated. The current session was rotated.");
+    } catch (error) {
+      const friendlyMessage = this.getPasswordChangeErrorMessage(error);
+      if (friendlyMessage) {
+        this.recordLog("error", `Password change failed: ${friendlyMessage}`, "error");
+        new import_obsidian9.Notice(friendlyMessage);
+        throw new Error(friendlyMessage);
+      }
+      this.handleError("Password change failed", error);
       throw error;
     }
   }
@@ -13647,6 +13868,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       const previousEntries = runtime.treeStore.getEntries();
       const snapshot = await this.apiClient.getWorkspaceTree(room.workspace.id);
       runtime.treeStore.applySnapshot(snapshot);
+      this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
       await this.fileBridge.applySnapshot(snapshot, previousEntries);
       this.setRoomSyncState(room.workspace.id, {
         lastCursor: snapshot.cursor,
@@ -14091,11 +14313,88 @@ ${keptTail}`;
   getRoomStore(workspaceId) {
     return this.roomRuntime.get(workspaceId)?.treeStore ?? null;
   }
+  buildPendingRoomPathKey(workspaceId, path) {
+    return `${workspaceId}::${path.replace(/\\/g, "/")}`;
+  }
+  registerPendingLocalCreate(workspaceId, path) {
+    this.pendingLocalCreates.set(this.buildPendingRoomPathKey(workspaceId, path), Date.now());
+  }
+  clearPendingLocalCreate(workspaceId, path) {
+    this.pendingLocalCreates.delete(this.buildPendingRoomPathKey(workspaceId, path));
+  }
+  hasPendingLocalCreate(workspaceId, path) {
+    const key = this.buildPendingRoomPathKey(workspaceId, path);
+    const createdAt = this.pendingLocalCreates.get(key);
+    if (createdAt === void 0) {
+      return false;
+    }
+    if (Date.now() - createdAt <= _RolayPlugin.PENDING_CREATE_CONFIRMATION_TTL_MS) {
+      return true;
+    }
+    this.pendingLocalCreates.delete(key);
+    return false;
+  }
+  registerPendingLocalDelete(workspaceId, path) {
+    this.pendingLocalDeletes.add(this.buildPendingRoomPathKey(workspaceId, path));
+  }
+  clearPendingLocalDelete(workspaceId, path) {
+    this.pendingLocalDeletes.delete(this.buildPendingRoomPathKey(workspaceId, path));
+  }
+  hasPendingLocalDelete(workspaceId, path) {
+    return this.pendingLocalDeletes.has(this.buildPendingRoomPathKey(workspaceId, path));
+  }
+  clearPendingRoomPathsForWorkspace(workspaceId) {
+    const prefix = `${workspaceId}::`;
+    for (const key of [...this.pendingLocalCreates.keys()]) {
+      if (key.startsWith(prefix)) {
+        this.pendingLocalCreates.delete(key);
+      }
+    }
+    for (const key of [...this.pendingLocalDeletes]) {
+      if (key.startsWith(prefix)) {
+        this.pendingLocalDeletes.delete(key);
+      }
+    }
+    for (const [key, handle] of [...this.recentRemoteObservedPaths.entries()]) {
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      window.clearTimeout(handle);
+      this.recentRemoteObservedPaths.delete(key);
+    }
+  }
   optimisticUpsertRoomEntry(workspaceId, entry) {
     this.getRoomStore(workspaceId)?.upsertEntry(entry);
   }
   optimisticDeleteRoomEntry(workspaceId, entryId) {
     this.getRoomStore(workspaceId)?.markEntryDeleted(entryId);
+  }
+  confirmSnapshotPendingCreates(workspaceId, entries) {
+    for (const entry of entries) {
+      if (entry.deleted) {
+        continue;
+      }
+      this.clearPendingLocalCreate(workspaceId, entry.path);
+    }
+  }
+  buildRemoteObservedPathKey(workspaceId, localPath) {
+    return `${workspaceId}::${(0, import_obsidian9.normalizePath)(localPath)}`;
+  }
+  noteRemoteObservedPath(workspaceId, localPath, serverPath) {
+    const key = this.buildRemoteObservedPathKey(workspaceId, localPath);
+    const existingHandle = this.recentRemoteObservedPaths.get(key);
+    if (existingHandle !== void 0) {
+      window.clearTimeout(existingHandle);
+    }
+    const handle = window.setTimeout(() => {
+      this.recentRemoteObservedPaths.delete(key);
+    }, _RolayPlugin.RECENT_REMOTE_PATH_TTL_MS);
+    this.recentRemoteObservedPaths.set(key, handle);
+    this.clearPendingLocalCreate(workspaceId, serverPath);
+    this.clearPendingMarkdownCreate(localPath);
+  }
+  wasPathRecentlyObservedAsRemote(workspaceId, localPath) {
+    return this.recentRemoteObservedPaths.has(this.buildRemoteObservedPathKey(workspaceId, localPath));
   }
   async saveRoomBinding(workspaceId, nextBinding) {
     const current = this.getStoredRoomBinding(workspaceId) ?? {
@@ -14152,6 +14451,7 @@ ${keptTail}`;
     }
     this.roomRuntime.delete(workspaceId);
     this.roomInvites.delete(workspaceId);
+    this.clearPendingRoomPathsForWorkspace(workspaceId);
     this.clearPendingMarkdownCreatesForWorkspace(workspaceId);
     this.clearPendingMarkdownMergesForWorkspace(workspaceId);
     const binding = this.getStoredRoomBinding(workspaceId);
@@ -14226,6 +14526,13 @@ ${keptTail}`;
       code: ""
     };
   }
+  clearPasswordChangeDraft() {
+    this.passwordChangeDraft = {
+      currentPassword: "",
+      newPassword: "",
+      confirmPassword: ""
+    };
+  }
   clearManagedUserDraft() {
     this.managedUserDraft = {
       username: "",
@@ -14246,6 +14553,26 @@ ${keptTail}`;
     this.adminSelectedRoomId = "";
     this.adminRoomMembers = [];
     this.clearAdminRoomMemberDraft();
+  }
+  getPasswordChangeErrorMessage(error) {
+    if (!(error instanceof RolayApiError)) {
+      return null;
+    }
+    if (error.code === "password_unchanged") {
+      return "New password must be different from the current password.";
+    }
+    const normalizedCode = error.code.toLowerCase();
+    if (normalizedCode.includes("current") && normalizedCode.includes("password")) {
+      return "Current password is incorrect.";
+    }
+    const normalizedMessage = error.message.toLowerCase();
+    if (normalizedMessage.includes("current password") && (normalizedMessage.includes("invalid") || normalizedMessage.includes("incorrect") || normalizedMessage.includes("wrong"))) {
+      return "Current password is incorrect.";
+    }
+    if (normalizedMessage.includes("password unchanged") || normalizedMessage.includes("same as") || normalizedMessage.includes("must be different")) {
+      return "New password must be different from the current password.";
+    }
+    return null;
   }
   getPendingMarkdownCreatesForWorkspace(workspaceId) {
     return Object.values(this.data.pendingMarkdownCreates).filter((entry) => entry.workspaceId === workspaceId).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
@@ -14401,6 +14728,24 @@ ${keptTail}`;
     }
     delete this.data.pendingMarkdownMerges[entryId];
     this.schedulePersist();
+  }
+  shouldDropPendingMarkdownCreateAsRemoteEcho(workspaceId, pendingCreate, remoteEntry) {
+    if (remoteEntry.deleted || remoteEntry.kind !== "markdown") {
+      return false;
+    }
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(pendingCreate.localPath);
+    if (this.wasPathRecentlyObservedAsRemote(workspaceId, normalizedLocalPath)) {
+      return true;
+    }
+    const cachedEntry = this.findPersistedCrdtCacheEntry(remoteEntry.id);
+    if (cachedEntry && (0, import_obsidian9.normalizePath)(cachedEntry.filePath) === normalizedLocalPath) {
+      return true;
+    }
+    const pendingMerge = this.data.pendingMarkdownMerges[remoteEntry.id];
+    if (pendingMerge && (0, import_obsidian9.normalizePath)(pendingMerge.localPath) === normalizedLocalPath) {
+      return true;
+    }
+    return false;
   }
   resolvePendingMarkdownServerPath(workspaceId, localPath, fallbackServerPath) {
     const folderName = this.getDownloadedFolderName(workspaceId);
@@ -14644,17 +14989,26 @@ ${keptTail}`;
     });
   }
   async queueCreateFolder(workspaceId, path) {
-    const response = await this.operationsQueue.enqueue(
-      workspaceId,
-      {
-        type: "create_folder",
-        path
-      },
-      `local folder create ${path}`
-    );
-    const createdEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
-    if (createdEntry) {
-      this.optimisticUpsertRoomEntry(workspaceId, createdEntry);
+    this.registerPendingLocalCreate(workspaceId, path);
+    let confirmedServerCreate = false;
+    try {
+      const response = await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type: "create_folder",
+          path
+        },
+        `local folder create ${path}`
+      );
+      const createdEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+      if (createdEntry) {
+        this.optimisticUpsertRoomEntry(workspaceId, createdEntry);
+      }
+      confirmedServerCreate = true;
+    } finally {
+      if (!confirmedServerCreate) {
+        this.clearPendingLocalCreate(workspaceId, path);
+      }
     }
   }
   async queueCreateMarkdown(workspaceId, path, localContent = "") {
@@ -14662,6 +15016,8 @@ ${keptTail}`;
     await this.syncMarkdownCreate(workspaceId, path, localPath, localContent, 0);
   }
   async syncMarkdownCreate(workspaceId, path, localPath, localContent = "", conflictDepth = 0) {
+    this.registerPendingLocalCreate(workspaceId, path);
+    let confirmedServerCreate = false;
     try {
       const response = await this.operationsQueue.enqueue(
         workspaceId,
@@ -14675,6 +15031,7 @@ ${keptTail}`;
       if (appliedEntry) {
         this.optimisticUpsertRoomEntry(workspaceId, appliedEntry);
       }
+      confirmedServerCreate = true;
       this.clearPendingMarkdownCreate(localPath);
       this.recordLog(
         "ops",
@@ -14714,6 +15071,7 @@ ${keptTail}`;
       }
     } catch (error) {
       if (error instanceof RolayOperationError && error.result.status === "conflict" && error.result.reason === "path_already_exists") {
+        this.clearPendingLocalCreate(workspaceId, path);
         await this.resolveMarkdownCreatePathConflict(
           workspaceId,
           path,
@@ -14726,6 +15084,10 @@ ${keptTail}`;
       }
       await this.rememberPendingMarkdownCreate(workspaceId, localPath, path, error);
       throw error;
+    } finally {
+      if (!confirmedServerCreate) {
+        this.clearPendingLocalCreate(workspaceId, path);
+      }
     }
   }
   async resolveMarkdownCreatePathConflict(workspaceId, originalServerPath, originalLocalPath, fallbackLocalContent, suggestedPath, conflictDepth) {
@@ -14805,6 +15167,15 @@ ${keptTail}`;
       }
       const remoteEntry = this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
       if (remoteEntry) {
+        if (this.shouldDropPendingMarkdownCreateAsRemoteEcho(workspaceId, pendingCreate, remoteEntry)) {
+          this.clearPendingMarkdownCreate(pendingCreate.localPath);
+          this.clearPendingLocalCreate(workspaceId, currentServerPath);
+          this.recordLog(
+            "ops",
+            `[${workspaceId}] Cleared stale pending markdown create for ${currentServerPath} because that path is already owned by remote entry ${remoteEntry.id}.`
+          );
+          continue;
+        }
         const currentLocalContent = await this.readLocalMarkdownContent(pendingCreate.localPath, "");
         await this.resolveMarkdownCreatePathConflict(
           workspaceId,
@@ -14891,44 +15262,62 @@ ${keptTail}`;
     }
   }
   async queueRenameOrMove(workspaceId, entry, newPath, type) {
-    const response = await this.operationsQueue.enqueue(
-      workspaceId,
-      {
-        type,
-        entryId: entry.id,
-        newPath,
-        preconditions: {
-          entryVersion: entry.entryVersion,
-          path: entry.path
-        }
-      },
-      `${type} ${entry.path} -> ${newPath}`
-    );
-    const updatedEntry = response.results.find((result) => result.status === "applied")?.entry ?? {
+    this.optimisticUpsertRoomEntry(workspaceId, {
       ...entry,
       path: newPath
-    };
-    this.optimisticUpsertRoomEntry(workspaceId, updatedEntry);
+    });
+    try {
+      const response = await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type,
+          entryId: entry.id,
+          newPath,
+          preconditions: {
+            entryVersion: entry.entryVersion,
+            path: entry.path
+          }
+        },
+        `${type} ${entry.path} -> ${newPath}`
+      );
+      const updatedEntry = response.results.find((result) => result.status === "applied")?.entry ?? {
+        ...entry,
+        path: newPath
+      };
+      this.optimisticUpsertRoomEntry(workspaceId, updatedEntry);
+    } catch (error) {
+      this.scheduleSnapshotRefresh(workspaceId, "rename-recovery");
+      throw error;
+    }
   }
   async queueDeleteEntry(workspaceId, entry) {
-    const response = await this.operationsQueue.enqueue(
-      workspaceId,
-      {
-        type: "delete_entry",
-        entryId: entry.id,
-        preconditions: {
-          entryVersion: entry.entryVersion,
-          path: entry.path
-        }
-      },
-      `delete ${entry.path}`
-    );
-    const deletedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
-    if (deletedEntry) {
-      this.optimisticUpsertRoomEntry(workspaceId, deletedEntry);
-      return;
-    }
+    this.registerPendingLocalDelete(workspaceId, entry.path);
     this.optimisticDeleteRoomEntry(workspaceId, entry.id);
+    try {
+      const response = await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type: "delete_entry",
+          entryId: entry.id,
+          preconditions: {
+            entryVersion: entry.entryVersion,
+            path: entry.path
+          }
+        },
+        `delete ${entry.path}`
+      );
+      const deletedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+      if (deletedEntry) {
+        this.optimisticUpsertRoomEntry(workspaceId, deletedEntry);
+        return;
+      }
+      this.optimisticDeleteRoomEntry(workspaceId, entry.id);
+    } catch (error) {
+      this.scheduleSnapshotRefresh(workspaceId, "delete-recovery");
+      throw error;
+    } finally {
+      this.clearPendingLocalDelete(workspaceId, entry.path);
+    }
   }
   findAvailableMarkdownConflictPath(workspaceId, desiredServerPath) {
     const normalizedDesiredPath = desiredServerPath.replace(/\\/g, "/");
@@ -14979,6 +15368,8 @@ ${keptTail}`;
 _RolayPlugin.MAX_PERSISTED_CRDT_DOCS = 64;
 _RolayPlugin.MAX_LOG_FILE_BYTES = 512 * 1024;
 _RolayPlugin.LOG_FILE_NAME = "rolay-sync.log";
+_RolayPlugin.PENDING_CREATE_CONFIRMATION_TTL_MS = 6e4;
+_RolayPlugin.RECENT_REMOTE_PATH_TTL_MS = 3e4;
 var RolayPlugin = _RolayPlugin;
 function compareRoomsByName(left, right) {
   const nameComparison = left.workspace.name.localeCompare(right.workspace.name);

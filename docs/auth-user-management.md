@@ -10,6 +10,7 @@ This document captures the auth and user-management model that the plugin now ta
 - `writer` and `admin` can create rooms.
 - `reader` can only join rooms.
 - Every user can fetch their own profile and update only their own `displayName`.
+- Every authenticated user can change their own password by proving knowledge of the current password.
 - Admins can list users, create managed accounts, and delete managed accounts.
 
 ## Endpoints The Plugin Uses
@@ -35,6 +36,29 @@ Request body:
 ```
 
 The plugin updates local session state immediately after a successful response.
+
+### Self-service password change
+
+- `PATCH /v1/auth/me/password`
+
+Request body:
+
+```json
+{
+  "currentPassword": "old-password",
+  "newPassword": "new-password"
+}
+```
+
+Successful responses rotate the active session and return a fresh `accessToken`, `refreshToken`, and `user`.
+
+Plugin behavior:
+
+- the settings UI asks for current password, new password, and confirmation
+- after success, the plugin replaces the stored session tokens immediately
+- the saved login password in plugin settings is also replaced with the new value
+- the user is not required to do a separate logout/login roundtrip
+- `password_unchanged` and wrong-current-password cases are surfaced directly in the UI
 
 ### Admin-managed account lifecycle
 

@@ -1,6 +1,6 @@
 import { MarkdownView, Notice, Plugin, TFile, normalizePath, type TAbstractFile } from "obsidian";
 import * as Y from "yjs";
-import { RolayApiClient } from "./api/client";
+import { RolayApiClient, RolayApiError } from "./api/client";
 import { FileBridge } from "./obsidian/file-bridge";
 import { createMarkdownTextState, CrdtSessionManager } from "./realtime/crdt-session";
 import { createSharedPresenceExtension } from "./realtime/shared-presence";
@@ -95,10 +95,18 @@ interface StatusSnapshot {
   recentLogs: string[];
 }
 
+interface PasswordChangeDraft {
+  currentPassword: string;
+  newPassword: string;
+  confirmPassword: string;
+}
+
 export default class RolayPlugin extends Plugin {
   private static readonly MAX_PERSISTED_CRDT_DOCS = 64;
   private static readonly MAX_LOG_FILE_BYTES = 512 * 1024;
   private static readonly LOG_FILE_NAME = "rolay-sync.log";
+  private static readonly PENDING_CREATE_CONFIRMATION_TTL_MS = 60_000;
+  private static readonly RECENT_REMOTE_PATH_TTL_MS = 30_000;
   private data!: RolayPluginData;
   private apiClient!: RolayApiClient;
   private crdtManager!: CrdtSessionManager;
@@ -106,6 +114,9 @@ export default class RolayPlugin extends Plugin {
   private fileBridge!: FileBridge;
   private readonly roomRuntime = new Map<string, RoomRuntimeState>();
   private readonly roomInvites = new Map<string, InviteState>();
+  private readonly pendingLocalCreates = new Map<string, number>();
+  private readonly pendingLocalDeletes = new Set<string>();
+  private readonly recentRemoteObservedPaths = new Map<string, number>();
   private persistHandle: number | null = null;
   private statusBarEl!: HTMLElement;
   private roomList: RoomListItem[] = [];
@@ -117,6 +128,11 @@ export default class RolayPlugin extends Plugin {
   private logFileWrite = Promise.resolve();
   private readonly pendingLogLines: string[] = [];
   private profileDraftDisplayName = "";
+  private passwordChangeDraft: PasswordChangeDraft = {
+    currentPassword: "",
+    newPassword: "",
+    confirmPassword: ""
+  };
   private createRoomDraft: CreateRoomRequest = {
     name: ""
   };
@@ -175,11 +191,16 @@ export default class RolayPlugin extends Plugin {
       getFolderName: (workspaceId) => this.getDownloadedFolderName(workspaceId),
       getDownloadedRooms: () => this.getDownloadedRooms(),
       getEntryByPath: (workspaceId, path) => this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null,
+      hasPendingCreate: (workspaceId, path) => this.hasPendingLocalCreate(workspaceId, path),
+      hasPendingDelete: (workspaceId, path) => this.hasPendingLocalDelete(workspaceId, path),
       log: (message) => this.recordLog("bridge", message),
       onCreateFolder: (workspaceId, path) => this.queueCreateFolder(workspaceId, path),
       onCreateMarkdown: (workspaceId, path, localContent) => this.queueCreateMarkdown(workspaceId, path, localContent),
       onRenameOrMove: (workspaceId, entry, newPath, type) => this.queueRenameOrMove(workspaceId, entry, newPath, type),
-      onDeleteEntry: (workspaceId, entry) => this.queueDeleteEntry(workspaceId, entry)
+      onDeleteEntry: (workspaceId, entry) => this.queueDeleteEntry(workspaceId, entry),
+      onRemotePathObserved: (workspaceId, localPath, serverPath) => {
+        this.noteRemoteObservedPath(workspaceId, localPath, serverPath);
+      }
     });
 
     this.statusBarEl = this.addStatusBarItem();
@@ -312,6 +333,17 @@ export default class RolayPlugin extends Plugin {
 
   setProfileDraftDisplayName(displayName: string): void {
     this.profileDraftDisplayName = displayName;
+  }
+
+  getPasswordChangeDraft(): PasswordChangeDraft {
+    return { ...this.passwordChangeDraft };
+  }
+
+  updatePasswordChangeDraft(update: Partial<PasswordChangeDraft>): void {
+    this.passwordChangeDraft = {
+      ...this.passwordChangeDraft,
+      ...update
+    };
   }
 
   getCreateRoomDraft(): CreateRoomRequest {
@@ -476,6 +508,7 @@ export default class RolayPlugin extends Plugin {
     this.adminRoomMembers = [];
     this.data.session = null;
     this.resetProfileDraft();
+    this.clearPasswordChangeDraft();
     this.clearRoomDrafts();
     this.clearManagedUserDraft();
     this.clearAdminRoomMemberDraft();
@@ -508,6 +541,61 @@ export default class RolayPlugin extends Plugin {
       new Notice(`Rolay display name updated to ${response.user.displayName}.`);
     } catch (error) {
       this.handleError("Display name update failed", error);
+      throw error;
+    }
+  }
+
+  async changeOwnPassword(): Promise<void> {
+    if (!this.getCurrentUser()) {
+      throw this.notifyError("Log into Rolay before changing your password.");
+    }
+
+    const currentPassword = this.passwordChangeDraft.currentPassword;
+    const newPassword = this.passwordChangeDraft.newPassword;
+    const confirmPassword = this.passwordChangeDraft.confirmPassword;
+
+    if (!currentPassword) {
+      throw this.notifyError("Current password is required.");
+    }
+
+    if (!newPassword) {
+      throw this.notifyError("New password is required.");
+    }
+
+    if (!confirmPassword) {
+      throw this.notifyError("Confirm the new password.");
+    }
+
+    if (newPassword !== confirmPassword) {
+      throw this.notifyError("New password confirmation does not match.");
+    }
+
+    if (newPassword === currentPassword) {
+      throw this.notifyError("New password must be different from the current password.");
+    }
+
+    try {
+      const response = await this.apiClient.changeCurrentUserPassword({
+        currentPassword,
+        newPassword
+      });
+
+      this.resetProfileDraft();
+      this.clearPasswordChangeDraft();
+      await this.updateSettings({
+        password: newPassword
+      });
+      this.recordLog("auth", `Changed password for ${response.user.username}. Session tokens were rotated.`);
+      new Notice("Rolay password updated. The current session was rotated.");
+    } catch (error) {
+      const friendlyMessage = this.getPasswordChangeErrorMessage(error);
+      if (friendlyMessage) {
+        this.recordLog("error", `Password change failed: ${friendlyMessage}`, "error");
+        new Notice(friendlyMessage);
+        throw new Error(friendlyMessage);
+      }
+
+      this.handleError("Password change failed", error);
       throw error;
     }
   }
@@ -942,6 +1030,7 @@ export default class RolayPlugin extends Plugin {
       const previousEntries = runtime.treeStore.getEntries();
       const snapshot = await this.apiClient.getWorkspaceTree(room.workspace.id);
       runtime.treeStore.applySnapshot(snapshot);
+      this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
       await this.fileBridge.applySnapshot(snapshot, previousEntries);
       this.setRoomSyncState(room.workspace.id, {
         lastCursor: snapshot.cursor,
@@ -1467,12 +1556,108 @@ export default class RolayPlugin extends Plugin {
     return this.roomRuntime.get(workspaceId)?.treeStore ?? null;
   }
 
+  private buildPendingRoomPathKey(workspaceId: string, path: string): string {
+    return `${workspaceId}::${path.replace(/\\/g, "/")}`;
+  }
+
+  private registerPendingLocalCreate(workspaceId: string, path: string): void {
+    this.pendingLocalCreates.set(this.buildPendingRoomPathKey(workspaceId, path), Date.now());
+  }
+
+  private clearPendingLocalCreate(workspaceId: string, path: string): void {
+    this.pendingLocalCreates.delete(this.buildPendingRoomPathKey(workspaceId, path));
+  }
+
+  private hasPendingLocalCreate(workspaceId: string, path: string): boolean {
+    const key = this.buildPendingRoomPathKey(workspaceId, path);
+    const createdAt = this.pendingLocalCreates.get(key);
+    if (createdAt === undefined) {
+      return false;
+    }
+
+    if (Date.now() - createdAt <= RolayPlugin.PENDING_CREATE_CONFIRMATION_TTL_MS) {
+      return true;
+    }
+
+    this.pendingLocalCreates.delete(key);
+    return false;
+  }
+
+  private registerPendingLocalDelete(workspaceId: string, path: string): void {
+    this.pendingLocalDeletes.add(this.buildPendingRoomPathKey(workspaceId, path));
+  }
+
+  private clearPendingLocalDelete(workspaceId: string, path: string): void {
+    this.pendingLocalDeletes.delete(this.buildPendingRoomPathKey(workspaceId, path));
+  }
+
+  private hasPendingLocalDelete(workspaceId: string, path: string): boolean {
+    return this.pendingLocalDeletes.has(this.buildPendingRoomPathKey(workspaceId, path));
+  }
+
+  private clearPendingRoomPathsForWorkspace(workspaceId: string): void {
+    const prefix = `${workspaceId}::`;
+    for (const key of [...this.pendingLocalCreates.keys()]) {
+      if (key.startsWith(prefix)) {
+        this.pendingLocalCreates.delete(key);
+      }
+    }
+
+    for (const key of [...this.pendingLocalDeletes]) {
+      if (key.startsWith(prefix)) {
+        this.pendingLocalDeletes.delete(key);
+      }
+    }
+
+    for (const [key, handle] of [...this.recentRemoteObservedPaths.entries()]) {
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+
+      window.clearTimeout(handle);
+      this.recentRemoteObservedPaths.delete(key);
+    }
+  }
+
   private optimisticUpsertRoomEntry(workspaceId: string, entry: FileEntry): void {
     this.getRoomStore(workspaceId)?.upsertEntry(entry);
   }
 
   private optimisticDeleteRoomEntry(workspaceId: string, entryId: string): void {
     this.getRoomStore(workspaceId)?.markEntryDeleted(entryId);
+  }
+
+  private confirmSnapshotPendingCreates(workspaceId: string, entries: FileEntry[]): void {
+    for (const entry of entries) {
+      if (entry.deleted) {
+        continue;
+      }
+
+      this.clearPendingLocalCreate(workspaceId, entry.path);
+    }
+  }
+
+  private buildRemoteObservedPathKey(workspaceId: string, localPath: string): string {
+    return `${workspaceId}::${normalizePath(localPath)}`;
+  }
+
+  private noteRemoteObservedPath(workspaceId: string, localPath: string, serverPath: string): void {
+    const key = this.buildRemoteObservedPathKey(workspaceId, localPath);
+    const existingHandle = this.recentRemoteObservedPaths.get(key);
+    if (existingHandle !== undefined) {
+      window.clearTimeout(existingHandle);
+    }
+
+    const handle = window.setTimeout(() => {
+      this.recentRemoteObservedPaths.delete(key);
+    }, RolayPlugin.RECENT_REMOTE_PATH_TTL_MS);
+    this.recentRemoteObservedPaths.set(key, handle);
+    this.clearPendingLocalCreate(workspaceId, serverPath);
+    this.clearPendingMarkdownCreate(localPath);
+  }
+
+  private wasPathRecentlyObservedAsRemote(workspaceId: string, localPath: string): boolean {
+    return this.recentRemoteObservedPaths.has(this.buildRemoteObservedPathKey(workspaceId, localPath));
   }
 
   private async saveRoomBinding(
@@ -1545,6 +1730,7 @@ export default class RolayPlugin extends Plugin {
 
     this.roomRuntime.delete(workspaceId);
     this.roomInvites.delete(workspaceId);
+    this.clearPendingRoomPathsForWorkspace(workspaceId);
     this.clearPendingMarkdownCreatesForWorkspace(workspaceId);
     this.clearPendingMarkdownMergesForWorkspace(workspaceId);
 
@@ -1637,6 +1823,14 @@ export default class RolayPlugin extends Plugin {
     };
   }
 
+  private clearPasswordChangeDraft(): void {
+    this.passwordChangeDraft = {
+      currentPassword: "",
+      newPassword: "",
+      confirmPassword: ""
+    };
+  }
+
   private clearManagedUserDraft(): void {
     this.managedUserDraft = {
       username: "",
@@ -1659,6 +1853,39 @@ export default class RolayPlugin extends Plugin {
     this.adminSelectedRoomId = "";
     this.adminRoomMembers = [];
     this.clearAdminRoomMemberDraft();
+  }
+
+  private getPasswordChangeErrorMessage(error: unknown): string | null {
+    if (!(error instanceof RolayApiError)) {
+      return null;
+    }
+
+    if (error.code === "password_unchanged") {
+      return "New password must be different from the current password.";
+    }
+
+    const normalizedCode = error.code.toLowerCase();
+    if (normalizedCode.includes("current") && normalizedCode.includes("password")) {
+      return "Current password is incorrect.";
+    }
+
+    const normalizedMessage = error.message.toLowerCase();
+    if (
+      normalizedMessage.includes("current password") &&
+      (normalizedMessage.includes("invalid") || normalizedMessage.includes("incorrect") || normalizedMessage.includes("wrong"))
+    ) {
+      return "Current password is incorrect.";
+    }
+
+    if (
+      normalizedMessage.includes("password unchanged") ||
+      normalizedMessage.includes("same as") ||
+      normalizedMessage.includes("must be different")
+    ) {
+      return "New password must be different from the current password.";
+    }
+
+    return null;
   }
 
   private getPendingMarkdownCreatesForWorkspace(workspaceId: string): RolayPendingMarkdownCreateEntry[] {
@@ -1856,6 +2083,33 @@ export default class RolayPlugin extends Plugin {
 
     delete this.data.pendingMarkdownMerges[entryId];
     this.schedulePersist();
+  }
+
+  private shouldDropPendingMarkdownCreateAsRemoteEcho(
+    workspaceId: string,
+    pendingCreate: RolayPendingMarkdownCreateEntry,
+    remoteEntry: FileEntry
+  ): boolean {
+    if (remoteEntry.deleted || remoteEntry.kind !== "markdown") {
+      return false;
+    }
+
+    const normalizedLocalPath = normalizePath(pendingCreate.localPath);
+    if (this.wasPathRecentlyObservedAsRemote(workspaceId, normalizedLocalPath)) {
+      return true;
+    }
+
+    const cachedEntry = this.findPersistedCrdtCacheEntry(remoteEntry.id);
+    if (cachedEntry && normalizePath(cachedEntry.filePath) === normalizedLocalPath) {
+      return true;
+    }
+
+    const pendingMerge = this.data.pendingMarkdownMerges[remoteEntry.id];
+    if (pendingMerge && normalizePath(pendingMerge.localPath) === normalizedLocalPath) {
+      return true;
+    }
+
+    return false;
   }
 
   private resolvePendingMarkdownServerPath(
@@ -2166,18 +2420,27 @@ export default class RolayPlugin extends Plugin {
   }
 
   private async queueCreateFolder(workspaceId: string, path: string): Promise<void> {
-    const response = await this.operationsQueue.enqueue(
-      workspaceId,
-      {
-        type: "create_folder",
-        path
-      },
-      `local folder create ${path}`
-    );
+    this.registerPendingLocalCreate(workspaceId, path);
+    let confirmedServerCreate = false;
+    try {
+      const response = await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type: "create_folder",
+          path
+        },
+        `local folder create ${path}`
+      );
 
-    const createdEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
-    if (createdEntry) {
-      this.optimisticUpsertRoomEntry(workspaceId, createdEntry);
+      const createdEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+      if (createdEntry) {
+        this.optimisticUpsertRoomEntry(workspaceId, createdEntry);
+      }
+      confirmedServerCreate = true;
+    } finally {
+      if (!confirmedServerCreate) {
+        this.clearPendingLocalCreate(workspaceId, path);
+      }
     }
   }
 
@@ -2197,6 +2460,8 @@ export default class RolayPlugin extends Plugin {
     localContent = "",
     conflictDepth = 0
   ): Promise<void> {
+    this.registerPendingLocalCreate(workspaceId, path);
+    let confirmedServerCreate = false;
     try {
       const response = await this.operationsQueue.enqueue(
         workspaceId,
@@ -2210,6 +2475,7 @@ export default class RolayPlugin extends Plugin {
       if (appliedEntry) {
         this.optimisticUpsertRoomEntry(workspaceId, appliedEntry);
       }
+      confirmedServerCreate = true;
       this.clearPendingMarkdownCreate(localPath);
       this.recordLog(
         "ops",
@@ -2262,6 +2528,7 @@ export default class RolayPlugin extends Plugin {
         error.result.status === "conflict" &&
         error.result.reason === "path_already_exists"
       ) {
+        this.clearPendingLocalCreate(workspaceId, path);
         await this.resolveMarkdownCreatePathConflict(
           workspaceId,
           path,
@@ -2275,6 +2542,10 @@ export default class RolayPlugin extends Plugin {
 
       await this.rememberPendingMarkdownCreate(workspaceId, localPath, path, error);
       throw error;
+    } finally {
+      if (!confirmedServerCreate) {
+        this.clearPendingLocalCreate(workspaceId, path);
+      }
     }
   }
 
@@ -2377,6 +2648,16 @@ export default class RolayPlugin extends Plugin {
 
       const remoteEntry = this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
       if (remoteEntry) {
+        if (this.shouldDropPendingMarkdownCreateAsRemoteEcho(workspaceId, pendingCreate, remoteEntry)) {
+          this.clearPendingMarkdownCreate(pendingCreate.localPath);
+          this.clearPendingLocalCreate(workspaceId, currentServerPath);
+          this.recordLog(
+            "ops",
+            `[${workspaceId}] Cleared stale pending markdown create for ${currentServerPath} because that path is already owned by remote entry ${remoteEntry.id}.`
+          );
+          continue;
+        }
+
         const currentLocalContent = await this.readLocalMarkdownContent(pendingCreate.localPath, "");
         await this.resolveMarkdownCreatePathConflict(
           workspaceId,
@@ -2481,50 +2762,70 @@ export default class RolayPlugin extends Plugin {
     newPath: string,
     type: "rename_entry" | "move_entry"
   ): Promise<void> {
-    const response = await this.operationsQueue.enqueue(
-      workspaceId,
-      {
-        type,
-        entryId: entry.id,
-        newPath,
-        preconditions: {
-          entryVersion: entry.entryVersion,
-          path: entry.path
-        }
-      },
-      `${type} ${entry.path} -> ${newPath}`
-    );
+    this.optimisticUpsertRoomEntry(workspaceId, {
+      ...entry,
+      path: newPath
+    });
 
-    const updatedEntry =
-      response.results.find((result) => result.status === "applied")?.entry ??
-      {
-        ...entry,
-        path: newPath
-      };
-    this.optimisticUpsertRoomEntry(workspaceId, updatedEntry);
+    try {
+      const response = await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type,
+          entryId: entry.id,
+          newPath,
+          preconditions: {
+            entryVersion: entry.entryVersion,
+            path: entry.path
+          }
+        },
+        `${type} ${entry.path} -> ${newPath}`
+      );
+
+      const updatedEntry =
+        response.results.find((result) => result.status === "applied")?.entry ??
+        {
+          ...entry,
+          path: newPath
+        };
+      this.optimisticUpsertRoomEntry(workspaceId, updatedEntry);
+    } catch (error) {
+      this.scheduleSnapshotRefresh(workspaceId, "rename-recovery");
+      throw error;
+    }
   }
 
   private async queueDeleteEntry(workspaceId: string, entry: FileEntry): Promise<void> {
-    const response = await this.operationsQueue.enqueue(
-      workspaceId,
-      {
-        type: "delete_entry",
-        entryId: entry.id,
-        preconditions: {
-          entryVersion: entry.entryVersion,
-          path: entry.path
-        }
-      },
-      `delete ${entry.path}`
-    );
-
-    const deletedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
-    if (deletedEntry) {
-      this.optimisticUpsertRoomEntry(workspaceId, deletedEntry);
-      return;
-    }
-
+    this.registerPendingLocalDelete(workspaceId, entry.path);
     this.optimisticDeleteRoomEntry(workspaceId, entry.id);
+
+    try {
+      const response = await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type: "delete_entry",
+          entryId: entry.id,
+          preconditions: {
+            entryVersion: entry.entryVersion,
+            path: entry.path
+          }
+        },
+        `delete ${entry.path}`
+      );
+
+      const deletedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+      if (deletedEntry) {
+        this.optimisticUpsertRoomEntry(workspaceId, deletedEntry);
+        return;
+      }
+
+      this.optimisticDeleteRoomEntry(workspaceId, entry.id);
+    } catch (error) {
+      this.scheduleSnapshotRefresh(workspaceId, "delete-recovery");
+      throw error;
+    } finally {
+      this.clearPendingLocalDelete(workspaceId, entry.path);
+    }
   }
 
   private findAvailableMarkdownConflictPath(workspaceId: string, desiredServerPath: string): string {

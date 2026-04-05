@@ -69,13 +69,15 @@ export class CrdtSessionManager {
 
     const liveSyncEnabled = this.isLiveSyncEnabledForLocalPath(file.path);
     const persistedCrdtState = this.getPersistedCrdtState(entry.id);
+    const localBootstrapState = this.pendingOfflineUpdates.get(entry.id) ?? persistedCrdtState;
+    const hasPendingOfflineState = this.pendingOfflineUpdates.has(entry.id);
 
     if (this.activeSession?.matches(file, entry)) {
       if (liveSyncEnabled && this.activeSession.isOffline()) {
-        const pendingOfflineUpdate = this.detachActiveSession() ?? persistedCrdtState;
+        const nextLocalBootstrapState = this.detachActiveSession() ?? persistedCrdtState;
         await this.activeSession.destroy();
         this.activeSession = null;
-        await this.connect(file, entry, pendingOfflineUpdate);
+        await this.connect(file, entry, nextLocalBootstrapState);
         return;
       }
 
@@ -90,13 +92,20 @@ export class CrdtSessionManager {
     await this.disconnect();
 
     if (liveSyncEnabled) {
-      await this.connect(file, entry, persistedCrdtState);
+      if (localBootstrapState) {
+        this.log(
+          `Preparing live CRDT bootstrap for ${file.path} from ${hasPendingOfflineState ? "offline state" : "persisted cache"}.`
+        );
+      }
+      await this.connect(file, entry, localBootstrapState);
       return;
     }
 
-    const pendingOfflineUpdate = this.pendingOfflineUpdates.get(entry.id) ?? persistedCrdtState;
-    if (pendingOfflineUpdate) {
-      await this.openOffline(file, entry, pendingOfflineUpdate);
+    if (localBootstrapState) {
+      this.log(
+        `Opening offline CRDT cache for ${file.path} from ${hasPendingOfflineState ? "offline state" : "persisted cache"}.`
+      );
+      await this.openOffline(file, entry, localBootstrapState);
       return;
     }
 
@@ -183,7 +192,7 @@ export class CrdtSessionManager {
     });
   }
 
-  private async connect(file: TFile, entry: FileEntry, pendingOfflineUpdate?: Uint8Array | null): Promise<void> {
+  private async connect(file: TFile, entry: FileEntry, initialState?: Uint8Array | null): Promise<void> {
     const currentUser = this.getCurrentUser();
     if (!currentUser) {
       this.log(`Skipping CRDT session for ${file.path} because no authenticated user is available.`);
@@ -203,7 +212,7 @@ export class CrdtSessionManager {
       createCrdtTokenSupplier(this.apiClient, entry.id, bootstrap.token),
       this.log,
       this.persistCrdtState,
-      pendingOfflineUpdate ?? this.pendingOfflineUpdates.get(entry.id) ?? null
+      initialState ?? null
     );
 
     this.activeSession = session;
@@ -211,7 +220,7 @@ export class CrdtSessionManager {
     this.pendingOfflineUpdates.delete(entry.id);
   }
 
-  private async openOffline(file: TFile, entry: FileEntry, pendingOfflineUpdate: Uint8Array): Promise<void> {
+  private async openOffline(file: TFile, entry: FileEntry, initialState: Uint8Array): Promise<void> {
     const currentUser = this.getCurrentUser();
     if (!currentUser) {
       return;
@@ -227,7 +236,7 @@ export class CrdtSessionManager {
       null,
       this.log,
       this.persistCrdtState,
-      pendingOfflineUpdate
+      initialState
     );
 
     this.activeSession = session;
@@ -281,7 +290,6 @@ class BoundCrdtSession {
   private remoteObserverBound = false;
   private persistenceObserverBound = false;
   private persistHandle: number | null = null;
-  private pendingOfflineUpdate: Uint8Array | null;
 
   constructor(
     app: App,
@@ -293,7 +301,7 @@ class BoundCrdtSession {
     token: string | (() => Promise<string>) | null,
     log: (message: string) => void,
     persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void,
-    pendingOfflineUpdate: Uint8Array | null = null
+    initialState: Uint8Array | null = null
   ) {
     this.app = app;
     this.file = file;
@@ -306,7 +314,10 @@ class BoundCrdtSession {
     this.persistCrdtState = persistCrdtState;
     this.awarenessUser = buildAwarenessUserPayload(currentUser);
     this.yText = this.yDocument.getText("content");
-    this.pendingOfflineUpdate = pendingOfflineUpdate;
+    if (initialState && initialState.byteLength > 0) {
+      Y.applyUpdate(this.yDocument, initialState, "rolay-local-bootstrap");
+      this.log(`Loaded local CRDT bootstrap state for ${this.file.path}.`);
+    }
   }
 
   async open(): Promise<void> {
@@ -327,17 +338,24 @@ class BoundCrdtSession {
         this.log(`CRDT websocket opened for ${this.file.path}.`);
       },
       onStatus: ({ status }) => {
+        if (status === "connecting" || status === "connected") {
+          if (this.status !== "synced") {
+            this.status = "connecting";
+          }
+        }
         this.log(`CRDT provider status for ${this.file.path}: ${status}.`);
       },
       onSynced: () => {
         this.status = "synced";
-        this.applyPendingOfflineUpdateIfNeeded();
         this.syncEditorContext();
       },
       onAwarenessChange: () => {
         this.renderRemotePresence();
       },
       onDisconnect: () => {
+        if (this.status !== "offline") {
+          this.status = "connecting";
+        }
         this.log(`CRDT websocket disconnected for ${this.file.path}.`);
         this.clearRemotePresence();
       },
@@ -358,7 +376,6 @@ class BoundCrdtSession {
     this.bindRemoteObserver();
     this.bindPersistenceObserver();
     this.status = "offline";
-    this.applyPendingOfflineUpdateIfNeeded();
     this.syncEditorContext();
   }
 
@@ -547,16 +564,6 @@ class BoundCrdtSession {
 
     this.provider.setAwarenessField("selection", null);
     this.lastLocalSelectionKey = null;
-  }
-
-  private applyPendingOfflineUpdateIfNeeded(): void {
-    if (!this.pendingOfflineUpdate) {
-      return;
-    }
-
-    Y.applyUpdate(this.yDocument, this.pendingOfflineUpdate, "rolay-pending-offline");
-    this.log(`Applied pending offline markdown changes for ${this.file.path}.`);
-    this.pendingOfflineUpdate = null;
   }
 
   private schedulePersistedState(): void {

@@ -10,6 +10,8 @@ import type {
   BlobDownloadTicketResponse,
   BlobUploadTicketRequest,
   BlobUploadTicketResponse,
+  ChangePasswordRequest,
+  ChangePasswordResponse,
   CreateManagedUserRequest,
   CreateRoomRequest,
   CrdtTokenResponse,
@@ -129,6 +131,23 @@ export class RolayApiClient {
       "/v1/auth/me/profile",
       body
     );
+  }
+
+  async changeCurrentUserPassword(body: ChangePasswordRequest): Promise<ChangePasswordResponse> {
+    const response = await this.requestJson<ChangePasswordResponse>(
+      "PATCH",
+      "/v1/auth/me/password",
+      body
+    );
+
+    await this.config.saveSession({
+      accessToken: response.accessToken,
+      refreshToken: response.refreshToken,
+      user: response.user,
+      authenticatedAt: new Date().toISOString()
+    });
+
+    return response;
   }
 
   async listRooms(): Promise<RoomListResponse> {

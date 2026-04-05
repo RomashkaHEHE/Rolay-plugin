@@ -93,6 +93,17 @@ export interface UpdateProfileRequest {
   displayName: string;
 }
 
+export interface ChangePasswordRequest {
+  currentPassword: string;
+  newPassword: string;
+}
+
+export interface ChangePasswordResponse {
+  accessToken: string;
+  refreshToken: string;
+  user: User;
+}
+
 export interface CreateManagedUserRequest {
   username: string;
   password: string;

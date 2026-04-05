@@ -9,6 +9,7 @@ The current MVP is built against the live Rolay `v1` contract and now follows th
 - username/password login plus refresh-token recovery
 - current-user bootstrap via `GET /v1/auth/me`
 - self-service `displayName` editing
+- self-service password change with session rotation
 - user session state with both `isAdmin` and `globalRole`
 - room list, room creation, and room join by invite key
 - per-room local folder binding with editable folder name
@@ -30,6 +31,7 @@ The plugin treats Rolay as a layered sync system:
 - Room content still syncs through `/v1/workspaces/{workspaceId}/...`
 - Markdown cold-start/bootstrap now uses `POST /v1/workspaces/{workspaceId}/markdown/bootstrap`
 - Markdown realtime still uses `POST /v1/files/{entryId}/crdt-token`
+- Password change lives under `PATCH /v1/auth/me/password` and rotates the active session
 
 Important product rules reflected in the plugin:
 
@@ -89,3 +91,4 @@ npm run dev
 - Admin account creation currently supports `writer` and `reader` global roles.
 - Binary blob download/upload is still future work; markdown CRDT and server-authoritative tree sync are the current focus.
 - Session credentials are still stored in Obsidian plugin data for MVP speed. Hardening storage is future work.
+- Successful password changes immediately replace the stored access token, refresh token, and saved login password used by the plugin.

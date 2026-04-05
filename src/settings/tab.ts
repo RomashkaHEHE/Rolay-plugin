@@ -183,6 +183,62 @@ export class RolaySettingTab extends PluginSettingTab {
         });
     }
 
+    if (currentUser) {
+      const passwordDraft = this.plugin.getPasswordChangeDraft();
+      containerEl.createEl("h3", { text: "Security" });
+
+      new Setting(containerEl)
+        .setName("Current password")
+        .setDesc("Required by the server before rotating the current session.")
+        .addText((text) => {
+          text.inputEl.type = "password";
+          text
+            .setPlaceholder("current password")
+            .setValue(passwordDraft.currentPassword)
+            .onChange((value) => {
+              this.plugin.updatePasswordChangeDraft({
+                currentPassword: value
+              });
+            });
+        });
+
+      new Setting(containerEl)
+        .setName("New password")
+        .setDesc("After success the plugin stores the new password for future session recovery.")
+        .addText((text) => {
+          text.inputEl.type = "password";
+          text
+            .setPlaceholder("new password")
+            .setValue(passwordDraft.newPassword)
+            .onChange((value) => {
+              this.plugin.updatePasswordChangeDraft({
+                newPassword: value
+              });
+            });
+        });
+
+      new Setting(containerEl)
+        .setName("Confirm new password")
+        .setDesc("The current Rolay session is rotated immediately after the password changes.")
+        .addText((text) => {
+          text.inputEl.type = "password";
+          text
+            .setPlaceholder("repeat new password")
+            .setValue(passwordDraft.confirmPassword)
+            .onChange((value) => {
+              this.plugin.updatePasswordChangeDraft({
+                confirmPassword: value
+              });
+            });
+        })
+        .addButton((button) => {
+          button.setButtonText("Change password").onClick(async () => {
+            await this.plugin.changeOwnPassword();
+            this.display();
+          });
+        });
+    }
+
     containerEl.createEl("h3", { text: "Rooms" });
     new Setting(containerEl)
       .setName("Room list")
