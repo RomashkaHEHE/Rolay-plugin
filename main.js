@@ -13515,6 +13515,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         if (runtime.snapshotRefreshHandle !== null) {
           window.clearTimeout(runtime.snapshotRefreshHandle);
         }
+        if (runtime.backgroundMarkdownRefreshHandle !== null) {
+          window.clearTimeout(runtime.backgroundMarkdownRefreshHandle);
+        }
         if (runtime.lockedBootstrapRetryHandle !== null) {
           window.clearTimeout(runtime.lockedBootstrapRetryHandle);
         }
@@ -13969,6 +13972,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     const room = this.requireDownloadedRoom(workspaceId);
     await this.refreshRoomSnapshot(room.workspace.id, reason);
     await this.startRoomEventStream(room.workspace.id);
+    this.scheduleBackgroundMarkdownRefresh(
+      room.workspace.id,
+      "post-connect-background-refresh",
+      _RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS,
+      true
+    );
     const activeFile = this.app.workspace.getActiveFile();
     if (activeFile && this.isLocalPathInDownloadedRoom(activeFile.path, room.workspace.id)) {
       await this.bindActiveMarkdownToCrdt();
@@ -14239,6 +14248,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
       );
       await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
+      this.scheduleBackgroundMarkdownRefresh(
+        room.workspace.id,
+        "post-snapshot-background-refresh",
+        _RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS,
+        true
+      );
       await this.reconcilePendingMarkdownCreates(room.workspace.id, reason);
       await this.reconcilePendingMarkdownMerges(room.workspace.id, reason);
       await this.persistNow();
@@ -14290,6 +14305,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     if (!runtime) {
       return;
     }
+    this.clearBackgroundMarkdownRefresh(workspaceId);
     this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
     this.cancelRoomMarkdownBootstrap(workspaceId);
     runtime.eventStream?.stop();
@@ -14523,6 +14539,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         await this.bindActiveMarkdownToCrdt();
         return;
       }
+      await this.refreshMarkdownContentBeforeRoomExit(file, oldPath);
       this.forgetRecentRemoteHintsForLocalPath(oldPath, true);
       this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       this.handlePendingMarkdownCreateRename(oldPath, file.path);
@@ -14612,6 +14629,64 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       runtime.snapshotRefreshHandle = null;
       void this.refreshRoomSnapshot(workspaceId, reason);
     }, 400);
+  }
+  clearBackgroundMarkdownRefresh(workspaceId) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+    if (runtime.backgroundMarkdownRefreshHandle !== null) {
+      window.clearTimeout(runtime.backgroundMarkdownRefreshHandle);
+      runtime.backgroundMarkdownRefreshHandle = null;
+    }
+    runtime.backgroundMarkdownRefreshInFlight = false;
+  }
+  scheduleBackgroundMarkdownRefresh(workspaceId, reason, delayMs = _RolayPlugin.ROOM_MARKDOWN_REFRESH_INTERVAL_MS, replaceExisting = false) {
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    if (runtime.backgroundMarkdownRefreshHandle !== null) {
+      if (!replaceExisting) {
+        return;
+      }
+      window.clearTimeout(runtime.backgroundMarkdownRefreshHandle);
+      runtime.backgroundMarkdownRefreshHandle = null;
+    }
+    runtime.backgroundMarkdownRefreshHandle = window.setTimeout(() => {
+      runtime.backgroundMarkdownRefreshHandle = null;
+      void this.runBackgroundMarkdownRefresh(workspaceId, reason);
+    }, Math.max(250, delayMs));
+  }
+  async runBackgroundMarkdownRefresh(workspaceId, reason) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    const binding = this.getStoredRoomBinding(workspaceId);
+    if (!runtime || !binding?.downloaded || runtime.streamStatus === "stopped") {
+      return;
+    }
+    if (runtime.backgroundMarkdownRefreshInFlight) {
+      this.scheduleBackgroundMarkdownRefresh(workspaceId, reason);
+      return;
+    }
+    if (runtime.markdownBootstrap.status === "loading") {
+      this.scheduleBackgroundMarkdownRefresh(workspaceId, reason);
+      return;
+    }
+    runtime.backgroundMarkdownRefreshInFlight = true;
+    try {
+      await this.refreshClosedRoomMarkdownContent(workspaceId, reason);
+    } catch (error) {
+      this.recordLog(
+        "crdt",
+        `[${workspaceId}] Background markdown refresh failed: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+    } finally {
+      runtime.backgroundMarkdownRefreshInFlight = false;
+      const currentRuntime = this.roomRuntime.get(workspaceId);
+      const currentBinding = this.getStoredRoomBinding(workspaceId);
+      if (!currentRuntime || !currentBinding?.downloaded || currentRuntime.streamStatus === "stopped") {
+        return;
+      }
+      this.scheduleBackgroundMarkdownRefresh(workspaceId, "background-markdown");
+    }
   }
   recordLog(scope, message, level = "info") {
     const entry = {
@@ -14782,6 +14857,8 @@ ${keptTail}`;
       eventStream: null,
       streamStatus: "stopped",
       snapshotRefreshHandle: null,
+      backgroundMarkdownRefreshHandle: null,
+      backgroundMarkdownRefreshInFlight: false,
       lockedBootstrapRetryHandle: null,
       lockedBootstrapRetryAttempt: 0,
       markdownBootstrap: {
@@ -15859,6 +15936,139 @@ ${keptTail}`;
     await this.app.vault.modify(localFile, nextText);
     return true;
   }
+  async refreshClosedRoomMarkdownContent(workspaceId, reason) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+    const targets = runtime.treeStore.getEntries().filter((entry) => !entry.deleted && entry.kind === "markdown").map((entry) => ({
+      entry,
+      localPath: this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path
+    })).filter(({ localPath }) => {
+      const localFile = this.app.vault.getAbstractFileByPath(localPath);
+      return localFile instanceof import_obsidian9.TFile && localFile.extension === "md" && getMarkdownViewsForFile(this.app, localPath).length === 0;
+    });
+    await this.fetchMarkdownTargetsFromBootstrap(workspaceId, targets, reason, true);
+  }
+  async refreshMarkdownContentBeforeRoomExit(file, oldPath) {
+    const room = this.resolveDownloadedRoomByLocalPath(oldPath);
+    if (!room) {
+      return;
+    }
+    if (this.resolveDownloadedRoomByLocalPath(file.path)?.workspaceId === room.workspaceId) {
+      return;
+    }
+    const oldServerPath = toServerPathForRoom(oldPath, this.data.settings.syncRoot, room.folderName);
+    if (!oldServerPath) {
+      return;
+    }
+    const roomStore = this.getRoomStore(room.workspaceId);
+    if (!roomStore) {
+      return;
+    }
+    const normalizedOldPath = (0, import_obsidian9.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian9.normalizePath)(file.path);
+    const targets = roomStore.getEntries().filter(
+      (entry) => !entry.deleted && entry.kind === "markdown" && (entry.path === oldServerPath || entry.path.startsWith(`${oldServerPath}/`))
+    ).map((entry) => {
+      const oldLocalPath = (0, import_obsidian9.normalizePath)(this.fileBridge.toLocalPath(room.workspaceId, entry.path) ?? entry.path);
+      if (oldLocalPath !== normalizedOldPath && !oldLocalPath.startsWith(`${normalizedOldPath}/`)) {
+        return null;
+      }
+      const relativeSuffix = oldLocalPath.slice(normalizedOldPath.length);
+      return {
+        entry,
+        localPath: `${normalizedNewPath}${relativeSuffix}`
+      };
+    }).filter((target) => target !== null);
+    if (targets.length === 0) {
+      return;
+    }
+    await this.fetchMarkdownTargetsFromBootstrap(
+      room.workspaceId,
+      targets,
+      "room-exit-content-sync",
+      false
+    );
+  }
+  async fetchMarkdownTargetsFromBootstrap(workspaceId, targets, reason, updateLocks) {
+    if (targets.length === 0) {
+      return;
+    }
+    const targetsByEntryId = new Map(
+      targets.map((target) => [target.entry.id, target])
+    );
+    const metadataResponse = await this.apiClient.getWorkspaceMarkdownBootstrap(workspaceId, {
+      entryIds: [...targetsByEntryId.keys()],
+      includeState: false
+    });
+    if (metadataResponse.encoding !== "base64") {
+      throw new Error(`Unsupported markdown bootstrap encoding: ${metadataResponse.encoding}`);
+    }
+    const metadataByEntryId = new Map(
+      metadataResponse.documents.map((document2) => [document2.entryId, document2])
+    );
+    const knownEntries = targets.map((target) => target.entry).filter((entry) => metadataByEntryId.has(entry.id));
+    if (knownEntries.length === 0) {
+      return;
+    }
+    const batches = this.buildMarkdownBootstrapBatches(knownEntries, metadataByEntryId);
+    let hydratedTargets = 0;
+    let changedStates = 0;
+    for (const batch of batches) {
+      const response = await this.apiClient.getWorkspaceMarkdownBootstrap(workspaceId, {
+        entryIds: batch.map((entry) => entry.id),
+        includeState: true
+      });
+      if (response.encoding !== "base64") {
+        throw new Error(`Unsupported markdown bootstrap encoding: ${response.encoding}`);
+      }
+      if (!response.includesState) {
+        throw new Error("Markdown bootstrap batch omitted state payloads.");
+      }
+      const responseByEntryId = new Map(
+        response.documents.map((document2) => [document2.entryId, document2])
+      );
+      for (const entry of batch) {
+        const target = targetsByEntryId.get(entry.id);
+        const document2 = responseByEntryId.get(entry.id);
+        if (!target || !document2?.state) {
+          continue;
+        }
+        const previousState = this.getPersistedCrdtState(entry.id);
+        const normalizedState = normalizeBootstrapState(document2.state);
+        if (this.persistCrdtStateIfChanged(entry.id, target.localPath, normalizedState)) {
+          changedStates += 1;
+        }
+        if (await this.hydrateMarkdownFileFromState(
+          workspaceId,
+          entry,
+          target.localPath,
+          normalizedState,
+          previousState
+        )) {
+          hydratedTargets += 1;
+        }
+        if (updateLocks && this.isLocalPathInDownloadedRoom(target.localPath, workspaceId)) {
+          await this.syncMarkdownLockForEntry(workspaceId, entry, target.localPath, normalizedState);
+        }
+      }
+    }
+    if (changedStates > 0 || hydratedTargets > 0) {
+      this.recordLog(
+        "crdt",
+        `[${workspaceId}] Refreshed ${hydratedTargets}/${targets.length} closed markdown document(s) via HTTP bootstrap (${reason}, ${changedStates} state update(s)).`
+      );
+    }
+  }
+  persistCrdtStateIfChanged(entryId, filePath, state) {
+    const existing = this.findPersistedCrdtCacheEntry(entryId);
+    if (existing && (0, import_obsidian9.normalizePath)(existing.filePath) === (0, import_obsidian9.normalizePath)(filePath) && areUint8ArraysEqual(decodeBase64(existing.encodedState), state)) {
+      return false;
+    }
+    this.persistCrdtState(entryId, filePath, state);
+    return true;
+  }
   getCrdtCacheKey(entryId) {
     const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl);
     return normalizedServerUrl ? `${normalizedServerUrl}::${entryId}` : entryId;
@@ -16538,6 +16748,8 @@ _RolayPlugin.LOG_FILE_NAME = "rolay-sync.log";
 _RolayPlugin.PENDING_CREATE_CONFIRMATION_TTL_MS = 6e4;
 _RolayPlugin.RECENT_REMOTE_PATH_TTL_MS = 3e4;
 _RolayPlugin.REMOTE_MARKDOWN_SETTLE_TTL_MS = 15e3;
+_RolayPlugin.ROOM_MARKDOWN_REFRESH_INTERVAL_MS = 5e3;
+_RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS = 1200;
 _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = 8;
 _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = 512 * 1024;
 var RolayPlugin = _RolayPlugin;
@@ -16779,6 +16991,17 @@ function formatByteCount(bytes) {
   }
   const digits = value >= 100 || unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
   return `${value.toFixed(digits)} ${units[unitIndex]}`;
+}
+function areUint8ArraysEqual(left, right) {
+  if (left.byteLength !== right.byteLength) {
+    return false;
+  }
+  for (let index = 0; index < left.byteLength; index += 1) {
+    if (left[index] !== right[index]) {
+      return false;
+    }
+  }
+  return true;
 }
 function compareCrdtCacheEntries(left, right) {
   return left.updatedAt.localeCompare(right.updatedAt);
