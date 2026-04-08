@@ -1212,6 +1212,7 @@ export default class RolayPlugin extends Plugin {
       onStatusChange: (status) => {
         runtime.streamStatus = status;
         this.updateStatusBar();
+        this.scheduleExplorerLoadingDecorations();
       },
       onError: (error) => {
         this.handleError(`Workspace event stream error (${room.workspace.id})`, error, false);
@@ -1232,6 +1233,7 @@ export default class RolayPlugin extends Plugin {
     runtime.eventStream = null;
     runtime.streamStatus = "stopped";
     this.updateStatusBar();
+    this.scheduleExplorerLoadingDecorations();
   }
 
   stopAllRoomEventStreams(): void {
@@ -2103,9 +2105,21 @@ export default class RolayPlugin extends Plugin {
       }
     }
 
+    const uploadingPaths = this.getUploadingMarkdownExplorerPaths();
+    const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
+
     const pathElements = container.querySelectorAll<HTMLElement>("[data-path]");
     for (const element of pathElements) {
-      element.classList.remove("rolay-loading-path", "rolay-loading-ancestor");
+      element.classList.remove(
+        "rolay-loading-path",
+        "rolay-loading-ancestor",
+        "rolay-uploading-path",
+        "rolay-uploading-ancestor",
+        "rolay-room-folder",
+        "rolay-room-folder-disconnected",
+        "rolay-room-folder-connecting",
+        "rolay-room-folder-connected"
+      );
 
       const dataPath = element.getAttribute("data-path");
       if (!dataPath) {
@@ -2117,6 +2131,11 @@ export default class RolayPlugin extends Plugin {
       const descendantMatch = !exactMatch && [...lockedPaths].some((lockedPath) => {
         return lockedPath.startsWith(`${normalizedPath}/`);
       });
+      const exactUploadingMatch = uploadingPaths.has(normalizedPath);
+      const descendantUploadingMatch = !exactUploadingMatch && [...uploadingPaths].some((uploadingPath) => {
+        return uploadingPath.startsWith(`${normalizedPath}/`);
+      });
+      const roomFolderStatus = roomFolderStatuses.get(normalizedPath) ?? null;
 
       if (exactMatch || descendantMatch) {
         element.classList.add("rolay-loading-path");
@@ -2125,7 +2144,58 @@ export default class RolayPlugin extends Plugin {
       if (descendantMatch) {
         element.classList.add("rolay-loading-ancestor");
       }
+
+      if (exactUploadingMatch || descendantUploadingMatch) {
+        element.classList.add("rolay-uploading-path");
+      }
+
+      if (descendantUploadingMatch) {
+        element.classList.add("rolay-uploading-ancestor");
+      }
+
+      if (roomFolderStatus) {
+        element.classList.add("rolay-room-folder");
+        if (roomFolderStatus === "open") {
+          element.classList.add("rolay-room-folder-connected");
+        } else if (roomFolderStatus === "stopped") {
+          element.classList.add("rolay-room-folder-disconnected");
+        } else {
+          element.classList.add("rolay-room-folder-connecting");
+        }
+      }
     }
+  }
+
+  private getUploadingMarkdownExplorerPaths(): Set<string> {
+    const uploadingPaths = new Set<string>();
+
+    for (const pendingCreate of Object.values(this.data.pendingMarkdownCreates)) {
+      uploadingPaths.add(normalizePath(pendingCreate.localPath));
+    }
+
+    for (const pendingMerge of Object.values(this.data.pendingMarkdownMerges)) {
+      uploadingPaths.add(normalizePath(pendingMerge.localPath));
+    }
+
+    return uploadingPaths;
+  }
+
+  private getRoomFolderExplorerStatuses(): Map<string, WorkspaceEventStreamStatus> {
+    const statuses = new Map<string, WorkspaceEventStreamStatus>();
+
+    for (const room of this.getDownloadedRooms()) {
+      const roomRoot = getRoomRoot(this.data.settings.syncRoot, room.folderName);
+      if (!roomRoot) {
+        continue;
+      }
+
+      statuses.set(
+        normalizePath(roomRoot),
+        this.roomRuntime.get(room.workspaceId)?.streamStatus ?? "stopped"
+      );
+    }
+
+    return statuses;
   }
 
   private async revertLockedMarkdownRename(file: TAbstractFile, oldPath: string): Promise<boolean> {
@@ -2919,6 +2989,7 @@ export default class RolayPlugin extends Plugin {
 
     if (!nextServerPath) {
       this.schedulePersist();
+      this.scheduleExplorerLoadingDecorations();
       this.recordLog(
         "ops",
         `[${pendingCreate.workspaceId}] Cleared pending markdown create for ${normalizedOldPath} because it moved outside the downloaded room.`
@@ -2932,6 +3003,7 @@ export default class RolayPlugin extends Plugin {
       serverPath: nextServerPath
     };
     this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
   }
 
   private handlePendingMarkdownMergeRename(oldPath: string, newPath: string): void {
@@ -2969,6 +3041,7 @@ export default class RolayPlugin extends Plugin {
 
     if (changed) {
       this.schedulePersist();
+      this.scheduleExplorerLoadingDecorations();
     }
   }
 
@@ -2980,6 +3053,7 @@ export default class RolayPlugin extends Plugin {
 
     delete this.data.pendingMarkdownCreates[normalizedLocalPath];
     this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
   }
 
   private clearPendingMarkdownMergesForLocalPath(localPath: string): void {
@@ -2996,6 +3070,7 @@ export default class RolayPlugin extends Plugin {
 
     if (changed) {
       this.schedulePersist();
+      this.scheduleExplorerLoadingDecorations();
     }
   }
 
@@ -3012,6 +3087,7 @@ export default class RolayPlugin extends Plugin {
 
     if (changed) {
       this.schedulePersist();
+      this.scheduleExplorerLoadingDecorations();
     }
   }
 
@@ -3028,6 +3104,7 @@ export default class RolayPlugin extends Plugin {
 
     if (changed) {
       this.schedulePersist();
+      this.scheduleExplorerLoadingDecorations();
     }
   }
 
@@ -3049,6 +3126,7 @@ export default class RolayPlugin extends Plugin {
       lastError: errorMessage
     };
     this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
 
     this.recordLog(
       "ops",
@@ -3076,6 +3154,7 @@ export default class RolayPlugin extends Plugin {
       lastError: error ? (error instanceof Error ? error.message : String(error)) : null
     };
     this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
   }
 
   private clearPendingMarkdownMerge(entryId: string): void {
@@ -3085,6 +3164,7 @@ export default class RolayPlugin extends Plugin {
 
     delete this.data.pendingMarkdownMerges[entryId];
     this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
   }
 
   private shouldDropPendingMarkdownCreateAsRemoteEcho(
