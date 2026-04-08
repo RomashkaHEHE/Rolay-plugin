@@ -3,7 +3,7 @@ import * as Y from "yjs";
 import { RolayApiClient, RolayApiError } from "./api/client";
 import { FileBridge } from "./obsidian/file-bridge";
 import { createMarkdownTextState, CrdtSessionManager } from "./realtime/crdt-session";
-import { createSharedPresenceExtension } from "./realtime/shared-presence";
+import { createSharedPresenceExtension, getMarkdownViewsForFile } from "./realtime/shared-presence";
 import {
   getRoomBindingSettings,
   ROLAY_AUTO_CONNECT,
@@ -23,6 +23,7 @@ import {
 import { RolaySettingTab } from "./settings/tab";
 import { WorkspaceEventStream, type WorkspaceEventStreamStatus } from "./sync/event-stream";
 import { OperationsQueue, RolayOperationError } from "./sync/operations";
+import { SettingsEventStream } from "./sync/settings-stream";
 import {
   getRoomRoot,
   isValidRoomFolderName,
@@ -37,9 +38,12 @@ import type {
   CreateRoomRequest,
   FileEntry,
   InviteState,
+  MarkdownBootstrapDocument,
   ManagedUser,
   RoomListItem,
   RoomMember,
+  SettingsEventEnvelope,
+  SettingsStreamEvent,
   User
 } from "./types/protocol";
 import { openTextInputModal } from "./ui/text-input-modal";
@@ -50,6 +54,8 @@ interface RoomRuntimeState {
   eventStream: WorkspaceEventStream | null;
   streamStatus: WorkspaceEventStreamStatus;
   snapshotRefreshHandle: number | null;
+  lockedBootstrapRetryHandle: number | null;
+  lockedBootstrapRetryAttempt: number;
   markdownBootstrap: RoomMarkdownBootstrapState;
 }
 
@@ -57,6 +63,10 @@ interface RoomMarkdownBootstrapState {
   status: "idle" | "loading" | "ready" | "error";
   totalTargets: number;
   completedTargets: number;
+  totalBytes: number;
+  completedBytes: number;
+  hydratedTargets: number;
+  lockedLocalPaths: Set<string>;
   lastRunAt: string | null;
   lastError: string | null;
   rerunRequested: boolean;
@@ -107,6 +117,9 @@ export default class RolayPlugin extends Plugin {
   private static readonly LOG_FILE_NAME = "rolay-sync.log";
   private static readonly PENDING_CREATE_CONFIRMATION_TTL_MS = 60_000;
   private static readonly RECENT_REMOTE_PATH_TTL_MS = 30_000;
+  private static readonly REMOTE_MARKDOWN_SETTLE_TTL_MS = 15_000;
+  private static readonly MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = 8;
+  private static readonly MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = 512 * 1024;
   private data!: RolayPluginData;
   private apiClient!: RolayApiClient;
   private crdtManager!: CrdtSessionManager;
@@ -117,7 +130,9 @@ export default class RolayPlugin extends Plugin {
   private readonly pendingLocalCreates = new Map<string, number>();
   private readonly pendingLocalDeletes = new Set<string>();
   private readonly recentRemoteObservedPaths = new Map<string, number>();
+  private readonly pendingRemoteMarkdownSettles = new Map<string, number>();
   private persistHandle: number | null = null;
+  private explorerDecorationHandle: number | null = null;
   private statusBarEl!: HTMLElement;
   private roomList: RoomListItem[] = [];
   private adminRoomList: AdminRoomListItem[] = [];
@@ -127,6 +142,11 @@ export default class RolayPlugin extends Plugin {
   private logFlushHandle: number | null = null;
   private logFileWrite = Promise.resolve();
   private readonly pendingLogLines: string[] = [];
+  private settingsTab!: RolaySettingTab;
+  private settingsEventStream: SettingsEventStream | null = null;
+  private settingsEventCursor: number | null = null;
+  private settingsEventStreamStatus: WorkspaceEventStreamStatus = "stopped";
+  private settingsStreamRecoveryInFlight = false;
   private profileDraftDisplayName = "";
   private passwordChangeDraft: PasswordChangeDraft = {
     currentPassword: "",
@@ -158,6 +178,9 @@ export default class RolayPlugin extends Plugin {
       getSession: () => this.data.session,
       saveSession: async (session) => {
         this.data.session = session;
+        if (!session) {
+          this.stopSettingsEventStream();
+        }
         await this.persistNow();
         this.updateStatusBar();
       }
@@ -206,7 +229,8 @@ export default class RolayPlugin extends Plugin {
     this.statusBarEl = this.addStatusBarItem();
     this.updateStatusBar();
 
-    this.addSettingTab(new RolaySettingTab(this.app, this));
+    this.settingsTab = new RolaySettingTab(this.app, this);
+    this.addSettingTab(this.settingsTab);
     this.registerCommands();
 
     this.registerEvent(
@@ -219,6 +243,11 @@ export default class RolayPlugin extends Plugin {
         if (info instanceof MarkdownView) {
           this.crdtManager.handleEditorChange(editor, info);
         }
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => {
+        this.scheduleExplorerLoadingDecorations();
       })
     );
     this.registerEvent(
@@ -238,8 +267,13 @@ export default class RolayPlugin extends Plugin {
     );
 
     this.register(() => {
+      this.stopSettingsEventStream();
       if (this.persistHandle !== null) {
         window.clearTimeout(this.persistHandle);
+      }
+
+      if (this.explorerDecorationHandle !== null) {
+        window.clearTimeout(this.explorerDecorationHandle);
       }
 
       if (this.logFlushHandle !== null) {
@@ -250,7 +284,15 @@ export default class RolayPlugin extends Plugin {
         if (runtime.snapshotRefreshHandle !== null) {
           window.clearTimeout(runtime.snapshotRefreshHandle);
         }
+        if (runtime.lockedBootstrapRetryHandle !== null) {
+          window.clearTimeout(runtime.lockedBootstrapRetryHandle);
+        }
       }
+
+      for (const handle of this.pendingRemoteMarkdownSettles.values()) {
+        window.clearTimeout(handle);
+      }
+      this.pendingRemoteMarkdownSettles.clear();
     });
 
     this.recordLog("plugin", "Rolay plugin loaded.");
@@ -259,6 +301,7 @@ export default class RolayPlugin extends Plugin {
   }
 
   override async onunload(): Promise<void> {
+    this.stopSettingsEventStream();
     this.stopAllRoomEventStreams();
     await this.crdtManager.disconnect();
     await this.persistNow();
@@ -321,6 +364,7 @@ export default class RolayPlugin extends Plugin {
   setAdminSelectedRoomId(roomId: string): void {
     this.adminSelectedRoomId = roomId.trim();
     this.adminRoomMembers = [];
+    this.requestSettingsRender();
   }
 
   getAdminRoomMembers(): RoomMember[] {
@@ -423,6 +467,56 @@ export default class RolayPlugin extends Plugin {
     };
   }
 
+  requestSettingsRender(): void {
+    this.settingsTab?.requestRender();
+  }
+
+  async activateSettingsPanelRealtime(): Promise<void> {
+    if (!this.getCurrentUser()) {
+      this.stopSettingsEventStream();
+      this.requestSettingsRender();
+      return;
+    }
+
+    await this.loadSettingsPanelSnapshot();
+    this.startSettingsEventStream(null);
+  }
+
+  deactivateSettingsPanelRealtime(): void {
+    this.stopSettingsEventStream();
+    this.requestSettingsRender();
+  }
+
+  async loadSettingsPanelSnapshot(): Promise<void> {
+    if (!this.getCurrentUser()) {
+      this.requestSettingsRender();
+      return;
+    }
+
+    try {
+      await this.fetchCurrentUser(false, false);
+    } catch (error) {
+      this.handleError("Settings initial load failed", error, false);
+      return;
+    }
+
+    try {
+      await this.refreshOwnerRoomInvites(false);
+    } catch (error) {
+      this.handleError("Invite auto-refresh failed", error, false);
+    }
+
+    if (this.getCurrentUser()?.isAdmin && this.adminSelectedRoomId) {
+      try {
+        await this.refreshAdminRoomMembers(false, this.adminSelectedRoomId, false);
+      } catch (error) {
+        this.handleError("Admin room members auto-refresh failed", error, false);
+      }
+    }
+
+    this.requestSettingsRender();
+  }
+
   async updateSettings(update: Partial<RolayPluginSettings>): Promise<void> {
     this.data.settings = {
       ...this.data.settings,
@@ -497,6 +591,7 @@ export default class RolayPlugin extends Plugin {
   }
 
   async logout(): Promise<void> {
+    this.stopSettingsEventStream();
     this.stopAllRoomEventStreams();
     await this.crdtManager.disconnect();
     this.roomRuntime.clear();
@@ -517,11 +612,13 @@ export default class RolayPlugin extends Plugin {
     this.updateStatusBar();
   }
 
-  async fetchCurrentUser(showNotice = false): Promise<User> {
+  async fetchCurrentUser(showNotice = false, logActivity = true): Promise<User> {
     const response = await this.apiClient.getCurrentUser();
     await this.applySessionUser(response.user);
-    await this.refreshPostAuthState();
-    this.recordLog("auth", `Loaded current user ${response.user.username}.`);
+    await this.refreshPostAuthState(logActivity);
+    if (logActivity) {
+      this.recordLog("auth", `Loaded current user ${response.user.username}.`);
+    }
     if (showNotice) {
       new Notice(`Current Rolay user: ${response.user.displayName}`);
     }
@@ -600,13 +697,15 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
-  async refreshRooms(showNotice = false): Promise<RoomListItem[]> {
+  async refreshRooms(showNotice = false, logActivity = true): Promise<RoomListItem[]> {
     const response = await this.apiClient.listRooms();
     this.roomList = [...response.workspaces].sort(compareRoomsByName);
     await this.reconcileDownloadedRooms();
     await this.reconcileLocalRoomFolders();
     this.reconcileInviteCache();
-    this.recordLog("rooms", `Loaded ${this.roomList.length} room(s).`);
+    if (logActivity) {
+      this.recordLog("rooms", `Loaded ${this.roomList.length} room(s).`);
+    }
     if (showNotice) {
       new Notice(`Loaded ${this.roomList.length} Rolay room(s).`);
     }
@@ -814,12 +913,14 @@ export default class RolayPlugin extends Plugin {
     new Notice(`Rolay room folder renamed to ${nextFolderName}.`);
   }
 
-  async refreshRoomInvite(workspaceId: string, showNotice = true): Promise<InviteState> {
+  async refreshRoomInvite(workspaceId: string, showNotice = true, logActivity = true): Promise<InviteState> {
     const room = this.requireOwnerRoom(workspaceId);
     const response = await this.apiClient.getRoomInvite(room.workspace.id);
     this.roomInvites.set(room.workspace.id, response.invite);
     this.patchInviteEnabled(room.workspace.id, response.invite.enabled);
-    this.recordLog("invite", `Loaded invite state for ${room.workspace.id}.`);
+    if (logActivity) {
+      this.recordLog("invite", `Loaded invite state for ${room.workspace.id}.`);
+    }
     if (showNotice) {
       new Notice(`Invite key loaded for ${room.workspace.name}.`);
     }
@@ -856,11 +957,13 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
-  async refreshManagedUsers(showNotice = false): Promise<ManagedUser[]> {
+  async refreshManagedUsers(showNotice = false, logActivity = true): Promise<ManagedUser[]> {
     this.requireAdmin();
     const response = await this.apiClient.listManagedUsers();
     this.managedUsers = [...response.users].sort((left, right) => left.username.localeCompare(right.username));
-    this.recordLog("admin", `Loaded ${this.managedUsers.length} managed user(s).`);
+    if (logActivity) {
+      this.recordLog("admin", `Loaded ${this.managedUsers.length} managed user(s).`);
+    }
     if (showNotice) {
       new Notice(`Loaded ${this.managedUsers.length} managed user(s).`);
     }
@@ -916,7 +1019,7 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
-  async refreshAdminRooms(showNotice = false): Promise<AdminRoomListItem[]> {
+  async refreshAdminRooms(showNotice = false, logActivity = true): Promise<AdminRoomListItem[]> {
     this.requireAdmin();
     const response = await this.apiClient.listAllRoomsAsAdmin();
     this.adminRoomList = [...response.workspaces].sort(compareRoomsByName);
@@ -931,7 +1034,9 @@ export default class RolayPlugin extends Plugin {
       this.adminRoomMembers = [];
     }
 
-    this.recordLog("admin", `Loaded ${this.adminRoomList.length} room(s) in admin scope.`);
+    if (logActivity) {
+      this.recordLog("admin", `Loaded ${this.adminRoomList.length} room(s) in admin scope.`);
+    }
     if (showNotice) {
       new Notice(`Loaded ${this.adminRoomList.length} admin room(s).`);
     }
@@ -940,7 +1045,8 @@ export default class RolayPlugin extends Plugin {
 
   async refreshAdminRoomMembers(
     showNotice = false,
-    roomId = this.adminSelectedRoomId
+    roomId = this.adminSelectedRoomId,
+    logActivity = true
   ): Promise<RoomMember[]> {
     this.requireAdmin();
 
@@ -952,7 +1058,9 @@ export default class RolayPlugin extends Plugin {
     const response = await this.apiClient.listRoomMembersAsAdmin(targetRoomId);
     this.adminSelectedRoomId = targetRoomId;
     this.adminRoomMembers = [...response.members].sort(compareRoomMembers);
-    this.recordLog("admin", `Loaded ${this.adminRoomMembers.length} member(s) for room ${targetRoomId}.`);
+    if (logActivity) {
+      this.recordLog("admin", `Loaded ${this.adminRoomMembers.length} member(s) for room ${targetRoomId}.`);
+    }
     if (showNotice) {
       new Notice(`Loaded ${this.adminRoomMembers.length} room member(s).`);
     }
@@ -1098,6 +1206,7 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
+    this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
     this.cancelRoomMarkdownBootstrap(workspaceId);
     runtime.eventStream?.stop();
     runtime.eventStream = null;
@@ -1111,10 +1220,129 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
+  private startSettingsEventStream(cursor: number | null): void {
+    this.stopSettingsEventStream();
+
+    if (!this.getCurrentUser()) {
+      return;
+    }
+
+    this.settingsEventCursor = cursor;
+    const stream = new SettingsEventStream(this.apiClient, (message) => {
+      this.recordLog("settings-sse", message);
+    });
+    this.settingsEventStream = stream;
+
+    stream.start(cursor, {
+      onOpen: () => {
+        this.recordLog("settings-sse", "Subscribed to settings events.");
+      },
+      onEvent: async (event) => {
+        await this.handleSettingsEventStreamEvent(event);
+      },
+      onStatusChange: (status) => {
+        this.settingsEventStreamStatus = status;
+        this.updateStatusBar();
+      },
+      onError: (error) => {
+        this.handleError("Settings event stream error", error, false);
+        if (this.shouldRecoverSettingsStream(error)) {
+          void this.recoverSettingsEventStream();
+        }
+      }
+    });
+  }
+
+  private stopSettingsEventStream(): void {
+    this.settingsEventStream?.stop();
+    this.settingsEventStream = null;
+    this.settingsEventStreamStatus = "stopped";
+  }
+
+  private async handleSettingsEventStreamEvent(event: SettingsStreamEvent): Promise<void> {
+    const envelope = normalizeSettingsEventEnvelope(event);
+    const eventId = event.id > 0 ? event.id : envelope.eventId;
+    if (Number.isFinite(eventId) && eventId > 0) {
+      this.settingsEventCursor = eventId;
+    }
+
+    if (envelope.type === "ping") {
+      return;
+    }
+
+    if (envelope.type === "stream.ready") {
+      this.recordLog("settings-sse", `Settings stream ready at event ${this.settingsEventCursor ?? envelope.eventId}.`);
+      this.requestSettingsRender();
+      return;
+    }
+
+    this.recordLog(
+      "settings-sse",
+      `Event ${this.settingsEventCursor ?? envelope.eventId}: ${envelope.type} (${envelope.scope}).`
+    );
+
+    switch (envelope.type) {
+      case "auth.me.updated":
+        await this.applySettingsUserUpdate(extractUserFromSettingsPayload(envelope.payload));
+        break;
+      case "room.created":
+      case "room.updated":
+        await this.applySettingsRoomUpsert(envelope.scope, envelope.payload);
+        break;
+      case "room.deleted":
+        await this.applySettingsRoomDelete(envelope.scope, envelope.payload);
+        break;
+      case "room.membership.changed":
+        await this.applySettingsRoomMembershipChanged(envelope.payload);
+        break;
+      case "room.invite.updated":
+        this.applySettingsInviteUpdate(extractInviteFromSettingsPayload(envelope.payload));
+        break;
+      case "admin.user.created":
+      case "admin.user.updated":
+        this.applySettingsManagedUserUpsert(extractManagedUserFromSettingsPayload(envelope.payload));
+        break;
+      case "admin.user.deleted":
+        this.applySettingsManagedUserDelete(extractUserIdFromSettingsPayload(envelope.payload));
+        break;
+      case "admin.room.members.updated":
+        this.applySettingsAdminRoomMembersUpdate(extractAdminRoomMembersPayload(envelope.payload));
+        break;
+      default:
+        break;
+    }
+
+    this.requestSettingsRender();
+  }
+
+  private async recoverSettingsEventStream(): Promise<void> {
+    if (this.settingsStreamRecoveryInFlight) {
+      return;
+    }
+
+    this.settingsStreamRecoveryInFlight = true;
+    try {
+      this.recordLog("settings-sse", "Settings SSE resume was reset. Refetching settings snapshot.");
+      this.stopSettingsEventStream();
+      this.settingsEventCursor = null;
+      await this.loadSettingsPanelSnapshot();
+      if (this.getCurrentUser()) {
+        this.startSettingsEventStream(null);
+      }
+    } finally {
+      this.settingsStreamRecoveryInFlight = false;
+    }
+  }
+
+  private shouldRecoverSettingsStream(error: Error): boolean {
+    return /HTTP (400|404|409|410)\b/.test(error.message);
+  }
+
   async bindActiveMarkdownToCrdt(): Promise<void> {
     try {
       const activeFile = this.app.workspace.getActiveFile();
       await this.crdtManager.bindToFile(activeFile);
+      await this.syncMarkdownLockForLocalPath(activeFile?.path ?? null);
       this.updateStatusBar();
     } catch (error) {
       this.handleError("CRDT bind failed", error);
@@ -1218,11 +1446,19 @@ export default class RolayPlugin extends Plugin {
 
   private async handleFileOpen(file: TFile | null): Promise<void> {
     await this.crdtManager.bindToFile(file);
+    if (file && this.findLockedMarkdownPathAtOrBelow(file.path)) {
+      const room = this.resolveDownloadedRoomByLocalPath(file.path);
+      if (room) {
+        this.scheduleSnapshotRefresh(room.workspaceId, "priority-open");
+      }
+    }
+    await this.syncMarkdownLockForLocalPath(file?.path ?? null);
     this.updateStatusBar();
   }
 
   private async handleVaultCreate(file: TAbstractFile): Promise<void> {
     try {
+      this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       await this.fileBridge.handleVaultCreate(file);
     } catch (error) {
       this.handleError(`Local create sync failed for ${file.path}`, error, false);
@@ -1231,6 +1467,13 @@ export default class RolayPlugin extends Plugin {
 
   private async handleVaultRename(file: TAbstractFile, oldPath: string): Promise<void> {
     try {
+      if (await this.revertLockedMarkdownRename(file, oldPath)) {
+        await this.bindActiveMarkdownToCrdt();
+        return;
+      }
+
+      this.forgetRecentRemoteHintsForLocalPath(oldPath, true);
+      this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       this.handlePendingMarkdownCreateRename(oldPath, file.path);
       this.handlePendingMarkdownMergeRename(oldPath, file.path);
       await this.fileBridge.handleVaultRename(file, oldPath);
@@ -1242,6 +1485,12 @@ export default class RolayPlugin extends Plugin {
 
   private async handleVaultDelete(file: TAbstractFile): Promise<void> {
     try {
+      if (await this.restoreLockedMarkdownDelete(file)) {
+        await this.bindActiveMarkdownToCrdt();
+        return;
+      }
+
+      this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       this.clearPendingMarkdownCreate(file.path);
       this.clearPendingMarkdownMergesForLocalPath(file.path);
       if (await this.handlePotentialRoomRootRemoval(file.path, "delete")) {
@@ -1255,22 +1504,22 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
-  private async refreshPostAuthState(): Promise<void> {
+  private async refreshPostAuthState(logActivity = true): Promise<void> {
     try {
-      await this.refreshRooms(false);
+      await this.refreshRooms(false, logActivity);
     } catch (error) {
       this.handleError("Room list refresh failed", error, false);
     }
 
     if (this.data.session?.user?.isAdmin) {
       try {
-        await this.refreshManagedUsers(false);
+        await this.refreshManagedUsers(false, logActivity);
       } catch (error) {
         this.handleError("Admin user list refresh failed", error, false);
       }
 
       try {
-        await this.refreshAdminRooms(false);
+        await this.refreshAdminRooms(false, logActivity);
       } catch (error) {
         this.handleError("Admin room list refresh failed", error, false);
       }
@@ -1480,7 +1729,7 @@ export default class RolayPlugin extends Plugin {
     const room = this.requireRoom(workspaceId);
     const binding = this.getStoredRoomBinding(workspaceId);
     if (!binding?.downloaded) {
-      throw this.notifyError("Download the room folder first.");
+      throw new Error("Download the room folder first.");
     }
 
     return room;
@@ -1538,10 +1787,16 @@ export default class RolayPlugin extends Plugin {
       eventStream: null,
       streamStatus: "stopped",
       snapshotRefreshHandle: null,
+      lockedBootstrapRetryHandle: null,
+      lockedBootstrapRetryAttempt: 0,
       markdownBootstrap: {
         status: "idle",
         totalTargets: 0,
         completedTargets: 0,
+        totalBytes: 0,
+        completedBytes: 0,
+        hydratedTargets: 0,
+        lockedLocalPaths: new Set<string>(),
         lastRunAt: null,
         lastError: null,
         rerunRequested: false,
@@ -1554,6 +1809,350 @@ export default class RolayPlugin extends Plugin {
 
   private getRoomStore(workspaceId: string): TreeStore | null {
     return this.roomRuntime.get(workspaceId)?.treeStore ?? null;
+  }
+
+  private resolveDownloadedRoomByLocalPath(localPath: string): DownloadedRoomDescriptor | null {
+    const downloadedRooms = this.getDownloadedRooms().sort(
+      (left, right) => right.folderName.length - left.folderName.length
+    );
+
+    for (const room of downloadedRooms) {
+      if (toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName) !== null) {
+        return room;
+      }
+    }
+
+    return null;
+  }
+
+  private findLockedMarkdownPathAtOrBelow(
+    localPath: string
+  ): { workspaceId: string; lockedPath: string } | null {
+    const normalizedLocalPath = normalizePath(localPath);
+
+    for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
+      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
+        if (
+          lockedPath === normalizedLocalPath ||
+          lockedPath.startsWith(`${normalizedLocalPath}/`) ||
+          normalizedLocalPath.startsWith(`${lockedPath}/`)
+        ) {
+          return {
+            workspaceId,
+            lockedPath
+          };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private async shouldKeepMarkdownLocked(
+    workspaceId: string,
+    entry: FileEntry,
+    localPath: string,
+    persistedState: Uint8Array | null = null
+  ): Promise<boolean> {
+    const normalizedLocalPath = normalizePath(localPath);
+    const waitingForRemoteSettle = this.isWaitingForRemoteMarkdownSettle(workspaceId, normalizedLocalPath);
+    const activeCrdtState = this.crdtManager.getState();
+    if (
+      activeCrdtState?.entryId === entry.id &&
+      (activeCrdtState.status === "synced" || activeCrdtState.status === "offline")
+    ) {
+      return false;
+    }
+
+    if (this.hasPendingLocalCreate(workspaceId, entry.path)) {
+      return true;
+    }
+
+    if (this.data.pendingMarkdownCreates[normalizedLocalPath]) {
+      return true;
+    }
+
+    if (this.data.pendingMarkdownMerges[entry.id]) {
+      return true;
+    }
+
+    const localFile = this.app.vault.getAbstractFileByPath(normalizedLocalPath);
+    if (!(localFile instanceof TFile) || localFile.extension !== "md") {
+      return true;
+    }
+
+    const nextState = persistedState ?? this.getPersistedCrdtState(entry.id);
+    if (!nextState) {
+      return true;
+    }
+
+    const openViews = getMarkdownViewsForFile(this.app, normalizedLocalPath);
+    const currentText = openViews.length > 0
+      ? openViews[0].editor.getValue()
+      : await this.app.vault.cachedRead(localFile);
+    const expectedText = decodeMarkdownTextState(nextState);
+
+    if (waitingForRemoteSettle && expectedText.length === 0) {
+      return true;
+    }
+
+    return currentText !== expectedText;
+  }
+
+  private async refreshRoomMarkdownLocks(workspaceId: string, entries: FileEntry[]): Promise<void> {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+
+    runtime.markdownBootstrap.lockedLocalPaths.clear();
+    for (const entry of entries) {
+      if (entry.deleted || entry.kind !== "markdown") {
+        continue;
+      }
+
+      const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
+      if (await this.shouldKeepMarkdownLocked(workspaceId, entry, localPath)) {
+        runtime.markdownBootstrap.lockedLocalPaths.add(normalizePath(localPath));
+      }
+    }
+
+    if (runtime.markdownBootstrap.lockedLocalPaths.size === 0) {
+      this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
+    } else if (runtime.markdownBootstrap.status !== "loading") {
+      this.scheduleLockedMarkdownBootstrapRetry(workspaceId, "locked-retry");
+    }
+
+    this.scheduleExplorerLoadingDecorations();
+  }
+
+  private async syncMarkdownLockForEntry(
+    workspaceId: string,
+    entry: FileEntry,
+    localPath: string,
+    persistedState: Uint8Array | null = null
+  ): Promise<void> {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+
+    const normalizedLocalPath = normalizePath(localPath);
+    if (await this.shouldKeepMarkdownLocked(workspaceId, entry, normalizedLocalPath, persistedState)) {
+      runtime.markdownBootstrap.lockedLocalPaths.add(normalizedLocalPath);
+    } else {
+      runtime.markdownBootstrap.lockedLocalPaths.delete(normalizedLocalPath);
+      this.clearPendingRemoteMarkdownSettle(workspaceId, normalizedLocalPath);
+    }
+
+    if (runtime.markdownBootstrap.lockedLocalPaths.size === 0) {
+      this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
+    } else if (runtime.markdownBootstrap.status !== "loading") {
+      this.scheduleLockedMarkdownBootstrapRetry(workspaceId, "locked-retry");
+    }
+
+    this.scheduleExplorerLoadingDecorations();
+  }
+
+  private async syncMarkdownLockForLocalPath(localPath: string | null): Promise<void> {
+    if (!localPath) {
+      this.scheduleExplorerLoadingDecorations();
+      return;
+    }
+
+    const room = this.resolveDownloadedRoomByLocalPath(localPath);
+    if (!room) {
+      this.scheduleExplorerLoadingDecorations();
+      return;
+    }
+
+    const serverPath = toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName);
+    if (!serverPath) {
+      this.scheduleExplorerLoadingDecorations();
+      return;
+    }
+
+    const entry = this.getRoomStore(room.workspaceId)?.getEntryByPath(serverPath) ?? null;
+    if (!entry || entry.kind !== "markdown" || entry.deleted) {
+      this.scheduleExplorerLoadingDecorations();
+      return;
+    }
+
+    await this.syncMarkdownLockForEntry(room.workspaceId, entry, localPath);
+  }
+
+  private scheduleExplorerLoadingDecorations(): void {
+    if (this.explorerDecorationHandle !== null) {
+      return;
+    }
+
+    this.explorerDecorationHandle = window.setTimeout(() => {
+      this.explorerDecorationHandle = null;
+      this.refreshExplorerLoadingDecorations();
+    }, 80);
+  }
+
+  private refreshExplorerLoadingDecorations(): void {
+    const container = this.app.workspace.containerEl;
+    if (!container) {
+      return;
+    }
+
+    const lockedPaths = new Set<string>();
+    for (const runtime of this.roomRuntime.values()) {
+      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
+        lockedPaths.add(lockedPath);
+      }
+    }
+
+    const pathElements = container.querySelectorAll<HTMLElement>("[data-path]");
+    for (const element of pathElements) {
+      element.classList.remove("rolay-loading-path", "rolay-loading-ancestor");
+
+      const dataPath = element.getAttribute("data-path");
+      if (!dataPath) {
+        continue;
+      }
+
+      const normalizedPath = normalizePath(dataPath);
+      const exactMatch = lockedPaths.has(normalizedPath);
+      const descendantMatch = !exactMatch && [...lockedPaths].some((lockedPath) => {
+        return lockedPath.startsWith(`${normalizedPath}/`);
+      });
+
+      if (exactMatch || descendantMatch) {
+        element.classList.add("rolay-loading-path");
+      }
+
+      if (descendantMatch) {
+        element.classList.add("rolay-loading-ancestor");
+      }
+    }
+  }
+
+  private async revertLockedMarkdownRename(file: TAbstractFile, oldPath: string): Promise<boolean> {
+    const blocked = this.findLockedMarkdownPathAtOrBelow(oldPath);
+    if (!blocked) {
+      return false;
+    }
+
+    this.recordLog(
+      "crdt",
+      `[${blocked.workspaceId}] Reverted local move/rename for ${oldPath} because ${blocked.lockedPath} is still loading and protected.`
+    );
+    new Notice("Rolay is still loading this markdown note. Move and rename are blocked until download finishes.");
+
+    if (file.path === oldPath) {
+      this.scheduleExplorerLoadingDecorations();
+      return true;
+    }
+
+    const currentFile = this.app.vault.getAbstractFileByPath(file.path);
+    if (!currentFile) {
+      this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-locked-rename");
+      return true;
+    }
+
+    try {
+      await this.fileBridge.runWithSuppressedPaths([oldPath, file.path], async () => {
+        await this.app.fileManager.renameFile(currentFile, oldPath);
+      });
+    } catch (error) {
+      this.recordLog(
+        "crdt",
+        `[${blocked.workspaceId}] Failed to revert locked rename for ${oldPath}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+      this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-locked-rename");
+    }
+
+    this.scheduleExplorerLoadingDecorations();
+    return true;
+  }
+
+  private async restoreLockedMarkdownDelete(file: TAbstractFile): Promise<boolean> {
+    const blocked = this.findLockedMarkdownPathAtOrBelow(file.path);
+    if (!blocked) {
+      return false;
+    }
+
+    this.recordLog(
+      "crdt",
+      `[${blocked.workspaceId}] Ignored local delete for ${file.path} because ${blocked.lockedPath} is still loading and protected.`
+    );
+    new Notice("Rolay is still loading this markdown note. Delete is blocked until download finishes.");
+    await this.refreshRoomSnapshot(blocked.workspaceId, "restore-locked-delete");
+    this.scheduleExplorerLoadingDecorations();
+    return true;
+  }
+
+  private clearLockedMarkdownBootstrapRetry(workspaceId: string, resetAttempt = true): void {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+
+    if (runtime.lockedBootstrapRetryHandle !== null) {
+      window.clearTimeout(runtime.lockedBootstrapRetryHandle);
+      runtime.lockedBootstrapRetryHandle = null;
+    }
+
+    if (resetAttempt) {
+      runtime.lockedBootstrapRetryAttempt = 0;
+    }
+  }
+
+  private scheduleLockedMarkdownBootstrapRetry(workspaceId: string, reason: string): void {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+
+    if (runtime.markdownBootstrap.lockedLocalPaths.size === 0) {
+      this.clearLockedMarkdownBootstrapRetry(workspaceId);
+      return;
+    }
+
+    if (runtime.lockedBootstrapRetryHandle !== null) {
+      return;
+    }
+
+    const retryDelays = [1000, 2000, 4000, 8000];
+    const delay = retryDelays[Math.min(runtime.lockedBootstrapRetryAttempt, retryDelays.length - 1)];
+    runtime.lockedBootstrapRetryHandle = window.setTimeout(() => {
+      runtime.lockedBootstrapRetryHandle = null;
+      runtime.lockedBootstrapRetryAttempt = Math.min(
+        runtime.lockedBootstrapRetryAttempt + 1,
+        retryDelays.length - 1
+      );
+
+      const currentRuntime = this.roomRuntime.get(workspaceId);
+      const roomBinding = this.getStoredRoomBinding(workspaceId);
+      if (!currentRuntime || !roomBinding?.downloaded) {
+        return;
+      }
+
+      const lockedEntries = currentRuntime.treeStore.getEntries().filter((entry) => {
+        if (entry.deleted || entry.kind !== "markdown") {
+          return false;
+        }
+
+        const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
+        return currentRuntime.markdownBootstrap.lockedLocalPaths.has(normalizePath(localPath));
+      });
+
+      if (lockedEntries.length === 0) {
+        this.clearLockedMarkdownBootstrapRetry(workspaceId);
+        return;
+      }
+
+      void this.bootstrapRoomMarkdownCache(
+        workspaceId,
+        lockedEntries,
+        reason,
+        currentRuntime.treeStore.getEntries()
+      );
+    }, delay);
   }
 
   private buildPendingRoomPathKey(workspaceId: string, path: string): string {
@@ -1617,6 +2216,15 @@ export default class RolayPlugin extends Plugin {
       window.clearTimeout(handle);
       this.recentRemoteObservedPaths.delete(key);
     }
+
+    for (const [key, handle] of [...this.pendingRemoteMarkdownSettles.entries()]) {
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+
+      window.clearTimeout(handle);
+      this.pendingRemoteMarkdownSettles.delete(key);
+    }
   }
 
   private optimisticUpsertRoomEntry(workspaceId: string, entry: FileEntry): void {
@@ -1652,12 +2260,71 @@ export default class RolayPlugin extends Plugin {
       this.recentRemoteObservedPaths.delete(key);
     }, RolayPlugin.RECENT_REMOTE_PATH_TTL_MS);
     this.recentRemoteObservedPaths.set(key, handle);
+    if (/\.(md|markdown)$/i.test(localPath) || /\.md$/i.test(serverPath)) {
+      this.markPendingRemoteMarkdownSettle(workspaceId, localPath);
+    }
     this.clearPendingLocalCreate(workspaceId, serverPath);
     this.clearPendingMarkdownCreate(localPath);
   }
 
   private wasPathRecentlyObservedAsRemote(workspaceId: string, localPath: string): boolean {
     return this.recentRemoteObservedPaths.has(this.buildRemoteObservedPathKey(workspaceId, localPath));
+  }
+
+  private forgetRecentRemoteHintsForLocalPath(localPath: string, clearSettle = false): void {
+    const room = this.resolveDownloadedRoomByLocalPath(localPath);
+    if (!room) {
+      return;
+    }
+
+    this.forgetRecentRemoteObservedPath(room.workspaceId, localPath, clearSettle);
+  }
+
+  private forgetRecentRemoteObservedPath(
+    workspaceId: string,
+    localPath: string,
+    clearSettle = false
+  ): void {
+    const key = this.buildRemoteObservedPathKey(workspaceId, localPath);
+    const handle = this.recentRemoteObservedPaths.get(key);
+    if (handle !== undefined) {
+      window.clearTimeout(handle);
+      this.recentRemoteObservedPaths.delete(key);
+    }
+
+    if (clearSettle) {
+      this.clearPendingRemoteMarkdownSettle(workspaceId, localPath);
+    }
+  }
+
+  private markPendingRemoteMarkdownSettle(workspaceId: string, localPath: string): void {
+    const key = this.buildRemoteObservedPathKey(workspaceId, localPath);
+    const existingHandle = this.pendingRemoteMarkdownSettles.get(key);
+    if (existingHandle !== undefined) {
+      window.clearTimeout(existingHandle);
+    }
+
+    const handle = window.setTimeout(() => {
+      this.pendingRemoteMarkdownSettles.delete(key);
+      this.scheduleSnapshotRefresh(workspaceId, "remote-markdown-settle");
+      this.scheduleExplorerLoadingDecorations();
+    }, RolayPlugin.REMOTE_MARKDOWN_SETTLE_TTL_MS);
+    this.pendingRemoteMarkdownSettles.set(key, handle);
+  }
+
+  private isWaitingForRemoteMarkdownSettle(workspaceId: string, localPath: string): boolean {
+    return this.pendingRemoteMarkdownSettles.has(this.buildRemoteObservedPathKey(workspaceId, localPath));
+  }
+
+  private clearPendingRemoteMarkdownSettle(workspaceId: string, localPath: string): void {
+    const key = this.buildRemoteObservedPathKey(workspaceId, localPath);
+    const handle = this.pendingRemoteMarkdownSettles.get(key);
+    if (handle === undefined) {
+      return;
+    }
+
+    window.clearTimeout(handle);
+    this.pendingRemoteMarkdownSettles.delete(key);
   }
 
   private async saveRoomBinding(
@@ -1722,6 +2389,7 @@ export default class RolayPlugin extends Plugin {
     }
 
     this.stopRoomEventStream(workspaceId);
+    this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
 
     const runtime = this.roomRuntime.get(workspaceId);
     if (runtime && runtime.snapshotRefreshHandle !== null) {
@@ -1729,6 +2397,7 @@ export default class RolayPlugin extends Plugin {
     }
 
     this.roomRuntime.delete(workspaceId);
+    this.scheduleExplorerLoadingDecorations();
     this.roomInvites.delete(workspaceId);
     this.clearPendingRoomPathsForWorkspace(workspaceId);
     this.clearPendingMarkdownCreatesForWorkspace(workspaceId);
@@ -1762,6 +2431,241 @@ export default class RolayPlugin extends Plugin {
     this.statusBarEl.setText(
       `Rolay: ${authLabel} | rooms ${downloadedRoomCount} downloaded | SSE ${activeStreamCount} open | CRDT ${crdtLabel}`
     );
+    this.requestSettingsRender();
+  }
+
+  private async refreshOwnerRoomInvites(logActivity = true): Promise<void> {
+    const ownerRooms = this.roomList.filter((room) => room.membershipRole === "owner");
+    for (const room of ownerRooms) {
+      try {
+        await this.refreshRoomInvite(room.workspace.id, false, logActivity);
+      } catch (error) {
+        this.handleError(`Invite auto-refresh failed (${room.workspace.id})`, error, false);
+      }
+    }
+  }
+
+  private async applySettingsUserUpdate(user: User | null): Promise<void> {
+    if (!user || !this.data.session) {
+      return;
+    }
+
+    const wasAdmin = Boolean(this.data.session.user?.isAdmin);
+    this.data.session = {
+      ...this.data.session,
+      user
+    };
+    this.resetProfileDraft();
+
+    if (wasAdmin && !user.isAdmin) {
+      this.clearAdminState();
+    } else if (!wasAdmin && user.isAdmin) {
+      try {
+        await this.refreshManagedUsers(false, false);
+        await this.refreshAdminRooms(false, false);
+        if (this.adminSelectedRoomId) {
+          await this.refreshAdminRoomMembers(false, this.adminSelectedRoomId, false);
+        }
+      } catch (error) {
+        this.handleError("Admin state bootstrap failed", error, false);
+      }
+    }
+
+    await this.persistNow();
+    this.updateStatusBar();
+  }
+
+  private async applySettingsRoomUpsert(scope: string, payload: unknown): Promise<void> {
+    if (scope === "admin.rooms") {
+      const room = extractAdminRoomFromSettingsPayload(payload);
+      if (!room) {
+        return;
+      }
+
+      this.upsertAdminRoom(room);
+      this.updateStatusBar();
+      return;
+    }
+
+    const room = extractRoomFromSettingsPayload(payload);
+    if (!room) {
+      return;
+    }
+
+    this.upsertUserRoom(room);
+    this.updateStatusBar();
+  }
+
+  private async applySettingsRoomDelete(scope: string, payload: unknown): Promise<void> {
+    const workspaceId = extractWorkspaceIdFromSettingsPayload(payload);
+    if (!workspaceId) {
+      return;
+    }
+
+    if (scope === "admin.rooms") {
+      this.removeAdminRoom(workspaceId);
+      this.updateStatusBar();
+      return;
+    }
+
+    await this.removeUserRoom(workspaceId, "settings-stream");
+    this.updateStatusBar();
+  }
+
+  private async applySettingsRoomMembershipChanged(payload: unknown): Promise<void> {
+    const membership = extractRoomMembershipChangedPayload(payload);
+    if (!membership) {
+      return;
+    }
+
+    if (membership.room) {
+      this.upsertUserRoom(membership.room);
+      this.updateStatusBar();
+      return;
+    }
+
+    if (membership.workspaceId && membership.removed !== false) {
+      await this.removeUserRoom(membership.workspaceId, "settings-membership");
+      this.updateStatusBar();
+      return;
+    }
+
+    if (membership.workspaceId) {
+      await this.loadSettingsPanelSnapshot();
+    }
+  }
+
+  private applySettingsInviteUpdate(invite: InviteState | null): void {
+    if (!invite) {
+      return;
+    }
+
+    this.roomInvites.set(invite.workspaceId, invite);
+    this.patchInviteEnabled(invite.workspaceId, invite.enabled);
+    this.updateStatusBar();
+  }
+
+  private applySettingsManagedUserUpsert(user: ManagedUser | null): void {
+    if (!user) {
+      return;
+    }
+
+    const nextUsers = this.managedUsers.filter((entry) => entry.id !== user.id);
+    nextUsers.push(user);
+    nextUsers.sort((left, right) => left.username.localeCompare(right.username));
+    this.managedUsers = nextUsers;
+    this.updateStatusBar();
+  }
+
+  private applySettingsManagedUserDelete(userId: string | null): void {
+    if (!userId) {
+      return;
+    }
+
+    this.managedUsers = this.managedUsers.filter((user) => user.id !== userId);
+    if (this.adminRoomMembers.some((member) => member.user.id === userId)) {
+      this.adminRoomMembers = this.adminRoomMembers.filter((member) => member.user.id !== userId);
+    }
+    this.updateStatusBar();
+  }
+
+  private applySettingsAdminRoomMembersUpdate(
+    update: { workspaceId: string; members: RoomMember[] } | null
+  ): void {
+    if (!update) {
+      return;
+    }
+
+    if (this.adminSelectedRoomId === update.workspaceId) {
+      this.adminRoomMembers = [...update.members].sort(compareRoomMembers);
+    }
+
+    const ownerCount = update.members.filter((member) => member.role === "owner").length;
+    const memberCount = update.members.length;
+    this.adminRoomList = this.adminRoomList.map((room) => {
+      if (room.workspace.id !== update.workspaceId) {
+        return room;
+      }
+
+      return {
+        ...room,
+        ownerCount,
+        memberCount
+      };
+    }).sort(compareRoomsByName);
+    this.roomList = this.roomList.map((room) => {
+      if (room.workspace.id !== update.workspaceId) {
+        return room;
+      }
+
+      return {
+        ...room,
+        memberCount
+      };
+    }).sort(compareRoomsByName);
+    this.updateStatusBar();
+  }
+
+  private upsertUserRoom(room: RoomListItem): void {
+    const nextRooms = this.roomList.filter((entry) => entry.workspace.id !== room.workspace.id);
+    nextRooms.push(room);
+    nextRooms.sort(compareRoomsByName);
+    this.roomList = nextRooms;
+    this.reconcileInviteCache();
+    if (room.membershipRole === "owner" && !this.roomInvites.has(room.workspace.id)) {
+      void this.refreshRoomInvite(room.workspace.id, false, false)
+        .then(() => {
+          this.requestSettingsRender();
+        })
+        .catch((error) => {
+          this.handleError(`Invite bootstrap failed (${room.workspace.id})`, error, false);
+        });
+    }
+  }
+
+  private upsertAdminRoom(room: AdminRoomListItem): void {
+    const nextRooms = this.adminRoomList.filter((entry) => entry.workspace.id !== room.workspace.id);
+    nextRooms.push(room);
+    nextRooms.sort(compareRoomsByName);
+    this.adminRoomList = nextRooms;
+    this.reconcileAdminSelectedRoom();
+  }
+
+  private async removeUserRoom(workspaceId: string, reason: string): Promise<void> {
+    const hadRoom = this.roomList.some((room) => room.workspace.id === workspaceId);
+    this.roomList = this.roomList.filter((room) => room.workspace.id !== workspaceId);
+    this.roomInvites.delete(workspaceId);
+    if (hadRoom && this.getStoredRoomBinding(workspaceId)?.downloaded) {
+      await this.deactivateRoomDownload(workspaceId, false);
+      this.recordLog("rooms", `Detached room ${workspaceId} after settings ${reason}.`);
+    }
+    this.reconcileInviteCache();
+  }
+
+  private removeAdminRoom(workspaceId: string): void {
+    this.adminRoomList = this.adminRoomList.filter((room) => room.workspace.id !== workspaceId);
+    if (this.adminSelectedRoomId === workspaceId) {
+      this.adminSelectedRoomId = "";
+      this.adminRoomMembers = [];
+      this.clearAdminRoomMemberDraft();
+    }
+    this.reconcileAdminSelectedRoom();
+  }
+
+  private reconcileAdminSelectedRoom(): void {
+    if (!this.adminSelectedRoomId && this.adminRoomList.length === 1) {
+      this.adminSelectedRoomId = this.adminRoomList[0].workspace.id;
+      return;
+    }
+
+    if (
+      this.adminSelectedRoomId &&
+      !this.adminRoomList.some((room) => room.workspace.id === this.adminSelectedRoomId)
+    ) {
+      this.adminSelectedRoomId = "";
+      this.adminRoomMembers = [];
+      this.clearAdminRoomMemberDraft();
+    }
   }
 
   private async applySessionUser(user: User): Promise<void> {
@@ -2201,6 +3105,60 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
+  private async hydrateMarkdownFileFromState(
+    workspaceId: string,
+    entry: FileEntry,
+    localPath: string,
+    nextState: Uint8Array,
+    previousState: Uint8Array | null
+  ): Promise<boolean> {
+    const localFile = this.app.vault.getAbstractFileByPath(localPath);
+    if (!(localFile instanceof TFile) || localFile.extension !== "md") {
+      return false;
+    }
+
+    if (this.hasPendingLocalCreate(workspaceId, entry.path)) {
+      this.recordLog("crdt", `[${workspaceId}] Skipped preload overwrite for ${entry.path} because a local create is still pending.`);
+      return false;
+    }
+
+    if (this.data.pendingMarkdownCreates[normalizePath(localPath)]) {
+      this.recordLog("crdt", `[${workspaceId}] Skipped preload overwrite for ${entry.path} because a local markdown create replay is pending.`);
+      return false;
+    }
+
+    if (this.data.pendingMarkdownMerges[entry.id]) {
+      this.recordLog("crdt", `[${workspaceId}] Skipped preload overwrite for ${entry.path} because a local markdown merge is pending.`);
+      return false;
+    }
+
+    if (getMarkdownViewsForFile(this.app, localPath).length > 0) {
+      return false;
+    }
+
+    const nextText = decodeMarkdownTextState(nextState);
+    const currentText = await this.app.vault.cachedRead(localFile);
+    if (currentText === nextText) {
+      return true;
+    }
+
+    const previousText = previousState ? decodeMarkdownTextState(previousState) : null;
+    const safeToOverwrite =
+      currentText.length === 0 ||
+      (previousText !== null && currentText === previousText);
+
+    if (!safeToOverwrite) {
+      this.recordLog(
+        "crdt",
+        `[${workspaceId}] Left local markdown ${entry.path} untouched during preload because it diverged from the last known cached content.`
+      );
+      return false;
+    }
+
+    await this.app.vault.modify(localFile, nextText);
+    return true;
+  }
+
   private getCrdtCacheKey(entryId: string): string {
     const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl);
     return normalizedServerUrl ? `${normalizedServerUrl}::${entryId}` : entryId;
@@ -2216,18 +3174,41 @@ export default class RolayPlugin extends Plugin {
     }
 
     if (!bootstrap || bootstrap.status === "idle") {
-      return `${cachedMarkdownCount}/${markdownEntryCount} cached`;
+      if (bootstrap?.lockedLocalPaths.size) {
+        return `${cachedMarkdownCount}/${markdownEntryCount} loaded (${bootstrap.lockedLocalPaths.size} still protected)`;
+      }
+
+      return `${cachedMarkdownCount}/${markdownEntryCount} loaded`;
     }
 
     if (bootstrap.status === "loading") {
-      return `bootstrapping ${cachedMarkdownCount}/${markdownEntryCount} cached (${bootstrap.completedTargets}/${bootstrap.totalTargets} stored)`;
+      if (bootstrap.totalBytes <= 0) {
+        return `measuring size (${bootstrap.completedTargets}/${Math.max(bootstrap.totalTargets, markdownEntryCount)} files, ${bootstrap.hydratedTargets} written locally)`;
+      }
+
+      const completedBytes = Math.min(bootstrap.completedBytes, bootstrap.totalBytes);
+      const percent = Math.round((completedBytes / bootstrap.totalBytes) * 100);
+      return `${percent}% loaded (${formatByteCount(completedBytes)}/${formatByteCount(bootstrap.totalBytes)}, ${bootstrap.completedTargets}/${bootstrap.totalTargets} files, ${bootstrap.hydratedTargets} written locally)`;
     }
 
     if (bootstrap.status === "error") {
-      return `partial ${cachedMarkdownCount}/${markdownEntryCount} cached (${bootstrap.lastError ?? "bootstrap error"})`;
+      if (bootstrap.totalBytes > 0) {
+        const completedBytes = Math.min(bootstrap.completedBytes, bootstrap.totalBytes);
+        const percent = Math.round((completedBytes / bootstrap.totalBytes) * 100);
+        return `partial ${percent}% loaded (${formatByteCount(completedBytes)}/${formatByteCount(bootstrap.totalBytes)}, ${bootstrap.lockedLocalPaths.size} protected, ${bootstrap.lastError ?? "bootstrap error"})`;
+      }
+
+      return `partial ${cachedMarkdownCount}/${markdownEntryCount} loaded (${bootstrap.lastError ?? "bootstrap error"})`;
     }
 
-    return `${cachedMarkdownCount}/${markdownEntryCount} cached`;
+    if (bootstrap.totalBytes > 0) {
+      const protectionLabel = bootstrap.lockedLocalPaths.size > 0
+        ? `, ${bootstrap.lockedLocalPaths.size} still protected`
+        : "";
+      return `100% loaded (${formatByteCount(bootstrap.totalBytes)}/${formatByteCount(bootstrap.totalBytes)}, ${cachedMarkdownCount}/${markdownEntryCount} files cached, ${bootstrap.hydratedTargets} written locally${protectionLabel})`;
+    }
+
+    return `100% loaded (${cachedMarkdownCount}/${markdownEntryCount} files cached, ${bootstrap.hydratedTargets} written locally)`;
   }
 
   private cancelRoomMarkdownBootstrap(workspaceId: string): void {
@@ -2241,21 +3222,40 @@ export default class RolayPlugin extends Plugin {
     runtime.markdownBootstrap.status = "idle";
     runtime.markdownBootstrap.totalTargets = 0;
     runtime.markdownBootstrap.completedTargets = 0;
+    runtime.markdownBootstrap.totalBytes = 0;
+    runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.hydratedTargets = 0;
     runtime.markdownBootstrap.lastError = null;
+    this.scheduleExplorerLoadingDecorations();
   }
 
   private async bootstrapRoomMarkdownCache(
     workspaceId: string,
     entries: FileEntry[],
-    reason: string
+    reason: string,
+    lockEntries: FileEntry[] = entries
   ): Promise<void> {
     const runtime = this.roomRuntime.get(workspaceId);
     if (!runtime) {
       return;
     }
 
-    const markdownEntries = entries.filter((entry) => !entry.deleted && entry.kind === "markdown");
-    const uncachedEntries = markdownEntries.filter((entry) => !this.hasPersistedCrdtCache(entry.id));
+    const activeFilePath = this.app.workspace.getActiveFile()?.path ?? null;
+    const markdownEntries = entries
+      .filter((entry) => !entry.deleted && entry.kind === "markdown")
+      .sort((left, right) => {
+        const leftLocalPath = this.fileBridge.toLocalPath(workspaceId, left.path) ?? left.path;
+        const rightLocalPath = this.fileBridge.toLocalPath(workspaceId, right.path) ?? right.path;
+        if (activeFilePath && leftLocalPath === activeFilePath && rightLocalPath !== activeFilePath) {
+          return -1;
+        }
+
+        if (activeFilePath && rightLocalPath === activeFilePath && leftLocalPath !== activeFilePath) {
+          return 1;
+        }
+
+        return left.path.localeCompare(right.path);
+      });
 
     if (runtime.markdownBootstrap.status === "loading") {
       runtime.markdownBootstrap.rerunRequested = true;
@@ -2265,63 +3265,148 @@ export default class RolayPlugin extends Plugin {
     runtime.markdownBootstrap.runToken += 1;
     const runToken = runtime.markdownBootstrap.runToken;
     runtime.markdownBootstrap.rerunRequested = false;
-    runtime.markdownBootstrap.totalTargets = uncachedEntries.length;
+    runtime.markdownBootstrap.totalTargets = markdownEntries.length;
     runtime.markdownBootstrap.completedTargets = 0;
+    runtime.markdownBootstrap.totalBytes = 0;
+    runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.hydratedTargets = 0;
     runtime.markdownBootstrap.lastRunAt = new Date().toISOString();
     runtime.markdownBootstrap.lastError = null;
-    runtime.markdownBootstrap.status = uncachedEntries.length > 0 ? "loading" : "ready";
+    runtime.markdownBootstrap.status = markdownEntries.length > 0 ? "loading" : "ready";
     this.updateStatusBar();
+    await this.refreshRoomMarkdownLocks(workspaceId, lockEntries);
 
-    if (uncachedEntries.length === 0) {
+    if (markdownEntries.length === 0) {
       return;
     }
 
     this.recordLog(
       "crdt",
-      `[${workspaceId}] Bootstrapping CRDT cache for ${uncachedEntries.length} markdown document(s) via HTTP (${reason}).`
+      `[${workspaceId}] Preloading ${markdownEntries.length} markdown document(s) via HTTP bootstrap metadata + state batches (${reason}).`
     );
 
     try {
-      const response = await this.apiClient.getWorkspaceMarkdownBootstrap(workspaceId, {
-        entryIds: uncachedEntries.map((entry) => entry.id)
+      const metadataResponse = await this.apiClient.getWorkspaceMarkdownBootstrap(workspaceId, {
+        entryIds: markdownEntries.map((entry) => entry.id),
+        includeState: false
       });
       if (runtime.markdownBootstrap.runToken !== runToken) {
         return;
       }
 
-      if (response.encoding !== "base64") {
-        throw new Error(`Unsupported markdown bootstrap encoding: ${response.encoding}`);
+      if (metadataResponse.encoding !== "base64") {
+        throw new Error(`Unsupported markdown bootstrap encoding: ${metadataResponse.encoding}`);
       }
 
-      const responseByEntryId = new Map(response.documents.map((document) => [document.entryId, document]));
-      for (const entry of uncachedEntries) {
-        const document = responseByEntryId.get(entry.id);
-        if (!document) {
-          continue;
+      const metadataByEntryId = new Map(
+        metadataResponse.documents.map((document) => [document.entryId, document])
+      );
+      const knownEntries = markdownEntries.filter((entry) => metadataByEntryId.has(entry.id));
+      const metadataMissingCount = markdownEntries.length - knownEntries.length;
+      runtime.markdownBootstrap.totalTargets = metadataResponse.documentCount > 0
+        ? metadataResponse.documentCount
+        : metadataResponse.documents.length;
+      runtime.markdownBootstrap.totalBytes = metadataResponse.totalEncodedBytes > 0
+        ? metadataResponse.totalEncodedBytes
+        : metadataResponse.documents.reduce(
+            (sum, document) => sum + Math.max(0, document.encodedBytes),
+            0
+          );
+      this.updateStatusBar();
+
+      if (knownEntries.length === 0) {
+        runtime.markdownBootstrap.lastError = metadataMissingCount > 0
+          ? `server returned metadata for 0/${markdownEntries.length} markdown documents`
+          : null;
+        runtime.markdownBootstrap.status = metadataMissingCount > 0 ? "error" : "ready";
+        await this.refreshRoomMarkdownLocks(workspaceId, lockEntries);
+        this.updateStatusBar();
+        return;
+      }
+
+      const batches = this.buildMarkdownBootstrapBatches(knownEntries, metadataByEntryId);
+      let missingEntryCount = metadataMissingCount;
+      for (const batch of batches) {
+        if (runtime.markdownBootstrap.runToken !== runToken) {
+          return;
         }
 
-        const normalizedState = normalizeBootstrapState(document.state);
-        const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
-        this.persistCrdtState(entry.id, localPath, normalizedState);
-        runtime.markdownBootstrap.completedTargets += 1;
+        const response = await this.apiClient.getWorkspaceMarkdownBootstrap(workspaceId, {
+          entryIds: batch.map((entry) => entry.id),
+          includeState: true
+        });
+        if (runtime.markdownBootstrap.runToken !== runToken) {
+          return;
+        }
+
+        if (response.encoding !== "base64") {
+          throw new Error(`Unsupported markdown bootstrap encoding: ${response.encoding}`);
+        }
+
+        if (!response.includesState) {
+          throw new Error("Markdown bootstrap batch omitted state payloads.");
+        }
+
+        const responseByEntryId = new Map(response.documents.map((document) => [document.entryId, document]));
+        for (const entry of batch) {
+          if (runtime.markdownBootstrap.runToken !== runToken) {
+            return;
+          }
+
+          const document = responseByEntryId.get(entry.id);
+          const metadataDocument = metadataByEntryId.get(entry.id);
+          if (!document?.state || !metadataDocument) {
+            missingEntryCount += 1;
+            continue;
+          }
+
+          const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
+          const previousState = this.getPersistedCrdtState(entry.id);
+          const normalizedState = normalizeBootstrapState(document.state);
+          this.persistCrdtState(entry.id, localPath, normalizedState);
+
+          if (await this.hydrateMarkdownFileFromState(workspaceId, entry, localPath, normalizedState, previousState)) {
+            runtime.markdownBootstrap.hydratedTargets += 1;
+          }
+
+          runtime.markdownBootstrap.completedTargets += 1;
+          runtime.markdownBootstrap.completedBytes += Math.max(
+            0,
+            document.encodedBytes ?? metadataDocument.encodedBytes
+          );
+
+          if (activeFilePath && localPath === activeFilePath) {
+            await this.bindActiveMarkdownToCrdt();
+          }
+
+          await this.syncMarkdownLockForEntry(workspaceId, entry, localPath, normalizedState);
+          this.updateStatusBar();
+        }
       }
 
-      const missingEntryCount = uncachedEntries.length - runtime.markdownBootstrap.completedTargets;
+      if (runtime.markdownBootstrap.totalBytes > 0) {
+        runtime.markdownBootstrap.completedBytes = Math.min(
+          runtime.markdownBootstrap.completedBytes,
+          runtime.markdownBootstrap.totalBytes
+        );
+      }
+
       runtime.markdownBootstrap.lastError = missingEntryCount > 0
-        ? `server returned ${response.documents.length}/${uncachedEntries.length} bootstrap document(s)`
+        ? `server returned ${runtime.markdownBootstrap.completedTargets}/${markdownEntries.length} bootstrap document(s)`
         : null;
       runtime.markdownBootstrap.status = missingEntryCount > 0 ? "error" : "ready";
+      await this.refreshRoomMarkdownLocks(workspaceId, lockEntries);
       this.updateStatusBar();
 
       if (missingEntryCount === 0) {
         this.recordLog(
           "crdt",
-          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets} document(s).`
+          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets} markdown document(s) with ${formatByteCount(runtime.markdownBootstrap.completedBytes)} downloaded.`
         );
       } else {
         this.recordLog(
           "crdt",
-          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets}/${uncachedEntries.length} document(s).`,
+          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets}/${markdownEntries.length} markdown document(s).`,
           "error"
         );
       }
@@ -2343,8 +3428,46 @@ export default class RolayPlugin extends Plugin {
 
     if (runtime.markdownBootstrap.rerunRequested) {
       runtime.markdownBootstrap.rerunRequested = false;
-      await this.bootstrapRoomMarkdownCache(workspaceId, runtime.treeStore.getEntries(), "rerun");
+      await this.bootstrapRoomMarkdownCache(
+        workspaceId,
+        runtime.treeStore.getEntries(),
+        "rerun",
+        runtime.treeStore.getEntries()
+      );
     }
+  }
+
+  private buildMarkdownBootstrapBatches(
+    entries: FileEntry[],
+    metadataByEntryId: Map<string, MarkdownBootstrapDocument>
+  ): FileEntry[][] {
+    const batches: FileEntry[][] = [];
+    let currentBatch: FileEntry[] = [];
+    let currentBatchBytes = 0;
+
+    for (const entry of entries) {
+      const encodedBytes = Math.max(0, metadataByEntryId.get(entry.id)?.encodedBytes ?? 0);
+      const wouldOverflowDocs =
+        currentBatch.length >= RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS;
+      const wouldOverflowBytes =
+        currentBatch.length > 0 &&
+        currentBatchBytes + encodedBytes > RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES;
+
+      if (wouldOverflowDocs || wouldOverflowBytes) {
+        batches.push(currentBatch);
+        currentBatch = [];
+        currentBatchBytes = 0;
+      }
+
+      currentBatch.push(entry);
+      currentBatchBytes += encodedBytes;
+    }
+
+    if (currentBatch.length > 0) {
+      batches.push(currentBatch);
+    }
+
+    return batches;
   }
 
   private isLiveSyncEnabledForLocalPath(localPath: string): boolean {
@@ -2885,6 +4008,276 @@ export default class RolayPlugin extends Plugin {
   }
 }
 
+function normalizeSettingsEventEnvelope(event: SettingsStreamEvent): SettingsEventEnvelope<unknown> {
+  const rawData: Record<string, unknown> = isRecord(event.data) ? event.data : {};
+  const eventId = typeof rawData["eventId"] === "number" ? rawData["eventId"] : event.id;
+  const type = typeof rawData["type"] === "string" ? rawData["type"] : event.event;
+  const occurredAt =
+    typeof rawData["occurredAt"] === "string" ? rawData["occurredAt"] : new Date().toISOString();
+  const scope =
+    typeof rawData["scope"] === "string" ? rawData["scope"] : inferSettingsScopeFromType(type);
+  const payload = "payload" in rawData ? rawData["payload"] : event.data;
+
+  return {
+    eventId,
+    type,
+    occurredAt,
+    scope,
+    payload
+  };
+}
+
+function inferSettingsScopeFromType(type: string): string {
+  switch (type) {
+    case "stream.ready":
+    case "ping":
+      return "settings.stream";
+    case "auth.me.updated":
+      return "auth.me";
+    case "room.invite.updated":
+      return "room.invite";
+    case "admin.user.created":
+    case "admin.user.updated":
+    case "admin.user.deleted":
+      return "admin.users";
+    case "admin.room.members.updated":
+      return "admin.room.members";
+    default:
+      return "rooms";
+  }
+}
+
+function extractUserFromSettingsPayload(payload: unknown): User | null {
+  const candidate = unwrapSettingsPayloadObject(payload, "user");
+  if (!candidate) {
+    return null;
+  }
+
+  const { id, username, displayName, isAdmin, globalRole } = candidate;
+  if (
+    typeof id !== "string" ||
+    typeof username !== "string" ||
+    typeof displayName !== "string" ||
+    typeof isAdmin !== "boolean" ||
+    (globalRole !== "admin" && globalRole !== "writer" && globalRole !== "reader")
+  ) {
+    return null;
+  }
+
+  return {
+    id,
+    username,
+    displayName,
+    isAdmin,
+    globalRole
+  };
+}
+
+function extractManagedUserFromSettingsPayload(payload: unknown): ManagedUser | null {
+  const candidate = unwrapSettingsPayloadObject(payload, "user");
+  const user = extractUserFromSettingsPayload(candidate ?? payload);
+  if (!user || !candidate) {
+    return null;
+  }
+
+  return {
+    ...user,
+    createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : undefined,
+    disabledAt:
+      typeof candidate.disabledAt === "string" || candidate.disabledAt === null
+        ? candidate.disabledAt
+        : undefined
+  };
+}
+
+function extractRoomFromSettingsPayload(payload: unknown): RoomListItem | null {
+  const candidate = unwrapSettingsPayloadObject(payload, "room");
+  if (!candidate) {
+    return null;
+  }
+
+  const workspace = extractWorkspace(candidate.workspace);
+  const membershipRole = candidate.membershipRole;
+  const createdAt = candidate.createdAt;
+  const memberCount = candidate.memberCount;
+  const inviteEnabled = candidate.inviteEnabled;
+
+  if (
+    !workspace ||
+    (membershipRole !== "owner" && membershipRole !== "member") ||
+    typeof createdAt !== "string" ||
+    typeof memberCount !== "number" ||
+    typeof inviteEnabled !== "boolean"
+  ) {
+    return null;
+  }
+
+  return {
+    workspace,
+    membershipRole,
+    createdAt,
+    memberCount,
+    inviteEnabled
+  };
+}
+
+function extractAdminRoomFromSettingsPayload(payload: unknown): AdminRoomListItem | null {
+  const candidate = unwrapSettingsPayloadObject(payload, "room");
+  const room = extractRoomFromSettingsPayload(candidate ?? payload);
+  if (!room || !candidate || typeof candidate.ownerCount !== "number") {
+    return null;
+  }
+
+  return {
+    ...room,
+    ownerCount: candidate.ownerCount
+  };
+}
+
+function extractInviteFromSettingsPayload(payload: unknown): InviteState | null {
+  const candidate = unwrapSettingsPayloadObject(payload, "invite");
+  if (!candidate) {
+    return null;
+  }
+
+  const { workspaceId, code, enabled, updatedAt } = candidate;
+  if (
+    typeof workspaceId !== "string" ||
+    typeof code !== "string" ||
+    typeof enabled !== "boolean" ||
+    typeof updatedAt !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    workspaceId,
+    code,
+    enabled,
+    updatedAt
+  };
+}
+
+function extractRoomMembershipChangedPayload(
+  payload: unknown
+): { workspaceId?: string; room?: RoomListItem; removed?: boolean } | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  const room = extractRoomFromSettingsPayload(payload);
+  const workspaceId =
+    typeof payload.workspaceId === "string"
+      ? payload.workspaceId
+      : room?.workspace.id;
+  const removed = typeof payload.removed === "boolean" ? payload.removed : undefined;
+  if (!workspaceId && !room) {
+    return null;
+  }
+
+  return {
+    workspaceId,
+    room: room ?? undefined,
+    removed
+  };
+}
+
+function extractWorkspaceIdFromSettingsPayload(payload: unknown): string | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  if (typeof payload.workspaceId === "string") {
+    return payload.workspaceId;
+  }
+
+  const room = extractRoomFromSettingsPayload(payload) ?? extractAdminRoomFromSettingsPayload(payload);
+  return room?.workspace.id ?? null;
+}
+
+function extractUserIdFromSettingsPayload(payload: unknown): string | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  if (typeof payload.userId === "string") {
+    return payload.userId;
+  }
+
+  const user = extractUserFromSettingsPayload(payload);
+  return user?.id ?? null;
+}
+
+function extractAdminRoomMembersPayload(
+  payload: unknown
+): { workspaceId: string; members: RoomMember[] } | null {
+  if (!isRecord(payload) || typeof payload.workspaceId !== "string" || !Array.isArray(payload.members)) {
+    return null;
+  }
+
+  const members = payload.members
+    .map((member) => extractRoomMember(member))
+    .filter((member): member is RoomMember => member !== null)
+    .sort(compareRoomMembers);
+
+  return {
+    workspaceId: payload.workspaceId,
+    members
+  };
+}
+
+function extractRoomMember(payload: unknown): RoomMember | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  const user = extractUserFromSettingsPayload(payload.user);
+  if (
+    !user ||
+    (payload.role !== "owner" && payload.role !== "member") ||
+    typeof payload.joinedAt !== "string"
+  ) {
+    return null;
+  }
+
+  return {
+    user,
+    role: payload.role,
+    joinedAt: payload.joinedAt
+  };
+}
+
+function extractWorkspace(payload: unknown): { id: string; slug?: string; name: string } | null {
+  if (!isRecord(payload) || typeof payload.id !== "string" || typeof payload.name !== "string") {
+    return null;
+  }
+
+  return {
+    id: payload.id,
+    slug: typeof payload.slug === "string" ? payload.slug : undefined,
+    name: payload.name
+  };
+}
+
+function unwrapSettingsPayloadObject(
+  payload: unknown,
+  nestedKey: string
+): Record<string, unknown> | null {
+  if (!isRecord(payload)) {
+    return null;
+  }
+
+  if (isRecord(payload[nestedKey])) {
+    return payload[nestedKey];
+  }
+
+  return payload;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
 function compareRoomsByName(left: RoomListItem, right: RoomListItem): number {
   const nameComparison = left.workspace.name.localeCompare(right.workspace.name);
   if (nameComparison !== 0) {
@@ -2912,6 +4305,34 @@ function normalizeBootstrapState(encodedState: string): Uint8Array {
   } finally {
     yDocument.destroy();
   }
+}
+
+function decodeMarkdownTextState(state: Uint8Array): string {
+  const yDocument = new Y.Doc();
+
+  try {
+    Y.applyUpdate(yDocument, state, "rolay-decode-markdown-state");
+    return yDocument.getText("content").toString();
+  } finally {
+    yDocument.destroy();
+  }
+}
+
+function formatByteCount(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+
+  const digits = value >= 100 || unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 
 function compareCrdtCacheEntries(left: RolayCrdtCacheEntry, right: RolayCrdtCacheEntry): number {

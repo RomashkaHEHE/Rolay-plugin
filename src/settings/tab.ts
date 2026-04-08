@@ -13,6 +13,8 @@ type SettingsView = "general" | "admin";
 export class RolaySettingTab extends PluginSettingTab {
   private readonly plugin: RolayPlugin;
   private activeView: SettingsView = "general";
+  private isVisible = false;
+  private renderHandle: number | null = null;
 
   constructor(app: App, plugin: RolayPlugin) {
     super(app, plugin);
@@ -20,6 +22,45 @@ export class RolaySettingTab extends PluginSettingTab {
   }
 
   override display(): void {
+    const wasVisible = this.isVisible;
+    this.isVisible = true;
+    if (!wasVisible) {
+      void this.plugin.activateSettingsPanelRealtime();
+    }
+    this.render();
+  }
+
+  override hide(): void {
+    this.isVisible = false;
+    this.plugin.deactivateSettingsPanelRealtime();
+    if (this.renderHandle !== null) {
+      window.clearTimeout(this.renderHandle);
+      this.renderHandle = null;
+    }
+    super.hide();
+  }
+
+  requestRender(): void {
+    if (!this.isVisible || this.renderHandle !== null) {
+      return;
+    }
+
+    this.renderHandle = window.setTimeout(() => {
+      this.renderHandle = null;
+      if (!this.isVisible) {
+        return;
+      }
+
+      if (this.hasFocusedTextInput()) {
+        this.requestRender();
+        return;
+      }
+
+      this.render();
+    }, 120);
+  }
+
+  private render(): void {
     const { containerEl } = this;
     const settings = this.plugin.getSettings();
     const status = this.plugin.getStatusSnapshot();
@@ -67,7 +108,7 @@ export class RolaySettingTab extends PluginSettingTab {
       }
 
       this.activeView = view;
-      this.display();
+      this.render();
     });
   }
 
@@ -133,28 +174,18 @@ export class RolaySettingTab extends PluginSettingTab {
         button.setWarning().setButtonText("Logout").onClick(async () => {
           await this.plugin.logout();
           new Notice("Rolay session cleared.");
-          this.display();
+          this.plugin.deactivateSettingsPanelRealtime();
+          this.requestRender();
         });
       });
     } else {
       authSetting.addButton((button) => {
         button.setCta().setButtonText("Login").onClick(async () => {
           await this.plugin.loginWithSettings();
-          this.display();
+          await this.plugin.activateSettingsPanelRealtime();
+          this.requestRender();
         });
       });
-    }
-
-    if (currentUser) {
-      new Setting(containerEl)
-        .setName("Current profile")
-        .setDesc("Reload `GET /v1/auth/me` and refresh room state from the server.")
-        .addButton((button) => {
-          button.setButtonText("Reload profile").onClick(async () => {
-            await this.plugin.fetchCurrentUser(true);
-            this.display();
-          });
-        });
     }
 
     containerEl.createEl("h3", { text: "Logged-in Profile" });
@@ -178,7 +209,7 @@ export class RolaySettingTab extends PluginSettingTab {
         .addButton((button) => {
           button.setButtonText("Save name").onClick(async () => {
             await this.plugin.updateOwnDisplayName();
-            this.display();
+            this.requestRender();
           });
         });
     }
@@ -234,22 +265,12 @@ export class RolaySettingTab extends PluginSettingTab {
         .addButton((button) => {
           button.setButtonText("Change password").onClick(async () => {
             await this.plugin.changeOwnPassword();
-            this.display();
+            this.requestRender();
           });
         });
     }
 
     containerEl.createEl("h3", { text: "Rooms" });
-    new Setting(containerEl)
-      .setName("Room list")
-      .setDesc("Reload all rooms available to the current user. Room membership is gained only by invite key or admin assignment.")
-      .addButton((button) => {
-        button.setButtonText("Refresh rooms").onClick(async () => {
-          await this.plugin.refreshRooms(true);
-          this.display();
-        });
-      });
-
     this.renderRoomCards(containerEl, rooms);
 
     if (currentUser && this.plugin.canCurrentUserCreateRooms()) {
@@ -269,7 +290,7 @@ export class RolaySettingTab extends PluginSettingTab {
         .addButton((button) => {
           button.setCta().setButtonText("Create room").onClick(async () => {
             await this.plugin.createRoomFromDraft();
-            this.display();
+            this.requestRender();
           });
         });
     }
@@ -290,7 +311,7 @@ export class RolaySettingTab extends PluginSettingTab {
       .addButton((button) => {
         button.setButtonText("Join room").onClick(async () => {
           await this.plugin.joinRoomFromDraft();
-          this.display();
+          this.requestRender();
         });
       });
 
@@ -323,15 +344,6 @@ export class RolaySettingTab extends PluginSettingTab {
     const selectedAdminRoom = adminRooms.find((room) => room.workspace.id === adminSelectedRoomId) ?? null;
 
     containerEl.createEl("h3", { text: "Admin Users" });
-    new Setting(containerEl)
-      .setName("Managed users")
-      .setDesc("Reload the global user list.")
-      .addButton((button) => {
-        button.setButtonText("Refresh users").onClick(async () => {
-          await this.plugin.refreshManagedUsers(true);
-          this.display();
-        });
-      });
 
     new Setting(containerEl)
       .setName("New username")
@@ -393,23 +405,13 @@ export class RolaySettingTab extends PluginSettingTab {
       .addButton((button) => {
         button.setCta().setButtonText("Create user").onClick(async () => {
           await this.plugin.createManagedUserFromDraft();
-          this.display();
+          this.requestRender();
         });
       });
 
     this.renderManagedUsers(containerEl, this.plugin.getManagedUsers(), currentUser?.id ?? null);
 
     containerEl.createEl("h3", { text: "Admin Rooms" });
-    new Setting(containerEl)
-      .setName("Admin room list")
-      .setDesc("Reload all rooms visible to admin.")
-      .addButton((button) => {
-        button.setButtonText("Refresh admin rooms").onClick(async () => {
-          await this.plugin.refreshAdminRooms(true);
-          this.display();
-        });
-      });
-
     new Setting(containerEl)
       .setName("Selected admin room")
       .setDesc("Choose which room to inspect for members or room deletion.")
@@ -420,16 +422,13 @@ export class RolaySettingTab extends PluginSettingTab {
         }
         dropdown
           .setValue(adminSelectedRoomId)
-          .onChange((value) => {
+          .onChange(async (value) => {
             this.plugin.setAdminSelectedRoomId(value);
-            this.display();
+            if (value) {
+              await this.plugin.refreshAdminRoomMembers(false, value, false);
+            }
+            this.requestRender();
           });
-      })
-      .addButton((button) => {
-        button.setButtonText("Load members").onClick(async () => {
-          await this.plugin.refreshAdminRoomMembers(true);
-          this.display();
-        });
       })
       .addButton((button) => {
         button.setWarning().setButtonText("Delete room").onClick(async () => {
@@ -443,7 +442,7 @@ export class RolaySettingTab extends PluginSettingTab {
           }
 
           await this.plugin.deleteAdminRoom();
-          this.display();
+          this.requestRender();
         });
       });
 
@@ -486,7 +485,7 @@ export class RolaySettingTab extends PluginSettingTab {
         .addButton((button) => {
           button.setButtonText("Add to room").onClick(async () => {
             await this.plugin.addUserToSelectedAdminRoom();
-            this.display();
+            this.requestRender();
           });
         });
 
@@ -497,7 +496,7 @@ export class RolaySettingTab extends PluginSettingTab {
   private renderRoomCards(containerEl: HTMLElement, rooms: RoomCardState[]): void {
     const listEl = containerEl.createDiv({ cls: "rolay-settings-status" });
     if (rooms.length === 0) {
-      listEl.createEl("div", { text: "No rooms loaded yet." });
+      listEl.createEl("div", { text: "No rooms available." });
       return;
     }
 
@@ -516,7 +515,7 @@ export class RolaySettingTab extends PluginSettingTab {
       this.addInfoLine(itemEl, "Last snapshot", card.lastSnapshotLabel);
       this.addInfoLine(itemEl, "Entries", String(card.entryCount));
       this.addInfoLine(itemEl, "Markdown files", String(card.markdownEntryCount));
-      this.addInfoLine(itemEl, "CRDT cache", card.crdtCacheLabel);
+      this.addInfoLine(itemEl, "Markdown preload", card.crdtCacheLabel);
 
       new Setting(itemEl)
         .setName("Local folder binding")
@@ -549,7 +548,7 @@ export class RolaySettingTab extends PluginSettingTab {
             } else {
               await this.plugin.installRoom(card.room.workspace.id, nextFolderName);
             }
-            this.display();
+            this.requestRender();
           });
         });
 
@@ -568,7 +567,7 @@ export class RolaySettingTab extends PluginSettingTab {
             } else {
               await this.plugin.connectRoom(card.room.workspace.id, true, "settings-connect");
             }
-            this.display();
+            this.requestRender();
           });
         });
       }
@@ -576,7 +575,7 @@ export class RolaySettingTab extends PluginSettingTab {
       if (card.room.membershipRole === "owner") {
         const inviteState = card.invite;
         this.addInfoLine(itemEl, "Invite enabled", String(inviteState?.enabled ?? card.room.inviteEnabled));
-        this.addInfoLine(itemEl, "Invite key", inviteState?.code ?? "not loaded");
+        this.addInfoLine(itemEl, "Invite key", inviteState?.code ?? "syncing...");
         if (inviteState?.updatedAt) {
           this.addInfoLine(itemEl, "Invite updated", inviteState.updatedAt);
         }
@@ -585,23 +584,17 @@ export class RolaySettingTab extends PluginSettingTab {
           .setName("Invite controls")
           .setDesc("Owner-only controls for this room.")
           .addButton((button) => {
-            button.setButtonText("Load invite").onClick(async () => {
-              await this.plugin.refreshRoomInvite(card.room.workspace.id, true);
-              this.display();
-            });
-          })
-          .addButton((button) => {
             button
               .setButtonText(inviteState?.enabled ?? card.room.inviteEnabled ? "Disable invite" : "Enable invite")
               .onClick(async () => {
                 await this.plugin.setRoomInviteEnabled(card.room.workspace.id, !(inviteState?.enabled ?? card.room.inviteEnabled));
-                this.display();
+                this.requestRender();
               });
           })
           .addButton((button) => {
             button.setWarning().setButtonText("Regenerate").onClick(async () => {
               await this.plugin.regenerateRoomInvite(card.room.workspace.id);
-              this.display();
+              this.requestRender();
             });
           });
       }
@@ -611,7 +604,7 @@ export class RolaySettingTab extends PluginSettingTab {
   private renderManagedUsers(containerEl: HTMLElement, users: ManagedUser[], currentUserId: string | null): void {
     const listEl = containerEl.createDiv({ cls: "rolay-settings-status" });
     if (users.length === 0) {
-      listEl.createEl("div", { text: "No managed users loaded yet." });
+      listEl.createEl("div", { text: "No managed users available." });
       return;
     }
 
@@ -641,7 +634,7 @@ export class RolaySettingTab extends PluginSettingTab {
           }
 
           await this.plugin.deleteManagedUser(user.id);
-          this.display();
+          this.requestRender();
         });
       }
     }
@@ -650,7 +643,7 @@ export class RolaySettingTab extends PluginSettingTab {
   private renderAdminRooms(containerEl: HTMLElement, rooms: AdminRoomListItem[], selectedRoomId: string): void {
     const listEl = containerEl.createDiv({ cls: "rolay-settings-status" });
     if (rooms.length === 0) {
-      listEl.createEl("div", { text: "No admin rooms loaded yet." });
+      listEl.createEl("div", { text: "No admin rooms available." });
       return;
     }
 
@@ -669,8 +662,8 @@ export class RolaySettingTab extends PluginSettingTab {
       });
       inspectButton.addEventListener("click", async () => {
         this.plugin.setAdminSelectedRoomId(room.workspace.id);
-        await this.plugin.refreshAdminRoomMembers(false, room.workspace.id);
-        this.display();
+        await this.plugin.refreshAdminRoomMembers(false, room.workspace.id, false);
+        this.requestRender();
       });
     }
   }
@@ -679,7 +672,7 @@ export class RolaySettingTab extends PluginSettingTab {
     containerEl.createEl("h4", { text: "Selected Room Members" });
     const listEl = containerEl.createDiv({ cls: "rolay-settings-status" });
     if (members.length === 0) {
-      listEl.createEl("div", { text: "No members loaded yet." });
+      listEl.createEl("div", { text: "No members yet." });
       return;
     }
 
@@ -696,5 +689,26 @@ export class RolaySettingTab extends PluginSettingTab {
     containerEl.createEl("div", {
       text: `${label}: ${value}`
     });
+  }
+
+  private hasFocusedTextInput(): boolean {
+    const activeEl = document.activeElement;
+    if (!(activeEl instanceof HTMLElement)) {
+      return false;
+    }
+
+    if (!this.containerEl.contains(activeEl)) {
+      return false;
+    }
+
+    if (
+      activeEl instanceof HTMLInputElement ||
+      activeEl instanceof HTMLTextAreaElement ||
+      activeEl instanceof HTMLSelectElement
+    ) {
+      return true;
+    }
+
+    return activeEl.isContentEditable;
   }
 }

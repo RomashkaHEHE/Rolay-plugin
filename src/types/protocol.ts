@@ -234,17 +234,24 @@ export interface CrdtTokenResponse {
 
 export interface MarkdownBootstrapRequest {
   entryIds?: string[];
+  includeState?: boolean;
 }
 
 export interface MarkdownBootstrapDocument {
   entryId: string;
   docId: string;
-  state: string;
+  stateBytes: number;
+  encodedBytes: number;
+  state?: string;
 }
 
 export interface MarkdownBootstrapResponse {
   workspaceId: string;
   encoding: "base64";
+  includesState: boolean;
+  documentCount: number;
+  totalStateBytes: number;
+  totalEncodedBytes: number;
   documents: MarkdownBootstrapDocument[];
 }
 
@@ -283,3 +290,67 @@ export interface WorkspaceEvent<TPayload = unknown> {
   event: string;
   data: TPayload;
 }
+
+export type SettingsEventType =
+  | "stream.ready"
+  | "auth.me.updated"
+  | "room.created"
+  | "room.updated"
+  | "room.deleted"
+  | "room.membership.changed"
+  | "room.invite.updated"
+  | "admin.user.created"
+  | "admin.user.updated"
+  | "admin.user.deleted"
+  | "admin.room.members.updated"
+  | "ping";
+
+export type SettingsEventScope =
+  | "settings.stream"
+  | "auth.me"
+  | "rooms"
+  | "room.invite"
+  | "admin.users"
+  | "admin.rooms"
+  | "admin.room.members";
+
+export interface SettingsEventEnvelope<TPayload = unknown> {
+  eventId: number;
+  type: SettingsEventType | string;
+  occurredAt: string;
+  scope: SettingsEventScope | string;
+  payload: TPayload;
+}
+
+export interface SettingsStreamReadyPayload {
+  cursor?: number;
+}
+
+export interface SettingsRoomDeletedPayload {
+  workspaceId: string;
+}
+
+export interface SettingsInviteUpdatedPayload {
+  invite: InviteState;
+}
+
+export interface SettingsRoomPayload<TRoom = RoomListItem | AdminRoomListItem> {
+  room: TRoom;
+}
+
+export interface SettingsRoomMembershipChangedPayload {
+  workspaceId?: string;
+  room?: RoomListItem;
+  removed?: boolean;
+}
+
+export interface SettingsAdminUserDeletedPayload {
+  userId: string;
+}
+
+export interface SettingsAdminRoomMembersUpdatedPayload {
+  workspaceId: string;
+  members: RoomMember[];
+}
+
+export type SettingsStreamEvent<TPayload = unknown> = WorkspaceEvent<TPayload>;

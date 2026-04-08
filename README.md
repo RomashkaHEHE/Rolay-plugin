@@ -19,6 +19,7 @@ The current MVP is built against the live Rolay `v1` contract and now follows th
 - admin-only user list, user creation, user deletion
 - admin-only room list, member inspection, add-user-to-room, and room deletion
 - separate in-settings admin tab that appears only for logged-in admins
+- settings/admin live updates through `GET /v1/events/settings`
 - CRDT bootstrap for markdown files through `crdt-token` and Yjs/Hocuspocus
 - room-level markdown bootstrap through `POST /v1/workspaces/{workspaceId}/markdown/bootstrap`
 
@@ -31,6 +32,7 @@ The plugin treats Rolay as a layered sync system:
 - Room content still syncs through `/v1/workspaces/{workspaceId}/...`
 - Markdown cold-start/bootstrap now uses `POST /v1/workspaces/{workspaceId}/markdown/bootstrap`
 - Markdown realtime still uses `POST /v1/files/{entryId}/crdt-token`
+- Settings/admin live UI updates use `GET /v1/events/settings`
 - Password change lives under `PATCH /v1/auth/me/password` and rotates the active session
 
 Important product rules reflected in the plugin:
@@ -84,7 +86,10 @@ npm run dev
 - Install is rejected if the target room folder already exists in the vault.
 - Downloaded rooms sync in parallel: each downloaded room maintains its own snapshot cursor and SSE stream.
 - Local room folders are projected under `syncRoot/<room-folder-name>/...`.
-- After each authoritative room snapshot, the plugin bootstraps missing markdown Yjs state in one HTTP call and stores it in local CRDT cache for safer offline reopen and later merge.
+- After each authoritative room snapshot, the plugin first fetches byte metadata for room markdown bootstrap and then downloads Yjs state in HTTP batches. This keeps offline-safe cache bootstrap separate from live websocket sync and gives the UI a more honest byte-based preload progress.
+- After each room connect/snapshot, the plugin preloads markdown content for the whole downloaded room in the background instead of waiting for each note to be opened one by one.
+- Markdown files that are still waiting for safe preload are temporarily protected from local move/rename/delete, and the Files pane marks those notes and their parent folders in red until the room has finished loading them safely.
+- Settings still do an initial REST snapshot on open, but further profile/rooms/invite/admin updates now come from a dedicated settings SSE stream instead of periodic polling.
 - Runtime sync logs are mirrored into `.obsidian/plugins/rolay/rolay-sync.log` so support/debugging does not depend only on the in-settings log widget.
 - If a locally created offline markdown note collides with a server path on reconnect, the plugin keeps both by renaming the local file to the next free name such as `file(1).md` before retrying the create.
 - When a markdown file with existing local text is created or moved into a room, the plugin now turns that text into a reusable Yjs update, persists it locally, and retries CRDT merge until the remote document has absorbed it. This avoids the old "empty file first, content only after reopen" race.

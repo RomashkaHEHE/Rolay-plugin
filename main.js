@@ -8914,10 +8914,13 @@ var _FileBridge = class _FileBridge {
       return;
     }
     if (!oldResolved && newResolved) {
+      this.forgetRecentRemoteHistory(file.path);
       await this.handleVaultCreate(file);
       return;
     }
     if (oldResolved && !newResolved) {
+      this.forgetRecentRemoteHistory(oldPath);
+      this.forgetRecentRemoteHistory(file.path);
       const entry2 = this.getEntryByPath(oldResolved.workspaceId, oldResolved.serverPath);
       if (!entry2) {
         return;
@@ -8932,6 +8935,8 @@ var _FileBridge = class _FileBridge {
       this.log(`Managed path ${oldPath} was moved across room roots. Cross-room moves are not supported.`);
       return;
     }
+    this.forgetRecentRemoteHistory(oldPath);
+    this.forgetRecentRemoteHistory(file.path);
     const entry = this.getEntryByPath(oldResolved.workspaceId, oldResolved.serverPath);
     if (!entry) {
       return;
@@ -8947,6 +8952,7 @@ var _FileBridge = class _FileBridge {
     if (this.consumeRecentRemoteDelete(file.path)) {
       return;
     }
+    this.forgetRecentRemoteHistory(file.path);
     const roomRoot = this.getRoomRoot(resolved.folderName);
     if (!this.app.vault.getAbstractFileByPath(roomRoot)) {
       this.log(`Skipping remote delete for ${file.path} because the local room root is no longer installed.`);
@@ -9180,6 +9186,26 @@ var _FileBridge = class _FileBridge {
     this.recentRemoteDeletes.delete(normalizedPath);
     this.log(`Ignored delete echo for remotely materialized path ${normalizedPath}.`);
     return true;
+  }
+  forgetRecentRemoteHistory(path) {
+    const normalizedPath = (0, import_obsidian3.normalizePath)(path);
+    const createHandle = this.recentRemoteCreates.get(normalizedPath);
+    if (createHandle !== void 0) {
+      window.clearTimeout(createHandle);
+      this.recentRemoteCreates.delete(normalizedPath);
+    }
+    const deleteHandle = this.recentRemoteDeletes.get(normalizedPath);
+    if (deleteHandle !== void 0) {
+      window.clearTimeout(deleteHandle);
+      this.recentRemoteDeletes.delete(normalizedPath);
+    }
+    for (const [key, handle] of [...this.recentRemoteRenames.entries()]) {
+      if (!key.startsWith(`${normalizedPath}=>`) && !key.endsWith(`=>${normalizedPath}`)) {
+        continue;
+      }
+      window.clearTimeout(handle);
+      this.recentRemoteRenames.delete(key);
+    }
   }
   buildRemoteRenameKey(oldPath, newPath) {
     return `${(0, import_obsidian3.normalizePath)(oldPath)}=>${(0, import_obsidian3.normalizePath)(newPath)}`;
@@ -12127,9 +12153,44 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.activeView = "general";
+    this.isVisible = false;
+    this.renderHandle = null;
     this.plugin = plugin;
   }
   display() {
+    const wasVisible = this.isVisible;
+    this.isVisible = true;
+    if (!wasVisible) {
+      void this.plugin.activateSettingsPanelRealtime();
+    }
+    this.render();
+  }
+  hide() {
+    this.isVisible = false;
+    this.plugin.deactivateSettingsPanelRealtime();
+    if (this.renderHandle !== null) {
+      window.clearTimeout(this.renderHandle);
+      this.renderHandle = null;
+    }
+    super.hide();
+  }
+  requestRender() {
+    if (!this.isVisible || this.renderHandle !== null) {
+      return;
+    }
+    this.renderHandle = window.setTimeout(() => {
+      this.renderHandle = null;
+      if (!this.isVisible) {
+        return;
+      }
+      if (this.hasFocusedTextInput()) {
+        this.requestRender();
+        return;
+      }
+      this.render();
+    }, 120);
+  }
+  render() {
     const { containerEl } = this;
     const settings = this.plugin.getSettings();
     const status = this.plugin.getStatusSnapshot();
@@ -12167,7 +12228,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
         return;
       }
       this.activeView = view;
-      this.display();
+      this.render();
     });
   }
   renderGeneralView(containerEl, settings, status, currentUser) {
@@ -12202,22 +12263,16 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
         button.setWarning().setButtonText("Logout").onClick(async () => {
           await this.plugin.logout();
           new import_obsidian8.Notice("Rolay session cleared.");
-          this.display();
+          this.plugin.deactivateSettingsPanelRealtime();
+          this.requestRender();
         });
       });
     } else {
       authSetting.addButton((button) => {
         button.setCta().setButtonText("Login").onClick(async () => {
           await this.plugin.loginWithSettings();
-          this.display();
-        });
-      });
-    }
-    if (currentUser) {
-      new import_obsidian8.Setting(containerEl).setName("Current profile").setDesc("Reload `GET /v1/auth/me` and refresh room state from the server.").addButton((button) => {
-        button.setButtonText("Reload profile").onClick(async () => {
-          await this.plugin.fetchCurrentUser(true);
-          this.display();
+          await this.plugin.activateSettingsPanelRealtime();
+          this.requestRender();
         });
       });
     }
@@ -12234,7 +12289,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       }).addButton((button) => {
         button.setButtonText("Save name").onClick(async () => {
           await this.plugin.updateOwnDisplayName();
-          this.display();
+          this.requestRender();
         });
       });
     }
@@ -12267,17 +12322,11 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       }).addButton((button) => {
         button.setButtonText("Change password").onClick(async () => {
           await this.plugin.changeOwnPassword();
-          this.display();
+          this.requestRender();
         });
       });
     }
     containerEl.createEl("h3", { text: "Rooms" });
-    new import_obsidian8.Setting(containerEl).setName("Room list").setDesc("Reload all rooms available to the current user. Room membership is gained only by invite key or admin assignment.").addButton((button) => {
-      button.setButtonText("Refresh rooms").onClick(async () => {
-        await this.plugin.refreshRooms(true);
-        this.display();
-      });
-    });
     this.renderRoomCards(containerEl, rooms);
     if (currentUser && this.plugin.canCurrentUserCreateRooms()) {
       new import_obsidian8.Setting(containerEl).setName("New room name").setDesc("Only writer/admin users can create rooms. The local folder is still not installed until you press the room's install button.").addText((text2) => {
@@ -12289,7 +12338,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       }).addButton((button) => {
         button.setCta().setButtonText("Create room").onClick(async () => {
           await this.plugin.createRoomFromDraft();
-          this.display();
+          this.requestRender();
         });
       });
     }
@@ -12302,7 +12351,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
     }).addButton((button) => {
       button.setButtonText("Join room").onClick(async () => {
         await this.plugin.joinRoomFromDraft();
-        this.display();
+        this.requestRender();
       });
     });
     containerEl.createEl("h3", { text: "Status" });
@@ -12331,12 +12380,6 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
     const adminSelectedRoomId = this.plugin.getAdminSelectedRoomId();
     const selectedAdminRoom = adminRooms.find((room) => room.workspace.id === adminSelectedRoomId) ?? null;
     containerEl.createEl("h3", { text: "Admin Users" });
-    new import_obsidian8.Setting(containerEl).setName("Managed users").setDesc("Reload the global user list.").addButton((button) => {
-      button.setButtonText("Refresh users").onClick(async () => {
-        await this.plugin.refreshManagedUsers(true);
-        this.display();
-      });
-    });
     new import_obsidian8.Setting(containerEl).setName("New username").setDesc("Username for the managed account.").addText((text2) => {
       text2.setPlaceholder("student1").setValue(managedUserDraft.username).onChange((value) => {
         this.plugin.updateManagedUserDraft({
@@ -12368,30 +12411,22 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
     }).addButton((button) => {
       button.setCta().setButtonText("Create user").onClick(async () => {
         await this.plugin.createManagedUserFromDraft();
-        this.display();
+        this.requestRender();
       });
     });
     this.renderManagedUsers(containerEl, this.plugin.getManagedUsers(), currentUser?.id ?? null);
     containerEl.createEl("h3", { text: "Admin Rooms" });
-    new import_obsidian8.Setting(containerEl).setName("Admin room list").setDesc("Reload all rooms visible to admin.").addButton((button) => {
-      button.setButtonText("Refresh admin rooms").onClick(async () => {
-        await this.plugin.refreshAdminRooms(true);
-        this.display();
-      });
-    });
     new import_obsidian8.Setting(containerEl).setName("Selected admin room").setDesc("Choose which room to inspect for members or room deletion.").addDropdown((dropdown) => {
       dropdown.addOption("", "Select room");
       for (const room of adminRooms) {
         dropdown.addOption(room.workspace.id, `${room.workspace.name} (${room.workspace.id})`);
       }
-      dropdown.setValue(adminSelectedRoomId).onChange((value) => {
+      dropdown.setValue(adminSelectedRoomId).onChange(async (value) => {
         this.plugin.setAdminSelectedRoomId(value);
-        this.display();
-      });
-    }).addButton((button) => {
-      button.setButtonText("Load members").onClick(async () => {
-        await this.plugin.refreshAdminRoomMembers(true);
-        this.display();
+        if (value) {
+          await this.plugin.refreshAdminRoomMembers(false, value, false);
+        }
+        this.requestRender();
       });
     }).addButton((button) => {
       button.setWarning().setButtonText("Delete room").onClick(async () => {
@@ -12403,7 +12438,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
           return;
         }
         await this.plugin.deleteAdminRoom();
-        this.display();
+        this.requestRender();
       });
     });
     this.renderAdminRooms(containerEl, adminRooms, adminSelectedRoomId);
@@ -12428,7 +12463,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       }).addButton((button) => {
         button.setButtonText("Add to room").onClick(async () => {
           await this.plugin.addUserToSelectedAdminRoom();
-          this.display();
+          this.requestRender();
         });
       });
       this.renderRoomMembers(containerEl, adminRoomMembers);
@@ -12437,7 +12472,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
   renderRoomCards(containerEl, rooms) {
     const listEl = containerEl.createDiv({ cls: "rolay-settings-status" });
     if (rooms.length === 0) {
-      listEl.createEl("div", { text: "No rooms loaded yet." });
+      listEl.createEl("div", { text: "No rooms available." });
       return;
     }
     for (const card of rooms) {
@@ -12455,7 +12490,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       this.addInfoLine(itemEl, "Last snapshot", card.lastSnapshotLabel);
       this.addInfoLine(itemEl, "Entries", String(card.entryCount));
       this.addInfoLine(itemEl, "Markdown files", String(card.markdownEntryCount));
-      this.addInfoLine(itemEl, "CRDT cache", card.crdtCacheLabel);
+      this.addInfoLine(itemEl, "Markdown preload", card.crdtCacheLabel);
       new import_obsidian8.Setting(itemEl).setName("Local folder binding").setDesc(card.downloaded ? "This room already has a local folder binding. Use `Rename` to move it to another local folder name without changing the room on the server." : "Install this room into a local vault folder. The default folder name is the room name.").addButton((button) => {
         if (!card.downloaded) {
           button.setCta();
@@ -12477,7 +12512,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
           } else {
             await this.plugin.installRoom(card.room.workspace.id, nextFolderName);
           }
-          this.display();
+          this.requestRender();
         });
       });
       const downloadSetting = new import_obsidian8.Setting(itemEl).setName("Room sync").setDesc(card.downloaded ? "This room already has an installed local folder and can sync in parallel with other installed rooms. Use the single Connect/Disconnect control to manage its live sync state." : "Install the room first. Once a local folder is bound, you can connect or disconnect live sync for this room.");
@@ -12490,31 +12525,26 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
             } else {
               await this.plugin.connectRoom(card.room.workspace.id, true, "settings-connect");
             }
-            this.display();
+            this.requestRender();
           });
         });
       }
       if (card.room.membershipRole === "owner") {
         const inviteState = card.invite;
         this.addInfoLine(itemEl, "Invite enabled", String(inviteState?.enabled ?? card.room.inviteEnabled));
-        this.addInfoLine(itemEl, "Invite key", inviteState?.code ?? "not loaded");
+        this.addInfoLine(itemEl, "Invite key", inviteState?.code ?? "syncing...");
         if (inviteState?.updatedAt) {
           this.addInfoLine(itemEl, "Invite updated", inviteState.updatedAt);
         }
         new import_obsidian8.Setting(itemEl).setName("Invite controls").setDesc("Owner-only controls for this room.").addButton((button) => {
-          button.setButtonText("Load invite").onClick(async () => {
-            await this.plugin.refreshRoomInvite(card.room.workspace.id, true);
-            this.display();
-          });
-        }).addButton((button) => {
           button.setButtonText(inviteState?.enabled ?? card.room.inviteEnabled ? "Disable invite" : "Enable invite").onClick(async () => {
             await this.plugin.setRoomInviteEnabled(card.room.workspace.id, !(inviteState?.enabled ?? card.room.inviteEnabled));
-            this.display();
+            this.requestRender();
           });
         }).addButton((button) => {
           button.setWarning().setButtonText("Regenerate").onClick(async () => {
             await this.plugin.regenerateRoomInvite(card.room.workspace.id);
-            this.display();
+            this.requestRender();
           });
         });
       }
@@ -12523,7 +12553,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
   renderManagedUsers(containerEl, users, currentUserId) {
     const listEl = containerEl.createDiv({ cls: "rolay-settings-status" });
     if (users.length === 0) {
-      listEl.createEl("div", { text: "No managed users loaded yet." });
+      listEl.createEl("div", { text: "No managed users available." });
       return;
     }
     for (const user of users) {
@@ -12550,7 +12580,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
             return;
           }
           await this.plugin.deleteManagedUser(user.id);
-          this.display();
+          this.requestRender();
         });
       }
     }
@@ -12558,7 +12588,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
   renderAdminRooms(containerEl, rooms, selectedRoomId) {
     const listEl = containerEl.createDiv({ cls: "rolay-settings-status" });
     if (rooms.length === 0) {
-      listEl.createEl("div", { text: "No admin rooms loaded yet." });
+      listEl.createEl("div", { text: "No admin rooms available." });
       return;
     }
     for (const room of rooms) {
@@ -12575,8 +12605,8 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       });
       inspectButton.addEventListener("click", async () => {
         this.plugin.setAdminSelectedRoomId(room.workspace.id);
-        await this.plugin.refreshAdminRoomMembers(false, room.workspace.id);
-        this.display();
+        await this.plugin.refreshAdminRoomMembers(false, room.workspace.id, false);
+        this.requestRender();
       });
     }
   }
@@ -12584,7 +12614,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
     containerEl.createEl("h4", { text: "Selected Room Members" });
     const listEl = containerEl.createDiv({ cls: "rolay-settings-status" });
     if (members.length === 0) {
-      listEl.createEl("div", { text: "No members loaded yet." });
+      listEl.createEl("div", { text: "No members yet." });
       return;
     }
     for (const member of members) {
@@ -12599,6 +12629,19 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
     containerEl.createEl("div", {
       text: `${label}: ${value}`
     });
+  }
+  hasFocusedTextInput() {
+    const activeEl = document.activeElement;
+    if (!(activeEl instanceof HTMLElement)) {
+      return false;
+    }
+    if (!this.containerEl.contains(activeEl)) {
+      return false;
+    }
+    if (activeEl instanceof HTMLInputElement || activeEl instanceof HTMLTextAreaElement || activeEl instanceof HTMLSelectElement) {
+      return true;
+    }
+    return activeEl.isContentEditable;
   }
 };
 
@@ -12991,6 +13034,241 @@ function describeResult(result) {
   return `Operation ${result.opId} ${result.status}: ${result.reason ?? "unknown"}.${suggested}`;
 }
 
+// src/sync/settings-stream.ts
+var SettingsEventStream = class {
+  constructor(apiClient, log) {
+    this.abortController = null;
+    this.stopped = true;
+    this.currentCursor = null;
+    this.reconnectAttempt = 0;
+    this.reconnectHandle = null;
+    this.handlers = null;
+    this.apiClient = apiClient;
+    this.log = log;
+  }
+  start(cursor, handlers) {
+    this.stop();
+    this.currentCursor = cursor;
+    this.handlers = handlers;
+    this.stopped = false;
+    void this.connect();
+  }
+  stop() {
+    this.stopped = true;
+    this.handlers?.onStatusChange?.("stopped");
+    this.abortController?.abort();
+    this.abortController = null;
+    if (this.reconnectHandle !== null) {
+      window.clearTimeout(this.reconnectHandle);
+      this.reconnectHandle = null;
+    }
+  }
+  getCursor() {
+    return this.currentCursor;
+  }
+  async connect() {
+    if (this.stopped || !this.handlers) {
+      return;
+    }
+    this.handlers.onStatusChange?.(this.reconnectAttempt === 0 ? "connecting" : "reconnecting");
+    this.abortController = new AbortController();
+    try {
+      const response = await this.openAuthorizedStream(this.abortController.signal);
+      this.reconnectAttempt = 0;
+      this.handlers.onStatusChange?.("open");
+      this.handlers.onOpen?.();
+      await this.consumeStream(response, this.abortController.signal);
+      if (!this.stopped) {
+        this.scheduleReconnect();
+      }
+    } catch (error) {
+      if (this.stopped || isAbortError2(error)) {
+        return;
+      }
+      const normalizedError = error instanceof Error ? error : new Error(String(error));
+      this.handlers.onStatusChange?.("error");
+      this.handlers.onError?.(normalizedError);
+      this.scheduleReconnect();
+    }
+  }
+  async consumeStream(response, signal) {
+    const parser = createParser({
+      onEvent: (message) => {
+        void this.handleMessage(message);
+      }
+    });
+    if (isNodeResponse2(response)) {
+      response.setEncoding("utf8");
+      await new Promise((resolve, reject) => {
+        const abortHandler = () => {
+          reject(createAbortError2());
+        };
+        signal.addEventListener("abort", abortHandler, { once: true });
+        response.on("data", (chunk) => {
+          parser.feed(chunk);
+        });
+        response.on("end", () => {
+          signal.removeEventListener("abort", abortHandler);
+          resolve();
+        });
+        response.on("error", (error) => {
+          signal.removeEventListener("abort", abortHandler);
+          reject(error);
+        });
+      });
+      return;
+    }
+    if (!response.body) {
+      throw new Error("Settings SSE response body is empty.");
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    while (!this.stopped) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      parser.feed(decoder.decode(value, { stream: true }));
+    }
+  }
+  async handleMessage(message) {
+    if (!message.event || !message.data) {
+      return;
+    }
+    const eventId = Number(message.id);
+    if (Number.isFinite(eventId)) {
+      this.currentCursor = eventId;
+    }
+    let data;
+    try {
+      data = JSON.parse(message.data);
+    } catch {
+      data = message.data;
+    }
+    await this.handlers?.onEvent?.({
+      id: Number.isFinite(eventId) ? eventId : this.currentCursor ?? 0,
+      event: message.event,
+      data
+    });
+  }
+  scheduleReconnect() {
+    if (this.stopped) {
+      return;
+    }
+    this.reconnectAttempt += 1;
+    const delay = Math.min(3e4, 1e3 * 2 ** Math.min(this.reconnectAttempt, 5));
+    this.log(`Settings SSE disconnected. Reconnecting in ${delay}ms.`);
+    this.handlers?.onStatusChange?.("reconnecting");
+    this.reconnectHandle = window.setTimeout(() => {
+      this.reconnectHandle = null;
+      void this.connect();
+    }, delay);
+  }
+  async openAuthorizedStream(signal) {
+    const accessToken = await this.apiClient.getValidAccessToken();
+    let response = await this.openStream(accessToken, signal);
+    if (getResponseStatus2(response) === 401) {
+      await this.apiClient.refresh();
+      const refreshedToken = await this.apiClient.getValidAccessToken();
+      response = await this.openStream(refreshedToken, signal);
+    }
+    const status = getResponseStatus2(response);
+    if (status >= 400) {
+      throw new Error(`Settings SSE request failed with HTTP ${status}.`);
+    }
+    return response;
+  }
+  async openStream(accessToken, signal) {
+    const url = this.buildUrl();
+    const nodeRequire = getNodeRequire2();
+    if (nodeRequire) {
+      return openNodeRequest2(url, accessToken, this.currentCursor, signal, nodeRequire);
+    }
+    const headers = new Headers({
+      Accept: "text/event-stream",
+      Authorization: `Bearer ${accessToken}`
+    });
+    if (this.currentCursor !== null) {
+      headers.set("Last-Event-ID", String(this.currentCursor));
+    }
+    return fetch(url, {
+      method: "GET",
+      headers,
+      signal
+    });
+  }
+  buildUrl() {
+    const query = this.currentCursor === null ? "" : `?cursor=${encodeURIComponent(String(this.currentCursor))}`;
+    return this.apiClient.buildAbsoluteUrl(`/v1/events/settings${query}`);
+  }
+};
+function isAbortError2(error) {
+  return error instanceof DOMException && error.name === "AbortError" || error instanceof Error && error.name === "AbortError";
+}
+function isNodeResponse2(response) {
+  return typeof response.setEncoding === "function";
+}
+function getResponseStatus2(response) {
+  return isNodeResponse2(response) ? response.statusCode ?? 0 : response.status;
+}
+function createAbortError2() {
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+function getNodeRequire2() {
+  const candidate = globalThis.require ?? globalThis.window?.require;
+  if (typeof candidate === "function") {
+    return candidate;
+  }
+  try {
+    return Function("return typeof require === 'function' ? require : undefined;")() ?? null;
+  } catch {
+    return null;
+  }
+}
+async function openNodeRequest2(urlString, accessToken, lastEventId, signal, nodeRequire) {
+  const url = new URL(urlString);
+  const requestModule = url.protocol === "https:" ? nodeRequire("node:https") : nodeRequire("node:http");
+  return new Promise((resolve, reject) => {
+    const headers = {
+      Accept: "text/event-stream",
+      Authorization: `Bearer ${accessToken}`
+    };
+    if (lastEventId !== null) {
+      headers["Last-Event-ID"] = String(lastEventId);
+    }
+    const options = {
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port ? Number(url.port) : void 0,
+      path: `${url.pathname}${url.search}`,
+      method: "GET",
+      headers
+    };
+    const request = requestModule.request(options, (response) => {
+      cleanup();
+      resolve(response);
+    });
+    const abortHandler = () => {
+      request.destroy(createAbortError2());
+      cleanup();
+      reject(createAbortError2());
+    };
+    const errorHandler = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      signal.removeEventListener("abort", abortHandler);
+      request.removeListener("error", errorHandler);
+    };
+    signal.addEventListener("abort", abortHandler, { once: true });
+    request.on("error", errorHandler);
+    request.end();
+  });
+}
+
 // src/sync/tree-store.ts
 var TreeStore = class {
   constructor() {
@@ -13092,7 +13370,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.pendingLocalCreates = /* @__PURE__ */ new Map();
     this.pendingLocalDeletes = /* @__PURE__ */ new Set();
     this.recentRemoteObservedPaths = /* @__PURE__ */ new Map();
+    this.pendingRemoteMarkdownSettles = /* @__PURE__ */ new Map();
     this.persistHandle = null;
+    this.explorerDecorationHandle = null;
     this.roomList = [];
     this.adminRoomList = [];
     this.managedUsers = [];
@@ -13101,6 +13381,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.logFlushHandle = null;
     this.logFileWrite = Promise.resolve();
     this.pendingLogLines = [];
+    this.settingsEventStream = null;
+    this.settingsEventCursor = null;
+    this.settingsEventStreamStatus = "stopped";
+    this.settingsStreamRecoveryInFlight = false;
     this.profileDraftDisplayName = "";
     this.passwordChangeDraft = {
       currentPassword: "",
@@ -13132,6 +13416,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       getSession: () => this.data.session,
       saveSession: async (session) => {
         this.data.session = session;
+        if (!session) {
+          this.stopSettingsEventStream();
+        }
         await this.persistNow();
         this.updateStatusBar();
       }
@@ -13178,7 +13465,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     });
     this.statusBarEl = this.addStatusBarItem();
     this.updateStatusBar();
-    this.addSettingTab(new RolaySettingTab(this.app, this));
+    this.settingsTab = new RolaySettingTab(this.app, this);
+    this.addSettingTab(this.settingsTab);
     this.registerCommands();
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
@@ -13190,6 +13478,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         if (info instanceof import_obsidian9.MarkdownView) {
           this.crdtManager.handleEditorChange(editor, info);
         }
+      })
+    );
+    this.registerEvent(
+      this.app.workspace.on("layout-change", () => {
+        this.scheduleExplorerLoadingDecorations();
       })
     );
     this.registerEvent(
@@ -13208,8 +13501,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       })
     );
     this.register(() => {
+      this.stopSettingsEventStream();
       if (this.persistHandle !== null) {
         window.clearTimeout(this.persistHandle);
+      }
+      if (this.explorerDecorationHandle !== null) {
+        window.clearTimeout(this.explorerDecorationHandle);
       }
       if (this.logFlushHandle !== null) {
         window.clearTimeout(this.logFlushHandle);
@@ -13218,12 +13515,20 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         if (runtime.snapshotRefreshHandle !== null) {
           window.clearTimeout(runtime.snapshotRefreshHandle);
         }
+        if (runtime.lockedBootstrapRetryHandle !== null) {
+          window.clearTimeout(runtime.lockedBootstrapRetryHandle);
+        }
       }
+      for (const handle of this.pendingRemoteMarkdownSettles.values()) {
+        window.clearTimeout(handle);
+      }
+      this.pendingRemoteMarkdownSettles.clear();
     });
     this.recordLog("plugin", "Rolay plugin loaded.");
     await this.bootstrapSync("startup");
   }
   async onunload() {
+    this.stopSettingsEventStream();
     this.stopAllRoomEventStreams();
     await this.crdtManager.disconnect();
     await this.persistNow();
@@ -13277,6 +13582,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   setAdminSelectedRoomId(roomId) {
     this.adminSelectedRoomId = roomId.trim();
     this.adminRoomMembers = [];
+    this.requestSettingsRender();
   }
   getAdminRoomMembers() {
     return [...this.adminRoomMembers];
@@ -13357,6 +13663,47 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       })
     };
   }
+  requestSettingsRender() {
+    this.settingsTab?.requestRender();
+  }
+  async activateSettingsPanelRealtime() {
+    if (!this.getCurrentUser()) {
+      this.stopSettingsEventStream();
+      this.requestSettingsRender();
+      return;
+    }
+    await this.loadSettingsPanelSnapshot();
+    this.startSettingsEventStream(null);
+  }
+  deactivateSettingsPanelRealtime() {
+    this.stopSettingsEventStream();
+    this.requestSettingsRender();
+  }
+  async loadSettingsPanelSnapshot() {
+    if (!this.getCurrentUser()) {
+      this.requestSettingsRender();
+      return;
+    }
+    try {
+      await this.fetchCurrentUser(false, false);
+    } catch (error) {
+      this.handleError("Settings initial load failed", error, false);
+      return;
+    }
+    try {
+      await this.refreshOwnerRoomInvites(false);
+    } catch (error) {
+      this.handleError("Invite auto-refresh failed", error, false);
+    }
+    if (this.getCurrentUser()?.isAdmin && this.adminSelectedRoomId) {
+      try {
+        await this.refreshAdminRoomMembers(false, this.adminSelectedRoomId, false);
+      } catch (error) {
+        this.handleError("Admin room members auto-refresh failed", error, false);
+      }
+    }
+    this.requestSettingsRender();
+  }
   async updateSettings(update) {
     this.data.settings = {
       ...this.data.settings,
@@ -13423,6 +13770,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
   }
   async logout() {
+    this.stopSettingsEventStream();
     this.stopAllRoomEventStreams();
     await this.crdtManager.disconnect();
     this.roomRuntime.clear();
@@ -13442,11 +13790,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     await this.persistNow();
     this.updateStatusBar();
   }
-  async fetchCurrentUser(showNotice = false) {
+  async fetchCurrentUser(showNotice = false, logActivity = true) {
     const response = await this.apiClient.getCurrentUser();
     await this.applySessionUser(response.user);
-    await this.refreshPostAuthState();
-    this.recordLog("auth", `Loaded current user ${response.user.username}.`);
+    await this.refreshPostAuthState(logActivity);
+    if (logActivity) {
+      this.recordLog("auth", `Loaded current user ${response.user.username}.`);
+    }
     if (showNotice) {
       new import_obsidian9.Notice(`Current Rolay user: ${response.user.displayName}`);
     }
@@ -13512,13 +13862,15 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       throw error;
     }
   }
-  async refreshRooms(showNotice = false) {
+  async refreshRooms(showNotice = false, logActivity = true) {
     const response = await this.apiClient.listRooms();
     this.roomList = [...response.workspaces].sort(compareRoomsByName);
     await this.reconcileDownloadedRooms();
     await this.reconcileLocalRoomFolders();
     this.reconcileInviteCache();
-    this.recordLog("rooms", `Loaded ${this.roomList.length} room(s).`);
+    if (logActivity) {
+      this.recordLog("rooms", `Loaded ${this.roomList.length} room(s).`);
+    }
     if (showNotice) {
       new import_obsidian9.Notice(`Loaded ${this.roomList.length} Rolay room(s).`);
     }
@@ -13687,12 +14039,14 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.recordLog("rooms", `Renamed local room folder for ${room.workspace.id} from ${currentFolderName} to ${nextFolderName}.`);
     new import_obsidian9.Notice(`Rolay room folder renamed to ${nextFolderName}.`);
   }
-  async refreshRoomInvite(workspaceId, showNotice = true) {
+  async refreshRoomInvite(workspaceId, showNotice = true, logActivity = true) {
     const room = this.requireOwnerRoom(workspaceId);
     const response = await this.apiClient.getRoomInvite(room.workspace.id);
     this.roomInvites.set(room.workspace.id, response.invite);
     this.patchInviteEnabled(room.workspace.id, response.invite.enabled);
-    this.recordLog("invite", `Loaded invite state for ${room.workspace.id}.`);
+    if (logActivity) {
+      this.recordLog("invite", `Loaded invite state for ${room.workspace.id}.`);
+    }
     if (showNotice) {
       new import_obsidian9.Notice(`Invite key loaded for ${room.workspace.name}.`);
     }
@@ -13724,11 +14078,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       throw error;
     }
   }
-  async refreshManagedUsers(showNotice = false) {
+  async refreshManagedUsers(showNotice = false, logActivity = true) {
     this.requireAdmin();
     const response = await this.apiClient.listManagedUsers();
     this.managedUsers = [...response.users].sort((left, right) => left.username.localeCompare(right.username));
-    this.recordLog("admin", `Loaded ${this.managedUsers.length} managed user(s).`);
+    if (logActivity) {
+      this.recordLog("admin", `Loaded ${this.managedUsers.length} managed user(s).`);
+    }
     if (showNotice) {
       new import_obsidian9.Notice(`Loaded ${this.managedUsers.length} managed user(s).`);
     }
@@ -13777,7 +14133,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       throw error;
     }
   }
-  async refreshAdminRooms(showNotice = false) {
+  async refreshAdminRooms(showNotice = false, logActivity = true) {
     this.requireAdmin();
     const response = await this.apiClient.listAllRoomsAsAdmin();
     this.adminRoomList = [...response.workspaces].sort(compareRoomsByName);
@@ -13787,13 +14143,15 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       this.adminSelectedRoomId = "";
       this.adminRoomMembers = [];
     }
-    this.recordLog("admin", `Loaded ${this.adminRoomList.length} room(s) in admin scope.`);
+    if (logActivity) {
+      this.recordLog("admin", `Loaded ${this.adminRoomList.length} room(s) in admin scope.`);
+    }
     if (showNotice) {
       new import_obsidian9.Notice(`Loaded ${this.adminRoomList.length} admin room(s).`);
     }
     return this.getAdminRooms();
   }
-  async refreshAdminRoomMembers(showNotice = false, roomId = this.adminSelectedRoomId) {
+  async refreshAdminRoomMembers(showNotice = false, roomId = this.adminSelectedRoomId, logActivity = true) {
     this.requireAdmin();
     const targetRoomId = roomId.trim();
     if (!targetRoomId) {
@@ -13802,7 +14160,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     const response = await this.apiClient.listRoomMembersAsAdmin(targetRoomId);
     this.adminSelectedRoomId = targetRoomId;
     this.adminRoomMembers = [...response.members].sort(compareRoomMembers);
-    this.recordLog("admin", `Loaded ${this.adminRoomMembers.length} member(s) for room ${targetRoomId}.`);
+    if (logActivity) {
+      this.recordLog("admin", `Loaded ${this.adminRoomMembers.length} member(s) for room ${targetRoomId}.`);
+    }
     if (showNotice) {
       new import_obsidian9.Notice(`Loaded ${this.adminRoomMembers.length} room member(s).`);
     }
@@ -13930,6 +14290,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     if (!runtime) {
       return;
     }
+    this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
     this.cancelRoomMarkdownBootstrap(workspaceId);
     runtime.eventStream?.stop();
     runtime.eventStream = null;
@@ -13941,10 +14302,115 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       this.stopRoomEventStream(workspaceId);
     }
   }
+  startSettingsEventStream(cursor) {
+    this.stopSettingsEventStream();
+    if (!this.getCurrentUser()) {
+      return;
+    }
+    this.settingsEventCursor = cursor;
+    const stream = new SettingsEventStream(this.apiClient, (message) => {
+      this.recordLog("settings-sse", message);
+    });
+    this.settingsEventStream = stream;
+    stream.start(cursor, {
+      onOpen: () => {
+        this.recordLog("settings-sse", "Subscribed to settings events.");
+      },
+      onEvent: async (event) => {
+        await this.handleSettingsEventStreamEvent(event);
+      },
+      onStatusChange: (status) => {
+        this.settingsEventStreamStatus = status;
+        this.updateStatusBar();
+      },
+      onError: (error) => {
+        this.handleError("Settings event stream error", error, false);
+        if (this.shouldRecoverSettingsStream(error)) {
+          void this.recoverSettingsEventStream();
+        }
+      }
+    });
+  }
+  stopSettingsEventStream() {
+    this.settingsEventStream?.stop();
+    this.settingsEventStream = null;
+    this.settingsEventStreamStatus = "stopped";
+  }
+  async handleSettingsEventStreamEvent(event) {
+    const envelope = normalizeSettingsEventEnvelope(event);
+    const eventId = event.id > 0 ? event.id : envelope.eventId;
+    if (Number.isFinite(eventId) && eventId > 0) {
+      this.settingsEventCursor = eventId;
+    }
+    if (envelope.type === "ping") {
+      return;
+    }
+    if (envelope.type === "stream.ready") {
+      this.recordLog("settings-sse", `Settings stream ready at event ${this.settingsEventCursor ?? envelope.eventId}.`);
+      this.requestSettingsRender();
+      return;
+    }
+    this.recordLog(
+      "settings-sse",
+      `Event ${this.settingsEventCursor ?? envelope.eventId}: ${envelope.type} (${envelope.scope}).`
+    );
+    switch (envelope.type) {
+      case "auth.me.updated":
+        await this.applySettingsUserUpdate(extractUserFromSettingsPayload(envelope.payload));
+        break;
+      case "room.created":
+      case "room.updated":
+        await this.applySettingsRoomUpsert(envelope.scope, envelope.payload);
+        break;
+      case "room.deleted":
+        await this.applySettingsRoomDelete(envelope.scope, envelope.payload);
+        break;
+      case "room.membership.changed":
+        await this.applySettingsRoomMembershipChanged(envelope.payload);
+        break;
+      case "room.invite.updated":
+        this.applySettingsInviteUpdate(extractInviteFromSettingsPayload(envelope.payload));
+        break;
+      case "admin.user.created":
+      case "admin.user.updated":
+        this.applySettingsManagedUserUpsert(extractManagedUserFromSettingsPayload(envelope.payload));
+        break;
+      case "admin.user.deleted":
+        this.applySettingsManagedUserDelete(extractUserIdFromSettingsPayload(envelope.payload));
+        break;
+      case "admin.room.members.updated":
+        this.applySettingsAdminRoomMembersUpdate(extractAdminRoomMembersPayload(envelope.payload));
+        break;
+      default:
+        break;
+    }
+    this.requestSettingsRender();
+  }
+  async recoverSettingsEventStream() {
+    if (this.settingsStreamRecoveryInFlight) {
+      return;
+    }
+    this.settingsStreamRecoveryInFlight = true;
+    try {
+      this.recordLog("settings-sse", "Settings SSE resume was reset. Refetching settings snapshot.");
+      this.stopSettingsEventStream();
+      this.settingsEventCursor = null;
+      await this.loadSettingsPanelSnapshot();
+      if (this.getCurrentUser()) {
+        this.startSettingsEventStream(null);
+      }
+    } finally {
+      this.settingsStreamRecoveryInFlight = false;
+    }
+  }
+  shouldRecoverSettingsStream(error) {
+    return /HTTP (400|404|409|410)\b/.test(error.message);
+  }
   async bindActiveMarkdownToCrdt() {
     try {
       const activeFile = this.app.workspace.getActiveFile();
       await this.crdtManager.bindToFile(activeFile);
+      await this.syncMarkdownLockForLocalPath(activeFile?.path ?? null);
       this.updateStatusBar();
     } catch (error) {
       this.handleError("CRDT bind failed", error);
@@ -14034,10 +14500,18 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async handleFileOpen(file) {
     await this.crdtManager.bindToFile(file);
+    if (file && this.findLockedMarkdownPathAtOrBelow(file.path)) {
+      const room = this.resolveDownloadedRoomByLocalPath(file.path);
+      if (room) {
+        this.scheduleSnapshotRefresh(room.workspaceId, "priority-open");
+      }
+    }
+    await this.syncMarkdownLockForLocalPath(file?.path ?? null);
     this.updateStatusBar();
   }
   async handleVaultCreate(file) {
     try {
+      this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       await this.fileBridge.handleVaultCreate(file);
     } catch (error) {
       this.handleError(`Local create sync failed for ${file.path}`, error, false);
@@ -14045,6 +14519,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async handleVaultRename(file, oldPath) {
     try {
+      if (await this.revertLockedMarkdownRename(file, oldPath)) {
+        await this.bindActiveMarkdownToCrdt();
+        return;
+      }
+      this.forgetRecentRemoteHintsForLocalPath(oldPath, true);
+      this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       this.handlePendingMarkdownCreateRename(oldPath, file.path);
       this.handlePendingMarkdownMergeRename(oldPath, file.path);
       await this.fileBridge.handleVaultRename(file, oldPath);
@@ -14055,6 +14535,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async handleVaultDelete(file) {
     try {
+      if (await this.restoreLockedMarkdownDelete(file)) {
+        await this.bindActiveMarkdownToCrdt();
+        return;
+      }
+      this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       this.clearPendingMarkdownCreate(file.path);
       this.clearPendingMarkdownMergesForLocalPath(file.path);
       if (await this.handlePotentialRoomRootRemoval(file.path, "delete")) {
@@ -14066,20 +14551,20 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       this.handleError(`Local delete sync failed for ${file.path}`, error, false);
     }
   }
-  async refreshPostAuthState() {
+  async refreshPostAuthState(logActivity = true) {
     try {
-      await this.refreshRooms(false);
+      await this.refreshRooms(false, logActivity);
     } catch (error) {
       this.handleError("Room list refresh failed", error, false);
     }
     if (this.data.session?.user?.isAdmin) {
       try {
-        await this.refreshManagedUsers(false);
+        await this.refreshManagedUsers(false, logActivity);
       } catch (error) {
         this.handleError("Admin user list refresh failed", error, false);
       }
       try {
-        await this.refreshAdminRooms(false);
+        await this.refreshAdminRooms(false, logActivity);
       } catch (error) {
         this.handleError("Admin room list refresh failed", error, false);
       }
@@ -14252,7 +14737,7 @@ ${keptTail}`;
     const room = this.requireRoom(workspaceId);
     const binding = this.getStoredRoomBinding(workspaceId);
     if (!binding?.downloaded) {
-      throw this.notifyError("Download the room folder first.");
+      throw new Error("Download the room folder first.");
     }
     return room;
   }
@@ -14297,10 +14782,16 @@ ${keptTail}`;
       eventStream: null,
       streamStatus: "stopped",
       snapshotRefreshHandle: null,
+      lockedBootstrapRetryHandle: null,
+      lockedBootstrapRetryAttempt: 0,
       markdownBootstrap: {
         status: "idle",
         totalTargets: 0,
         completedTargets: 0,
+        totalBytes: 0,
+        completedBytes: 0,
+        hydratedTargets: 0,
+        lockedLocalPaths: /* @__PURE__ */ new Set(),
         lastRunAt: null,
         lastError: null,
         rerunRequested: false,
@@ -14312,6 +14803,271 @@ ${keptTail}`;
   }
   getRoomStore(workspaceId) {
     return this.roomRuntime.get(workspaceId)?.treeStore ?? null;
+  }
+  resolveDownloadedRoomByLocalPath(localPath) {
+    const downloadedRooms = this.getDownloadedRooms().sort(
+      (left, right) => right.folderName.length - left.folderName.length
+    );
+    for (const room of downloadedRooms) {
+      if (toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName) !== null) {
+        return room;
+      }
+    }
+    return null;
+  }
+  findLockedMarkdownPathAtOrBelow(localPath) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
+      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
+        if (lockedPath === normalizedLocalPath || lockedPath.startsWith(`${normalizedLocalPath}/`) || normalizedLocalPath.startsWith(`${lockedPath}/`)) {
+          return {
+            workspaceId,
+            lockedPath
+          };
+        }
+      }
+    }
+    return null;
+  }
+  async shouldKeepMarkdownLocked(workspaceId, entry, localPath, persistedState = null) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    const waitingForRemoteSettle = this.isWaitingForRemoteMarkdownSettle(workspaceId, normalizedLocalPath);
+    const activeCrdtState = this.crdtManager.getState();
+    if (activeCrdtState?.entryId === entry.id && (activeCrdtState.status === "synced" || activeCrdtState.status === "offline")) {
+      return false;
+    }
+    if (this.hasPendingLocalCreate(workspaceId, entry.path)) {
+      return true;
+    }
+    if (this.data.pendingMarkdownCreates[normalizedLocalPath]) {
+      return true;
+    }
+    if (this.data.pendingMarkdownMerges[entry.id]) {
+      return true;
+    }
+    const localFile = this.app.vault.getAbstractFileByPath(normalizedLocalPath);
+    if (!(localFile instanceof import_obsidian9.TFile) || localFile.extension !== "md") {
+      return true;
+    }
+    const nextState = persistedState ?? this.getPersistedCrdtState(entry.id);
+    if (!nextState) {
+      return true;
+    }
+    const openViews = getMarkdownViewsForFile(this.app, normalizedLocalPath);
+    const currentText = openViews.length > 0 ? openViews[0].editor.getValue() : await this.app.vault.cachedRead(localFile);
+    const expectedText = decodeMarkdownTextState(nextState);
+    if (waitingForRemoteSettle && expectedText.length === 0) {
+      return true;
+    }
+    return currentText !== expectedText;
+  }
+  async refreshRoomMarkdownLocks(workspaceId, entries) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+    runtime.markdownBootstrap.lockedLocalPaths.clear();
+    for (const entry of entries) {
+      if (entry.deleted || entry.kind !== "markdown") {
+        continue;
+      }
+      const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
+      if (await this.shouldKeepMarkdownLocked(workspaceId, entry, localPath)) {
+        runtime.markdownBootstrap.lockedLocalPaths.add((0, import_obsidian9.normalizePath)(localPath));
+      }
+    }
+    if (runtime.markdownBootstrap.lockedLocalPaths.size === 0) {
+      this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
+    } else if (runtime.markdownBootstrap.status !== "loading") {
+      this.scheduleLockedMarkdownBootstrapRetry(workspaceId, "locked-retry");
+    }
+    this.scheduleExplorerLoadingDecorations();
+  }
+  async syncMarkdownLockForEntry(workspaceId, entry, localPath, persistedState = null) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    if (await this.shouldKeepMarkdownLocked(workspaceId, entry, normalizedLocalPath, persistedState)) {
+      runtime.markdownBootstrap.lockedLocalPaths.add(normalizedLocalPath);
+    } else {
+      runtime.markdownBootstrap.lockedLocalPaths.delete(normalizedLocalPath);
+      this.clearPendingRemoteMarkdownSettle(workspaceId, normalizedLocalPath);
+    }
+    if (runtime.markdownBootstrap.lockedLocalPaths.size === 0) {
+      this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
+    } else if (runtime.markdownBootstrap.status !== "loading") {
+      this.scheduleLockedMarkdownBootstrapRetry(workspaceId, "locked-retry");
+    }
+    this.scheduleExplorerLoadingDecorations();
+  }
+  async syncMarkdownLockForLocalPath(localPath) {
+    if (!localPath) {
+      this.scheduleExplorerLoadingDecorations();
+      return;
+    }
+    const room = this.resolveDownloadedRoomByLocalPath(localPath);
+    if (!room) {
+      this.scheduleExplorerLoadingDecorations();
+      return;
+    }
+    const serverPath = toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName);
+    if (!serverPath) {
+      this.scheduleExplorerLoadingDecorations();
+      return;
+    }
+    const entry = this.getRoomStore(room.workspaceId)?.getEntryByPath(serverPath) ?? null;
+    if (!entry || entry.kind !== "markdown" || entry.deleted) {
+      this.scheduleExplorerLoadingDecorations();
+      return;
+    }
+    await this.syncMarkdownLockForEntry(room.workspaceId, entry, localPath);
+  }
+  scheduleExplorerLoadingDecorations() {
+    if (this.explorerDecorationHandle !== null) {
+      return;
+    }
+    this.explorerDecorationHandle = window.setTimeout(() => {
+      this.explorerDecorationHandle = null;
+      this.refreshExplorerLoadingDecorations();
+    }, 80);
+  }
+  refreshExplorerLoadingDecorations() {
+    const container = this.app.workspace.containerEl;
+    if (!container) {
+      return;
+    }
+    const lockedPaths = /* @__PURE__ */ new Set();
+    for (const runtime of this.roomRuntime.values()) {
+      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
+        lockedPaths.add(lockedPath);
+      }
+    }
+    const pathElements = container.querySelectorAll("[data-path]");
+    for (const element2 of pathElements) {
+      element2.classList.remove("rolay-loading-path", "rolay-loading-ancestor");
+      const dataPath = element2.getAttribute("data-path");
+      if (!dataPath) {
+        continue;
+      }
+      const normalizedPath = (0, import_obsidian9.normalizePath)(dataPath);
+      const exactMatch = lockedPaths.has(normalizedPath);
+      const descendantMatch = !exactMatch && [...lockedPaths].some((lockedPath) => {
+        return lockedPath.startsWith(`${normalizedPath}/`);
+      });
+      if (exactMatch || descendantMatch) {
+        element2.classList.add("rolay-loading-path");
+      }
+      if (descendantMatch) {
+        element2.classList.add("rolay-loading-ancestor");
+      }
+    }
+  }
+  async revertLockedMarkdownRename(file, oldPath) {
+    const blocked = this.findLockedMarkdownPathAtOrBelow(oldPath);
+    if (!blocked) {
+      return false;
+    }
+    this.recordLog(
+      "crdt",
+      `[${blocked.workspaceId}] Reverted local move/rename for ${oldPath} because ${blocked.lockedPath} is still loading and protected.`
+    );
+    new import_obsidian9.Notice("Rolay is still loading this markdown note. Move and rename are blocked until download finishes.");
+    if (file.path === oldPath) {
+      this.scheduleExplorerLoadingDecorations();
+      return true;
+    }
+    const currentFile = this.app.vault.getAbstractFileByPath(file.path);
+    if (!currentFile) {
+      this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-locked-rename");
+      return true;
+    }
+    try {
+      await this.fileBridge.runWithSuppressedPaths([oldPath, file.path], async () => {
+        await this.app.fileManager.renameFile(currentFile, oldPath);
+      });
+    } catch (error) {
+      this.recordLog(
+        "crdt",
+        `[${blocked.workspaceId}] Failed to revert locked rename for ${oldPath}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+      this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-locked-rename");
+    }
+    this.scheduleExplorerLoadingDecorations();
+    return true;
+  }
+  async restoreLockedMarkdownDelete(file) {
+    const blocked = this.findLockedMarkdownPathAtOrBelow(file.path);
+    if (!blocked) {
+      return false;
+    }
+    this.recordLog(
+      "crdt",
+      `[${blocked.workspaceId}] Ignored local delete for ${file.path} because ${blocked.lockedPath} is still loading and protected.`
+    );
+    new import_obsidian9.Notice("Rolay is still loading this markdown note. Delete is blocked until download finishes.");
+    await this.refreshRoomSnapshot(blocked.workspaceId, "restore-locked-delete");
+    this.scheduleExplorerLoadingDecorations();
+    return true;
+  }
+  clearLockedMarkdownBootstrapRetry(workspaceId, resetAttempt = true) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+    if (runtime.lockedBootstrapRetryHandle !== null) {
+      window.clearTimeout(runtime.lockedBootstrapRetryHandle);
+      runtime.lockedBootstrapRetryHandle = null;
+    }
+    if (resetAttempt) {
+      runtime.lockedBootstrapRetryAttempt = 0;
+    }
+  }
+  scheduleLockedMarkdownBootstrapRetry(workspaceId, reason) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+    if (runtime.markdownBootstrap.lockedLocalPaths.size === 0) {
+      this.clearLockedMarkdownBootstrapRetry(workspaceId);
+      return;
+    }
+    if (runtime.lockedBootstrapRetryHandle !== null) {
+      return;
+    }
+    const retryDelays = [1e3, 2e3, 4e3, 8e3];
+    const delay = retryDelays[Math.min(runtime.lockedBootstrapRetryAttempt, retryDelays.length - 1)];
+    runtime.lockedBootstrapRetryHandle = window.setTimeout(() => {
+      runtime.lockedBootstrapRetryHandle = null;
+      runtime.lockedBootstrapRetryAttempt = Math.min(
+        runtime.lockedBootstrapRetryAttempt + 1,
+        retryDelays.length - 1
+      );
+      const currentRuntime = this.roomRuntime.get(workspaceId);
+      const roomBinding = this.getStoredRoomBinding(workspaceId);
+      if (!currentRuntime || !roomBinding?.downloaded) {
+        return;
+      }
+      const lockedEntries = currentRuntime.treeStore.getEntries().filter((entry) => {
+        if (entry.deleted || entry.kind !== "markdown") {
+          return false;
+        }
+        const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
+        return currentRuntime.markdownBootstrap.lockedLocalPaths.has((0, import_obsidian9.normalizePath)(localPath));
+      });
+      if (lockedEntries.length === 0) {
+        this.clearLockedMarkdownBootstrapRetry(workspaceId);
+        return;
+      }
+      void this.bootstrapRoomMarkdownCache(
+        workspaceId,
+        lockedEntries,
+        reason,
+        currentRuntime.treeStore.getEntries()
+      );
+    }, delay);
   }
   buildPendingRoomPathKey(workspaceId, path) {
     return `${workspaceId}::${path.replace(/\\/g, "/")}`;
@@ -14362,6 +15118,13 @@ ${keptTail}`;
       window.clearTimeout(handle);
       this.recentRemoteObservedPaths.delete(key);
     }
+    for (const [key, handle] of [...this.pendingRemoteMarkdownSettles.entries()]) {
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      window.clearTimeout(handle);
+      this.pendingRemoteMarkdownSettles.delete(key);
+    }
   }
   optimisticUpsertRoomEntry(workspaceId, entry) {
     this.getRoomStore(workspaceId)?.upsertEntry(entry);
@@ -14390,11 +15153,57 @@ ${keptTail}`;
       this.recentRemoteObservedPaths.delete(key);
     }, _RolayPlugin.RECENT_REMOTE_PATH_TTL_MS);
     this.recentRemoteObservedPaths.set(key, handle);
+    if (/\.(md|markdown)$/i.test(localPath) || /\.md$/i.test(serverPath)) {
+      this.markPendingRemoteMarkdownSettle(workspaceId, localPath);
+    }
     this.clearPendingLocalCreate(workspaceId, serverPath);
     this.clearPendingMarkdownCreate(localPath);
   }
   wasPathRecentlyObservedAsRemote(workspaceId, localPath) {
     return this.recentRemoteObservedPaths.has(this.buildRemoteObservedPathKey(workspaceId, localPath));
+  }
+  forgetRecentRemoteHintsForLocalPath(localPath, clearSettle = false) {
+    const room = this.resolveDownloadedRoomByLocalPath(localPath);
+    if (!room) {
+      return;
+    }
+    this.forgetRecentRemoteObservedPath(room.workspaceId, localPath, clearSettle);
+  }
+  forgetRecentRemoteObservedPath(workspaceId, localPath, clearSettle = false) {
+    const key = this.buildRemoteObservedPathKey(workspaceId, localPath);
+    const handle = this.recentRemoteObservedPaths.get(key);
+    if (handle !== void 0) {
+      window.clearTimeout(handle);
+      this.recentRemoteObservedPaths.delete(key);
+    }
+    if (clearSettle) {
+      this.clearPendingRemoteMarkdownSettle(workspaceId, localPath);
+    }
+  }
+  markPendingRemoteMarkdownSettle(workspaceId, localPath) {
+    const key = this.buildRemoteObservedPathKey(workspaceId, localPath);
+    const existingHandle = this.pendingRemoteMarkdownSettles.get(key);
+    if (existingHandle !== void 0) {
+      window.clearTimeout(existingHandle);
+    }
+    const handle = window.setTimeout(() => {
+      this.pendingRemoteMarkdownSettles.delete(key);
+      this.scheduleSnapshotRefresh(workspaceId, "remote-markdown-settle");
+      this.scheduleExplorerLoadingDecorations();
+    }, _RolayPlugin.REMOTE_MARKDOWN_SETTLE_TTL_MS);
+    this.pendingRemoteMarkdownSettles.set(key, handle);
+  }
+  isWaitingForRemoteMarkdownSettle(workspaceId, localPath) {
+    return this.pendingRemoteMarkdownSettles.has(this.buildRemoteObservedPathKey(workspaceId, localPath));
+  }
+  clearPendingRemoteMarkdownSettle(workspaceId, localPath) {
+    const key = this.buildRemoteObservedPathKey(workspaceId, localPath);
+    const handle = this.pendingRemoteMarkdownSettles.get(key);
+    if (handle === void 0) {
+      return;
+    }
+    window.clearTimeout(handle);
+    this.pendingRemoteMarkdownSettles.delete(key);
   }
   async saveRoomBinding(workspaceId, nextBinding) {
     const current = this.getStoredRoomBinding(workspaceId) ?? {
@@ -14445,11 +15254,13 @@ ${keptTail}`;
       await this.crdtManager.disconnect();
     }
     this.stopRoomEventStream(workspaceId);
+    this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
     const runtime = this.roomRuntime.get(workspaceId);
     if (runtime && runtime.snapshotRefreshHandle !== null) {
       window.clearTimeout(runtime.snapshotRefreshHandle);
     }
     this.roomRuntime.delete(workspaceId);
+    this.scheduleExplorerLoadingDecorations();
     this.roomInvites.delete(workspaceId);
     this.clearPendingRoomPathsForWorkspace(workspaceId);
     this.clearPendingMarkdownCreatesForWorkspace(workspaceId);
@@ -14477,6 +15288,201 @@ ${keptTail}`;
     this.statusBarEl.setText(
       `Rolay: ${authLabel} | rooms ${downloadedRoomCount} downloaded | SSE ${activeStreamCount} open | CRDT ${crdtLabel}`
     );
+    this.requestSettingsRender();
+  }
+  async refreshOwnerRoomInvites(logActivity = true) {
+    const ownerRooms = this.roomList.filter((room) => room.membershipRole === "owner");
+    for (const room of ownerRooms) {
+      try {
+        await this.refreshRoomInvite(room.workspace.id, false, logActivity);
+      } catch (error) {
+        this.handleError(`Invite auto-refresh failed (${room.workspace.id})`, error, false);
+      }
+    }
+  }
+  async applySettingsUserUpdate(user) {
+    if (!user || !this.data.session) {
+      return;
+    }
+    const wasAdmin = Boolean(this.data.session.user?.isAdmin);
+    this.data.session = {
+      ...this.data.session,
+      user
+    };
+    this.resetProfileDraft();
+    if (wasAdmin && !user.isAdmin) {
+      this.clearAdminState();
+    } else if (!wasAdmin && user.isAdmin) {
+      try {
+        await this.refreshManagedUsers(false, false);
+        await this.refreshAdminRooms(false, false);
+        if (this.adminSelectedRoomId) {
+          await this.refreshAdminRoomMembers(false, this.adminSelectedRoomId, false);
+        }
+      } catch (error) {
+        this.handleError("Admin state bootstrap failed", error, false);
+      }
+    }
+    await this.persistNow();
+    this.updateStatusBar();
+  }
+  async applySettingsRoomUpsert(scope, payload) {
+    if (scope === "admin.rooms") {
+      const room2 = extractAdminRoomFromSettingsPayload(payload);
+      if (!room2) {
+        return;
+      }
+      this.upsertAdminRoom(room2);
+      this.updateStatusBar();
+      return;
+    }
+    const room = extractRoomFromSettingsPayload(payload);
+    if (!room) {
+      return;
+    }
+    this.upsertUserRoom(room);
+    this.updateStatusBar();
+  }
+  async applySettingsRoomDelete(scope, payload) {
+    const workspaceId = extractWorkspaceIdFromSettingsPayload(payload);
+    if (!workspaceId) {
+      return;
+    }
+    if (scope === "admin.rooms") {
+      this.removeAdminRoom(workspaceId);
+      this.updateStatusBar();
+      return;
+    }
+    await this.removeUserRoom(workspaceId, "settings-stream");
+    this.updateStatusBar();
+  }
+  async applySettingsRoomMembershipChanged(payload) {
+    const membership = extractRoomMembershipChangedPayload(payload);
+    if (!membership) {
+      return;
+    }
+    if (membership.room) {
+      this.upsertUserRoom(membership.room);
+      this.updateStatusBar();
+      return;
+    }
+    if (membership.workspaceId && membership.removed !== false) {
+      await this.removeUserRoom(membership.workspaceId, "settings-membership");
+      this.updateStatusBar();
+      return;
+    }
+    if (membership.workspaceId) {
+      await this.loadSettingsPanelSnapshot();
+    }
+  }
+  applySettingsInviteUpdate(invite) {
+    if (!invite) {
+      return;
+    }
+    this.roomInvites.set(invite.workspaceId, invite);
+    this.patchInviteEnabled(invite.workspaceId, invite.enabled);
+    this.updateStatusBar();
+  }
+  applySettingsManagedUserUpsert(user) {
+    if (!user) {
+      return;
+    }
+    const nextUsers = this.managedUsers.filter((entry) => entry.id !== user.id);
+    nextUsers.push(user);
+    nextUsers.sort((left, right) => left.username.localeCompare(right.username));
+    this.managedUsers = nextUsers;
+    this.updateStatusBar();
+  }
+  applySettingsManagedUserDelete(userId) {
+    if (!userId) {
+      return;
+    }
+    this.managedUsers = this.managedUsers.filter((user) => user.id !== userId);
+    if (this.adminRoomMembers.some((member) => member.user.id === userId)) {
+      this.adminRoomMembers = this.adminRoomMembers.filter((member) => member.user.id !== userId);
+    }
+    this.updateStatusBar();
+  }
+  applySettingsAdminRoomMembersUpdate(update) {
+    if (!update) {
+      return;
+    }
+    if (this.adminSelectedRoomId === update.workspaceId) {
+      this.adminRoomMembers = [...update.members].sort(compareRoomMembers);
+    }
+    const ownerCount = update.members.filter((member) => member.role === "owner").length;
+    const memberCount = update.members.length;
+    this.adminRoomList = this.adminRoomList.map((room) => {
+      if (room.workspace.id !== update.workspaceId) {
+        return room;
+      }
+      return {
+        ...room,
+        ownerCount,
+        memberCount
+      };
+    }).sort(compareRoomsByName);
+    this.roomList = this.roomList.map((room) => {
+      if (room.workspace.id !== update.workspaceId) {
+        return room;
+      }
+      return {
+        ...room,
+        memberCount
+      };
+    }).sort(compareRoomsByName);
+    this.updateStatusBar();
+  }
+  upsertUserRoom(room) {
+    const nextRooms = this.roomList.filter((entry) => entry.workspace.id !== room.workspace.id);
+    nextRooms.push(room);
+    nextRooms.sort(compareRoomsByName);
+    this.roomList = nextRooms;
+    this.reconcileInviteCache();
+    if (room.membershipRole === "owner" && !this.roomInvites.has(room.workspace.id)) {
+      void this.refreshRoomInvite(room.workspace.id, false, false).then(() => {
+        this.requestSettingsRender();
+      }).catch((error) => {
+        this.handleError(`Invite bootstrap failed (${room.workspace.id})`, error, false);
+      });
+    }
+  }
+  upsertAdminRoom(room) {
+    const nextRooms = this.adminRoomList.filter((entry) => entry.workspace.id !== room.workspace.id);
+    nextRooms.push(room);
+    nextRooms.sort(compareRoomsByName);
+    this.adminRoomList = nextRooms;
+    this.reconcileAdminSelectedRoom();
+  }
+  async removeUserRoom(workspaceId, reason) {
+    const hadRoom = this.roomList.some((room) => room.workspace.id === workspaceId);
+    this.roomList = this.roomList.filter((room) => room.workspace.id !== workspaceId);
+    this.roomInvites.delete(workspaceId);
+    if (hadRoom && this.getStoredRoomBinding(workspaceId)?.downloaded) {
+      await this.deactivateRoomDownload(workspaceId, false);
+      this.recordLog("rooms", `Detached room ${workspaceId} after settings ${reason}.`);
+    }
+    this.reconcileInviteCache();
+  }
+  removeAdminRoom(workspaceId) {
+    this.adminRoomList = this.adminRoomList.filter((room) => room.workspace.id !== workspaceId);
+    if (this.adminSelectedRoomId === workspaceId) {
+      this.adminSelectedRoomId = "";
+      this.adminRoomMembers = [];
+      this.clearAdminRoomMemberDraft();
+    }
+    this.reconcileAdminSelectedRoom();
+  }
+  reconcileAdminSelectedRoom() {
+    if (!this.adminSelectedRoomId && this.adminRoomList.length === 1) {
+      this.adminSelectedRoomId = this.adminRoomList[0].workspace.id;
+      return;
+    }
+    if (this.adminSelectedRoomId && !this.adminRoomList.some((room) => room.workspace.id === this.adminSelectedRoomId)) {
+      this.adminSelectedRoomId = "";
+      this.adminRoomMembers = [];
+      this.clearAdminRoomMemberDraft();
+    }
   }
   async applySessionUser(user) {
     if (!this.data.session) {
@@ -14816,6 +15822,43 @@ ${keptTail}`;
       delete this.data.crdtCache.entries[staleEntry.entryId];
     }
   }
+  async hydrateMarkdownFileFromState(workspaceId, entry, localPath, nextState, previousState) {
+    const localFile = this.app.vault.getAbstractFileByPath(localPath);
+    if (!(localFile instanceof import_obsidian9.TFile) || localFile.extension !== "md") {
+      return false;
+    }
+    if (this.hasPendingLocalCreate(workspaceId, entry.path)) {
+      this.recordLog("crdt", `[${workspaceId}] Skipped preload overwrite for ${entry.path} because a local create is still pending.`);
+      return false;
+    }
+    if (this.data.pendingMarkdownCreates[(0, import_obsidian9.normalizePath)(localPath)]) {
+      this.recordLog("crdt", `[${workspaceId}] Skipped preload overwrite for ${entry.path} because a local markdown create replay is pending.`);
+      return false;
+    }
+    if (this.data.pendingMarkdownMerges[entry.id]) {
+      this.recordLog("crdt", `[${workspaceId}] Skipped preload overwrite for ${entry.path} because a local markdown merge is pending.`);
+      return false;
+    }
+    if (getMarkdownViewsForFile(this.app, localPath).length > 0) {
+      return false;
+    }
+    const nextText = decodeMarkdownTextState(nextState);
+    const currentText = await this.app.vault.cachedRead(localFile);
+    if (currentText === nextText) {
+      return true;
+    }
+    const previousText = previousState ? decodeMarkdownTextState(previousState) : null;
+    const safeToOverwrite = currentText.length === 0 || previousText !== null && currentText === previousText;
+    if (!safeToOverwrite) {
+      this.recordLog(
+        "crdt",
+        `[${workspaceId}] Left local markdown ${entry.path} untouched during preload because it diverged from the last known cached content.`
+      );
+      return false;
+    }
+    await this.app.vault.modify(localFile, nextText);
+    return true;
+  }
   getCrdtCacheKey(entryId) {
     const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl);
     return normalizedServerUrl ? `${normalizedServerUrl}::${entryId}` : entryId;
@@ -14825,15 +15868,32 @@ ${keptTail}`;
       return "no markdown files yet";
     }
     if (!bootstrap || bootstrap.status === "idle") {
-      return `${cachedMarkdownCount}/${markdownEntryCount} cached`;
+      if (bootstrap?.lockedLocalPaths.size) {
+        return `${cachedMarkdownCount}/${markdownEntryCount} loaded (${bootstrap.lockedLocalPaths.size} still protected)`;
+      }
+      return `${cachedMarkdownCount}/${markdownEntryCount} loaded`;
     }
     if (bootstrap.status === "loading") {
-      return `bootstrapping ${cachedMarkdownCount}/${markdownEntryCount} cached (${bootstrap.completedTargets}/${bootstrap.totalTargets} stored)`;
+      if (bootstrap.totalBytes <= 0) {
+        return `measuring size (${bootstrap.completedTargets}/${Math.max(bootstrap.totalTargets, markdownEntryCount)} files, ${bootstrap.hydratedTargets} written locally)`;
+      }
+      const completedBytes = Math.min(bootstrap.completedBytes, bootstrap.totalBytes);
+      const percent = Math.round(completedBytes / bootstrap.totalBytes * 100);
+      return `${percent}% loaded (${formatByteCount(completedBytes)}/${formatByteCount(bootstrap.totalBytes)}, ${bootstrap.completedTargets}/${bootstrap.totalTargets} files, ${bootstrap.hydratedTargets} written locally)`;
     }
     if (bootstrap.status === "error") {
-      return `partial ${cachedMarkdownCount}/${markdownEntryCount} cached (${bootstrap.lastError ?? "bootstrap error"})`;
+      if (bootstrap.totalBytes > 0) {
+        const completedBytes = Math.min(bootstrap.completedBytes, bootstrap.totalBytes);
+        const percent = Math.round(completedBytes / bootstrap.totalBytes * 100);
+        return `partial ${percent}% loaded (${formatByteCount(completedBytes)}/${formatByteCount(bootstrap.totalBytes)}, ${bootstrap.lockedLocalPaths.size} protected, ${bootstrap.lastError ?? "bootstrap error"})`;
+      }
+      return `partial ${cachedMarkdownCount}/${markdownEntryCount} loaded (${bootstrap.lastError ?? "bootstrap error"})`;
     }
-    return `${cachedMarkdownCount}/${markdownEntryCount} cached`;
+    if (bootstrap.totalBytes > 0) {
+      const protectionLabel = bootstrap.lockedLocalPaths.size > 0 ? `, ${bootstrap.lockedLocalPaths.size} still protected` : "";
+      return `100% loaded (${formatByteCount(bootstrap.totalBytes)}/${formatByteCount(bootstrap.totalBytes)}, ${cachedMarkdownCount}/${markdownEntryCount} files cached, ${bootstrap.hydratedTargets} written locally${protectionLabel})`;
+    }
+    return `100% loaded (${cachedMarkdownCount}/${markdownEntryCount} files cached, ${bootstrap.hydratedTargets} written locally)`;
   }
   cancelRoomMarkdownBootstrap(workspaceId) {
     const runtime = this.roomRuntime.get(workspaceId);
@@ -14845,15 +15905,29 @@ ${keptTail}`;
     runtime.markdownBootstrap.status = "idle";
     runtime.markdownBootstrap.totalTargets = 0;
     runtime.markdownBootstrap.completedTargets = 0;
+    runtime.markdownBootstrap.totalBytes = 0;
+    runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.hydratedTargets = 0;
     runtime.markdownBootstrap.lastError = null;
+    this.scheduleExplorerLoadingDecorations();
   }
-  async bootstrapRoomMarkdownCache(workspaceId, entries, reason) {
+  async bootstrapRoomMarkdownCache(workspaceId, entries, reason, lockEntries = entries) {
     const runtime = this.roomRuntime.get(workspaceId);
     if (!runtime) {
       return;
     }
-    const markdownEntries = entries.filter((entry) => !entry.deleted && entry.kind === "markdown");
-    const uncachedEntries = markdownEntries.filter((entry) => !this.hasPersistedCrdtCache(entry.id));
+    const activeFilePath = this.app.workspace.getActiveFile()?.path ?? null;
+    const markdownEntries = entries.filter((entry) => !entry.deleted && entry.kind === "markdown").sort((left, right) => {
+      const leftLocalPath = this.fileBridge.toLocalPath(workspaceId, left.path) ?? left.path;
+      const rightLocalPath = this.fileBridge.toLocalPath(workspaceId, right.path) ?? right.path;
+      if (activeFilePath && leftLocalPath === activeFilePath && rightLocalPath !== activeFilePath) {
+        return -1;
+      }
+      if (activeFilePath && rightLocalPath === activeFilePath && leftLocalPath !== activeFilePath) {
+        return 1;
+      }
+      return left.path.localeCompare(right.path);
+    });
     if (runtime.markdownBootstrap.status === "loading") {
       runtime.markdownBootstrap.rerunRequested = true;
       return;
@@ -14861,53 +15935,120 @@ ${keptTail}`;
     runtime.markdownBootstrap.runToken += 1;
     const runToken = runtime.markdownBootstrap.runToken;
     runtime.markdownBootstrap.rerunRequested = false;
-    runtime.markdownBootstrap.totalTargets = uncachedEntries.length;
+    runtime.markdownBootstrap.totalTargets = markdownEntries.length;
     runtime.markdownBootstrap.completedTargets = 0;
+    runtime.markdownBootstrap.totalBytes = 0;
+    runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.hydratedTargets = 0;
     runtime.markdownBootstrap.lastRunAt = (/* @__PURE__ */ new Date()).toISOString();
     runtime.markdownBootstrap.lastError = null;
-    runtime.markdownBootstrap.status = uncachedEntries.length > 0 ? "loading" : "ready";
+    runtime.markdownBootstrap.status = markdownEntries.length > 0 ? "loading" : "ready";
     this.updateStatusBar();
-    if (uncachedEntries.length === 0) {
+    await this.refreshRoomMarkdownLocks(workspaceId, lockEntries);
+    if (markdownEntries.length === 0) {
       return;
     }
     this.recordLog(
       "crdt",
-      `[${workspaceId}] Bootstrapping CRDT cache for ${uncachedEntries.length} markdown document(s) via HTTP (${reason}).`
+      `[${workspaceId}] Preloading ${markdownEntries.length} markdown document(s) via HTTP bootstrap metadata + state batches (${reason}).`
     );
     try {
-      const response = await this.apiClient.getWorkspaceMarkdownBootstrap(workspaceId, {
-        entryIds: uncachedEntries.map((entry) => entry.id)
+      const metadataResponse = await this.apiClient.getWorkspaceMarkdownBootstrap(workspaceId, {
+        entryIds: markdownEntries.map((entry) => entry.id),
+        includeState: false
       });
       if (runtime.markdownBootstrap.runToken !== runToken) {
         return;
       }
-      if (response.encoding !== "base64") {
-        throw new Error(`Unsupported markdown bootstrap encoding: ${response.encoding}`);
+      if (metadataResponse.encoding !== "base64") {
+        throw new Error(`Unsupported markdown bootstrap encoding: ${metadataResponse.encoding}`);
       }
-      const responseByEntryId = new Map(response.documents.map((document2) => [document2.entryId, document2]));
-      for (const entry of uncachedEntries) {
-        const document2 = responseByEntryId.get(entry.id);
-        if (!document2) {
-          continue;
+      const metadataByEntryId = new Map(
+        metadataResponse.documents.map((document2) => [document2.entryId, document2])
+      );
+      const knownEntries = markdownEntries.filter((entry) => metadataByEntryId.has(entry.id));
+      const metadataMissingCount = markdownEntries.length - knownEntries.length;
+      runtime.markdownBootstrap.totalTargets = metadataResponse.documentCount > 0 ? metadataResponse.documentCount : metadataResponse.documents.length;
+      runtime.markdownBootstrap.totalBytes = metadataResponse.totalEncodedBytes > 0 ? metadataResponse.totalEncodedBytes : metadataResponse.documents.reduce(
+        (sum, document2) => sum + Math.max(0, document2.encodedBytes),
+        0
+      );
+      this.updateStatusBar();
+      if (knownEntries.length === 0) {
+        runtime.markdownBootstrap.lastError = metadataMissingCount > 0 ? `server returned metadata for 0/${markdownEntries.length} markdown documents` : null;
+        runtime.markdownBootstrap.status = metadataMissingCount > 0 ? "error" : "ready";
+        await this.refreshRoomMarkdownLocks(workspaceId, lockEntries);
+        this.updateStatusBar();
+        return;
+      }
+      const batches = this.buildMarkdownBootstrapBatches(knownEntries, metadataByEntryId);
+      let missingEntryCount = metadataMissingCount;
+      for (const batch of batches) {
+        if (runtime.markdownBootstrap.runToken !== runToken) {
+          return;
         }
-        const normalizedState = normalizeBootstrapState(document2.state);
-        const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
-        this.persistCrdtState(entry.id, localPath, normalizedState);
-        runtime.markdownBootstrap.completedTargets += 1;
+        const response = await this.apiClient.getWorkspaceMarkdownBootstrap(workspaceId, {
+          entryIds: batch.map((entry) => entry.id),
+          includeState: true
+        });
+        if (runtime.markdownBootstrap.runToken !== runToken) {
+          return;
+        }
+        if (response.encoding !== "base64") {
+          throw new Error(`Unsupported markdown bootstrap encoding: ${response.encoding}`);
+        }
+        if (!response.includesState) {
+          throw new Error("Markdown bootstrap batch omitted state payloads.");
+        }
+        const responseByEntryId = new Map(response.documents.map((document2) => [document2.entryId, document2]));
+        for (const entry of batch) {
+          if (runtime.markdownBootstrap.runToken !== runToken) {
+            return;
+          }
+          const document2 = responseByEntryId.get(entry.id);
+          const metadataDocument = metadataByEntryId.get(entry.id);
+          if (!document2?.state || !metadataDocument) {
+            missingEntryCount += 1;
+            continue;
+          }
+          const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
+          const previousState = this.getPersistedCrdtState(entry.id);
+          const normalizedState = normalizeBootstrapState(document2.state);
+          this.persistCrdtState(entry.id, localPath, normalizedState);
+          if (await this.hydrateMarkdownFileFromState(workspaceId, entry, localPath, normalizedState, previousState)) {
+            runtime.markdownBootstrap.hydratedTargets += 1;
+          }
+          runtime.markdownBootstrap.completedTargets += 1;
+          runtime.markdownBootstrap.completedBytes += Math.max(
+            0,
+            document2.encodedBytes ?? metadataDocument.encodedBytes
+          );
+          if (activeFilePath && localPath === activeFilePath) {
+            await this.bindActiveMarkdownToCrdt();
+          }
+          await this.syncMarkdownLockForEntry(workspaceId, entry, localPath, normalizedState);
+          this.updateStatusBar();
+        }
       }
-      const missingEntryCount = uncachedEntries.length - runtime.markdownBootstrap.completedTargets;
-      runtime.markdownBootstrap.lastError = missingEntryCount > 0 ? `server returned ${response.documents.length}/${uncachedEntries.length} bootstrap document(s)` : null;
+      if (runtime.markdownBootstrap.totalBytes > 0) {
+        runtime.markdownBootstrap.completedBytes = Math.min(
+          runtime.markdownBootstrap.completedBytes,
+          runtime.markdownBootstrap.totalBytes
+        );
+      }
+      runtime.markdownBootstrap.lastError = missingEntryCount > 0 ? `server returned ${runtime.markdownBootstrap.completedTargets}/${markdownEntries.length} bootstrap document(s)` : null;
       runtime.markdownBootstrap.status = missingEntryCount > 0 ? "error" : "ready";
+      await this.refreshRoomMarkdownLocks(workspaceId, lockEntries);
       this.updateStatusBar();
       if (missingEntryCount === 0) {
         this.recordLog(
           "crdt",
-          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets} document(s).`
+          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets} markdown document(s) with ${formatByteCount(runtime.markdownBootstrap.completedBytes)} downloaded.`
         );
       } else {
         this.recordLog(
           "crdt",
-          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets}/${uncachedEntries.length} document(s).`,
+          `[${workspaceId}] HTTP markdown bootstrap stored ${runtime.markdownBootstrap.completedTargets}/${markdownEntries.length} markdown document(s).`,
           "error"
         );
       }
@@ -14927,8 +16068,34 @@ ${keptTail}`;
     }
     if (runtime.markdownBootstrap.rerunRequested) {
       runtime.markdownBootstrap.rerunRequested = false;
-      await this.bootstrapRoomMarkdownCache(workspaceId, runtime.treeStore.getEntries(), "rerun");
+      await this.bootstrapRoomMarkdownCache(
+        workspaceId,
+        runtime.treeStore.getEntries(),
+        "rerun",
+        runtime.treeStore.getEntries()
+      );
     }
+  }
+  buildMarkdownBootstrapBatches(entries, metadataByEntryId) {
+    const batches = [];
+    let currentBatch = [];
+    let currentBatchBytes = 0;
+    for (const entry of entries) {
+      const encodedBytes = Math.max(0, metadataByEntryId.get(entry.id)?.encodedBytes ?? 0);
+      const wouldOverflowDocs = currentBatch.length >= _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS;
+      const wouldOverflowBytes = currentBatch.length > 0 && currentBatchBytes + encodedBytes > _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES;
+      if (wouldOverflowDocs || wouldOverflowBytes) {
+        batches.push(currentBatch);
+        currentBatch = [];
+        currentBatchBytes = 0;
+      }
+      currentBatch.push(entry);
+      currentBatchBytes += encodedBytes;
+    }
+    if (currentBatch.length > 0) {
+      batches.push(currentBatch);
+    }
+    return batches;
   }
   isLiveSyncEnabledForLocalPath(localPath) {
     for (const room of this.getDownloadedRooms()) {
@@ -15370,7 +16537,203 @@ _RolayPlugin.MAX_LOG_FILE_BYTES = 512 * 1024;
 _RolayPlugin.LOG_FILE_NAME = "rolay-sync.log";
 _RolayPlugin.PENDING_CREATE_CONFIRMATION_TTL_MS = 6e4;
 _RolayPlugin.RECENT_REMOTE_PATH_TTL_MS = 3e4;
+_RolayPlugin.REMOTE_MARKDOWN_SETTLE_TTL_MS = 15e3;
+_RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = 8;
+_RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = 512 * 1024;
 var RolayPlugin = _RolayPlugin;
+function normalizeSettingsEventEnvelope(event) {
+  const rawData = isRecord2(event.data) ? event.data : {};
+  const eventId = typeof rawData["eventId"] === "number" ? rawData["eventId"] : event.id;
+  const type = typeof rawData["type"] === "string" ? rawData["type"] : event.event;
+  const occurredAt = typeof rawData["occurredAt"] === "string" ? rawData["occurredAt"] : (/* @__PURE__ */ new Date()).toISOString();
+  const scope = typeof rawData["scope"] === "string" ? rawData["scope"] : inferSettingsScopeFromType(type);
+  const payload = "payload" in rawData ? rawData["payload"] : event.data;
+  return {
+    eventId,
+    type,
+    occurredAt,
+    scope,
+    payload
+  };
+}
+function inferSettingsScopeFromType(type) {
+  switch (type) {
+    case "stream.ready":
+    case "ping":
+      return "settings.stream";
+    case "auth.me.updated":
+      return "auth.me";
+    case "room.invite.updated":
+      return "room.invite";
+    case "admin.user.created":
+    case "admin.user.updated":
+    case "admin.user.deleted":
+      return "admin.users";
+    case "admin.room.members.updated":
+      return "admin.room.members";
+    default:
+      return "rooms";
+  }
+}
+function extractUserFromSettingsPayload(payload) {
+  const candidate = unwrapSettingsPayloadObject(payload, "user");
+  if (!candidate) {
+    return null;
+  }
+  const { id: id2, username, displayName, isAdmin, globalRole } = candidate;
+  if (typeof id2 !== "string" || typeof username !== "string" || typeof displayName !== "string" || typeof isAdmin !== "boolean" || globalRole !== "admin" && globalRole !== "writer" && globalRole !== "reader") {
+    return null;
+  }
+  return {
+    id: id2,
+    username,
+    displayName,
+    isAdmin,
+    globalRole
+  };
+}
+function extractManagedUserFromSettingsPayload(payload) {
+  const candidate = unwrapSettingsPayloadObject(payload, "user");
+  const user = extractUserFromSettingsPayload(candidate ?? payload);
+  if (!user || !candidate) {
+    return null;
+  }
+  return {
+    ...user,
+    createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : void 0,
+    disabledAt: typeof candidate.disabledAt === "string" || candidate.disabledAt === null ? candidate.disabledAt : void 0
+  };
+}
+function extractRoomFromSettingsPayload(payload) {
+  const candidate = unwrapSettingsPayloadObject(payload, "room");
+  if (!candidate) {
+    return null;
+  }
+  const workspace = extractWorkspace(candidate.workspace);
+  const membershipRole = candidate.membershipRole;
+  const createdAt = candidate.createdAt;
+  const memberCount = candidate.memberCount;
+  const inviteEnabled = candidate.inviteEnabled;
+  if (!workspace || membershipRole !== "owner" && membershipRole !== "member" || typeof createdAt !== "string" || typeof memberCount !== "number" || typeof inviteEnabled !== "boolean") {
+    return null;
+  }
+  return {
+    workspace,
+    membershipRole,
+    createdAt,
+    memberCount,
+    inviteEnabled
+  };
+}
+function extractAdminRoomFromSettingsPayload(payload) {
+  const candidate = unwrapSettingsPayloadObject(payload, "room");
+  const room = extractRoomFromSettingsPayload(candidate ?? payload);
+  if (!room || !candidate || typeof candidate.ownerCount !== "number") {
+    return null;
+  }
+  return {
+    ...room,
+    ownerCount: candidate.ownerCount
+  };
+}
+function extractInviteFromSettingsPayload(payload) {
+  const candidate = unwrapSettingsPayloadObject(payload, "invite");
+  if (!candidate) {
+    return null;
+  }
+  const { workspaceId, code, enabled, updatedAt } = candidate;
+  if (typeof workspaceId !== "string" || typeof code !== "string" || typeof enabled !== "boolean" || typeof updatedAt !== "string") {
+    return null;
+  }
+  return {
+    workspaceId,
+    code,
+    enabled,
+    updatedAt
+  };
+}
+function extractRoomMembershipChangedPayload(payload) {
+  if (!isRecord2(payload)) {
+    return null;
+  }
+  const room = extractRoomFromSettingsPayload(payload);
+  const workspaceId = typeof payload.workspaceId === "string" ? payload.workspaceId : room?.workspace.id;
+  const removed = typeof payload.removed === "boolean" ? payload.removed : void 0;
+  if (!workspaceId && !room) {
+    return null;
+  }
+  return {
+    workspaceId,
+    room: room ?? void 0,
+    removed
+  };
+}
+function extractWorkspaceIdFromSettingsPayload(payload) {
+  if (!isRecord2(payload)) {
+    return null;
+  }
+  if (typeof payload.workspaceId === "string") {
+    return payload.workspaceId;
+  }
+  const room = extractRoomFromSettingsPayload(payload) ?? extractAdminRoomFromSettingsPayload(payload);
+  return room?.workspace.id ?? null;
+}
+function extractUserIdFromSettingsPayload(payload) {
+  if (!isRecord2(payload)) {
+    return null;
+  }
+  if (typeof payload.userId === "string") {
+    return payload.userId;
+  }
+  const user = extractUserFromSettingsPayload(payload);
+  return user?.id ?? null;
+}
+function extractAdminRoomMembersPayload(payload) {
+  if (!isRecord2(payload) || typeof payload.workspaceId !== "string" || !Array.isArray(payload.members)) {
+    return null;
+  }
+  const members = payload.members.map((member) => extractRoomMember(member)).filter((member) => member !== null).sort(compareRoomMembers);
+  return {
+    workspaceId: payload.workspaceId,
+    members
+  };
+}
+function extractRoomMember(payload) {
+  if (!isRecord2(payload)) {
+    return null;
+  }
+  const user = extractUserFromSettingsPayload(payload.user);
+  if (!user || payload.role !== "owner" && payload.role !== "member" || typeof payload.joinedAt !== "string") {
+    return null;
+  }
+  return {
+    user,
+    role: payload.role,
+    joinedAt: payload.joinedAt
+  };
+}
+function extractWorkspace(payload) {
+  if (!isRecord2(payload) || typeof payload.id !== "string" || typeof payload.name !== "string") {
+    return null;
+  }
+  return {
+    id: payload.id,
+    slug: typeof payload.slug === "string" ? payload.slug : void 0,
+    name: payload.name
+  };
+}
+function unwrapSettingsPayloadObject(payload, nestedKey) {
+  if (!isRecord2(payload)) {
+    return null;
+  }
+  if (isRecord2(payload[nestedKey])) {
+    return payload[nestedKey];
+  }
+  return payload;
+}
+function isRecord2(value) {
+  return typeof value === "object" && value !== null;
+}
 function compareRoomsByName(left, right) {
   const nameComparison = left.workspace.name.localeCompare(right.workspace.name);
   if (nameComparison !== 0) {
@@ -15393,6 +16756,29 @@ function normalizeBootstrapState(encodedState) {
   } finally {
     yDocument.destroy();
   }
+}
+function decodeMarkdownTextState(state) {
+  const yDocument = new Doc();
+  try {
+    applyUpdate(yDocument, state, "rolay-decode-markdown-state");
+    return yDocument.getText("content").toString();
+  } finally {
+    yDocument.destroy();
+  }
+}
+function formatByteCount(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) {
+    return "0 B";
+  }
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const digits = value >= 100 || unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(digits)} ${units[unitIndex]}`;
 }
 function compareCrdtCacheEntries(left, right) {
   return left.updatedAt.localeCompare(right.updatedAt);

@@ -95,3 +95,18 @@
   transform: translateY(calc(-100% - 0.85em)) scale(1);
   visibility: visible;
 }
+
+.nav-file.rolay-loading-path > .nav-file-title,
+.nav-folder.rolay-loading-path > .nav-folder-title,
+.nav-file-title.rolay-loading-path,
+.nav-folder-title.rolay-loading-path,
+.tree-item-self.rolay-loading-path {
+  border-left: 2px solid var(--text-error);
+  color: var(--text-error);
+}
+
+.nav-folder.rolay-loading-ancestor > .nav-folder-title,
+.nav-folder-title.rolay-loading-ancestor,
+.tree-item-self.rolay-loading-ancestor {
+  border-left: 2px dashed var(--text-error);
+}

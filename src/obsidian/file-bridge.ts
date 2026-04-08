@@ -208,11 +208,14 @@ export class FileBridge {
     }
 
     if (!oldResolved && newResolved) {
+      this.forgetRecentRemoteHistory(file.path);
       await this.handleVaultCreate(file);
       return;
     }
 
     if (oldResolved && !newResolved) {
+      this.forgetRecentRemoteHistory(oldPath);
+      this.forgetRecentRemoteHistory(file.path);
       const entry = this.getEntryByPath(oldResolved.workspaceId, oldResolved.serverPath);
       if (!entry) {
         return;
@@ -231,6 +234,8 @@ export class FileBridge {
       return;
     }
 
+    this.forgetRecentRemoteHistory(oldPath);
+    this.forgetRecentRemoteHistory(file.path);
     const entry = this.getEntryByPath(oldResolved.workspaceId, oldResolved.serverPath);
     if (!entry) {
       return;
@@ -254,6 +259,7 @@ export class FileBridge {
       return;
     }
 
+    this.forgetRecentRemoteHistory(file.path);
     const roomRoot = this.getRoomRoot(resolved.folderName);
     if (!this.app.vault.getAbstractFileByPath(roomRoot)) {
       this.log(`Skipping remote delete for ${file.path} because the local room root is no longer installed.`);
@@ -542,6 +548,31 @@ export class FileBridge {
     this.recentRemoteDeletes.delete(normalizedPath);
     this.log(`Ignored delete echo for remotely materialized path ${normalizedPath}.`);
     return true;
+  }
+
+  private forgetRecentRemoteHistory(path: string): void {
+    const normalizedPath = normalizePath(path);
+
+    const createHandle = this.recentRemoteCreates.get(normalizedPath);
+    if (createHandle !== undefined) {
+      window.clearTimeout(createHandle);
+      this.recentRemoteCreates.delete(normalizedPath);
+    }
+
+    const deleteHandle = this.recentRemoteDeletes.get(normalizedPath);
+    if (deleteHandle !== undefined) {
+      window.clearTimeout(deleteHandle);
+      this.recentRemoteDeletes.delete(normalizedPath);
+    }
+
+    for (const [key, handle] of [...this.recentRemoteRenames.entries()]) {
+      if (!key.startsWith(`${normalizedPath}=>`) && !key.endsWith(`=>${normalizedPath}`)) {
+        continue;
+      }
+
+      window.clearTimeout(handle);
+      this.recentRemoteRenames.delete(key);
+    }
   }
 
   private buildRemoteRenameKey(oldPath: string, newPath: string): string {
