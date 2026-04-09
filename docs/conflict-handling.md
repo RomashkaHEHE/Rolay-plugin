@@ -40,3 +40,7 @@ Current plugin behavior:
 - Failed local markdown creates are tracked as pending work and retried on the next authoritative room refresh/connect.
 - If a pending local markdown create collides with an already existing server path, the client renames the local note to the next free filename (for example `file.md` -> `file(1).md`) before retrying, so neither copy is lost.
 - Markdown imports with existing local text are treated as reusable Yjs updates instead of one-shot "seed only if empty" attempts. The plugin keeps retrying that CRDT merge until it succeeds or the local file disappears.
+- Binary uploads are tracked as pending work and replayed after the next authoritative room refresh/connect if the upload or commit step fails.
+- If a local binary file collides with an already existing remote path, the client renames the local file to the next free Explorer-style copy name (for example `file.pdf` -> `file(1).pdf`) before retrying, so both copies survive.
+- If an incoming binary blob revision would overwrite a locally diverged file, the client first keeps the local bytes as a conflict copy and then writes the authoritative remote blob into the canonical room path.
+- Binary files that are still downloading are protected from local move/rename/delete, and binary uploads are cancelable so a canceled upload never reaches `commit_blob_revision`.

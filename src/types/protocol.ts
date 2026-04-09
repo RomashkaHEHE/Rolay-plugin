@@ -267,14 +267,39 @@ export interface UploadTarget {
   headers: Record<string, string>;
 }
 
+export interface CancelTarget {
+  method: "DELETE";
+  url: string;
+}
+
 export interface BlobUploadTicketResponse {
   alreadyExists: boolean;
+  uploadId: string;
+  hash: string;
+  sizeBytes: number;
+  mimeType: string;
+  expiresAt: string;
   upload?: UploadTarget;
+  cancel?: CancelTarget;
+}
+
+export interface BlobUploadContentResponse {
+  ok: boolean;
+  hash: string;
+  sizeBytes: number;
 }
 
 export interface BlobDownloadTicketResponse {
   hash: string;
+  sizeBytes: number;
+  mimeType: string;
   url: string;
+}
+
+export interface BlobUploadCancelResponse {
+  ok: boolean;
+  uploadId: string;
+  wasActive: boolean;
 }
 
 export interface ApiErrorResponse {

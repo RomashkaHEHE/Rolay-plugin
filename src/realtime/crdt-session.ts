@@ -43,6 +43,7 @@ export class CrdtSessionManager {
   private readonly log: (message: string) => void;
   private readonly pendingOfflineUpdates = new Map<string, Uint8Array>();
   private activeSession: BoundCrdtSession | null = null;
+  private sessionOperationQueue = Promise.resolve();
 
   constructor(config: CrdtSessionManagerConfig) {
     this.app = config.app;
@@ -56,14 +57,53 @@ export class CrdtSessionManager {
   }
 
   async bindToFile(file: TFile | null): Promise<void> {
+    return this.runSessionOperation(async () => {
+      await this.bindToFileNow(file);
+    });
+  }
+
+  async refreshActiveSession(): Promise<void> {
+    return this.runSessionOperation(async () => {
+      if (!this.activeSession) {
+        return;
+      }
+
+      const { file } = this.activeSession;
+      await this.bindToFileNow(file);
+    });
+  }
+
+  async disconnect(): Promise<void> {
+    return this.runSessionOperation(async () => {
+      this.detachActiveSession();
+      await this.activeSession?.destroy();
+      this.activeSession = null;
+    });
+  }
+
+  async goOffline(): Promise<void> {
+    return this.runSessionOperation(async () => {
+      if (!this.activeSession) {
+        return;
+      }
+
+      await this.activeSession.goOffline();
+    });
+  }
+
+  private async bindToFileNow(file: TFile | null): Promise<void> {
     if (!file || file.extension !== "md") {
-      await this.disconnect();
+      this.detachActiveSession();
+      await this.activeSession?.destroy();
+      this.activeSession = null;
       return;
     }
 
     const entry = this.resolveEntryByLocalPath(file.path);
     if (!entry || entry.kind !== "markdown") {
-      await this.disconnect();
+      this.detachActiveSession();
+      await this.activeSession?.destroy();
+      this.activeSession = null;
       return;
     }
 
@@ -89,7 +129,9 @@ export class CrdtSessionManager {
       return;
     }
 
-    await this.disconnect();
+    this.detachActiveSession();
+    await this.activeSession?.destroy();
+    this.activeSession = null;
 
     if (liveSyncEnabled) {
       if (localBootstrapState) {
@@ -112,27 +154,17 @@ export class CrdtSessionManager {
     this.log(`No persisted CRDT cache is available for offline markdown ${file.path}. Remote-safe merge will start after the next live sync.`);
   }
 
-  async refreshActiveSession(): Promise<void> {
-    if (!this.activeSession) {
-      return;
-    }
-
-    const { file } = this.activeSession;
-    await this.bindToFile(file);
-  }
-
-  async disconnect(): Promise<void> {
-    this.detachActiveSession();
-    await this.activeSession?.destroy();
-    this.activeSession = null;
-  }
-
   handleEditorChange(editor: Editor, view: MarkdownView): void {
     if (!this.activeSession || !view.file) {
       return;
     }
 
     if (view.file.path !== this.activeSession.file.path) {
+      return;
+    }
+
+    const editorView = getCodeMirrorEditorView(editor);
+    if (!editorView?.hasFocus) {
       return;
     }
 
@@ -145,14 +177,6 @@ export class CrdtSessionManager {
     }
 
     this.activeSession.updateLocalPresence(editor, focused);
-  }
-
-  async goOffline(): Promise<void> {
-    if (!this.activeSession) {
-      return;
-    }
-
-    await this.activeSession.goOffline();
   }
 
   getState(): CrdtSessionState | null {
@@ -255,6 +279,15 @@ export class CrdtSessionManager {
       this.persistCrdtState(this.activeSession.entry.id, this.activeSession.file.path, pendingOfflineUpdate);
     }
     return pendingOfflineUpdate;
+  }
+
+  private async runSessionOperation<T>(operation: () => Promise<T>): Promise<T> {
+    const next = this.sessionOperationQueue.then(operation, operation);
+    this.sessionOperationQueue = next.then(
+      () => undefined,
+      () => undefined
+    );
+    return next;
   }
 }
 

@@ -12,6 +12,7 @@ import {
   toLocalPathForRoom,
   toServerPathForRoom
 } from "../sync/path-mapper";
+import { isMarkdownPath } from "../utils/file-kind";
 
 type RemotePathChangeType = "rename_entry" | "move_entry";
 
@@ -32,9 +33,12 @@ interface FileBridgeConfig {
   getEntryByPath: (workspaceId: string, path: string) => FileEntry | null;
   hasPendingCreate: (workspaceId: string, path: string) => boolean;
   hasPendingDelete: (workspaceId: string, path: string) => boolean;
+  hasPendingBinaryWrite: (localPath: string) => boolean;
   log: (message: string) => void;
   onCreateFolder: (workspaceId: string, path: string) => Promise<void>;
   onCreateMarkdown: (workspaceId: string, path: string, localContent: string) => Promise<void>;
+  onCreateBinary: (workspaceId: string, path: string, localContent: ArrayBuffer) => Promise<void>;
+  onUpdateBinary: (workspaceId: string, entry: FileEntry, localContent: ArrayBuffer) => Promise<void>;
   onRenameOrMove: (
     workspaceId: string,
     entry: FileEntry,
@@ -43,10 +47,13 @@ interface FileBridgeConfig {
   ) => Promise<void>;
   onDeleteEntry: (workspaceId: string, entry: FileEntry) => Promise<void>;
   onRemotePathObserved?: (workspaceId: string, localPath: string, serverPath: string) => void;
+  wasPathRecentlyObservedAsRemote?: (workspaceId: string, localPath: string) => boolean;
 }
 
 export class FileBridge {
   private static readonly REMOTE_CREATE_GUARD_MS = 10_000;
+  private static readonly REMOTE_WRITE_GUARD_MS = 4_000;
+  private static readonly REMOTE_BINARY_PLACEHOLDER_GUARD_MS = 5 * 60_000;
   private readonly app: App;
   private readonly getSyncRoot: () => string;
   private readonly getFolderName: (workspaceId: string) => string | null;
@@ -54,9 +61,12 @@ export class FileBridge {
   private readonly getEntryByPath: (workspaceId: string, path: string) => FileEntry | null;
   private readonly hasPendingCreate: (workspaceId: string, path: string) => boolean;
   private readonly hasPendingDelete: (workspaceId: string, path: string) => boolean;
+  private readonly hasPendingBinaryWrite: (localPath: string) => boolean;
   private readonly log: (message: string) => void;
   private readonly onCreateFolder: (workspaceId: string, path: string) => Promise<void>;
   private readonly onCreateMarkdown: (workspaceId: string, path: string, localContent: string) => Promise<void>;
+  private readonly onCreateBinary: (workspaceId: string, path: string, localContent: ArrayBuffer) => Promise<void>;
+  private readonly onUpdateBinary: (workspaceId: string, entry: FileEntry, localContent: ArrayBuffer) => Promise<void>;
   private readonly onRenameOrMove: (
     workspaceId: string,
     entry: FileEntry,
@@ -65,10 +75,13 @@ export class FileBridge {
   ) => Promise<void>;
   private readonly onDeleteEntry: (workspaceId: string, entry: FileEntry) => Promise<void>;
   private readonly onRemotePathObserved?: (workspaceId: string, localPath: string, serverPath: string) => void;
+  private readonly wasPathRecentlyObservedAsRemote?: (workspaceId: string, localPath: string) => boolean;
   private readonly suppressedPrefixes = new Map<string, number>();
   private readonly recentRemoteCreates = new Map<string, number>();
+  private readonly recentRemoteWrites = new Map<string, number>();
   private readonly recentRemoteRenames = new Map<string, number>();
   private readonly recentRemoteDeletes = new Map<string, number>();
+  private readonly protectedRemoteBinaryPlaceholders = new Map<string, number>();
 
   constructor(config: FileBridgeConfig) {
     this.app = config.app;
@@ -78,12 +91,16 @@ export class FileBridge {
     this.getEntryByPath = config.getEntryByPath;
     this.hasPendingCreate = config.hasPendingCreate;
     this.hasPendingDelete = config.hasPendingDelete;
+    this.hasPendingBinaryWrite = config.hasPendingBinaryWrite;
     this.log = config.log;
     this.onCreateFolder = config.onCreateFolder;
     this.onCreateMarkdown = config.onCreateMarkdown;
+    this.onCreateBinary = config.onCreateBinary;
+    this.onUpdateBinary = config.onUpdateBinary;
     this.onRenameOrMove = config.onRenameOrMove;
     this.onDeleteEntry = config.onDeleteEntry;
     this.onRemotePathObserved = config.onRemotePathObserved;
+    this.wasPathRecentlyObservedAsRemote = config.wasPathRecentlyObservedAsRemote;
   }
 
   async applySnapshot(snapshot: TreeSnapshotResponse, previousEntries: FileEntry[]): Promise<void> {
@@ -166,6 +183,21 @@ export class FileBridge {
       return;
     }
 
+    if (this.wasPathRecentlyObservedAsRemote?.(resolved.workspaceId, file.path)) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+
+    if (
+      file instanceof TFile &&
+      !isMarkdownPath(file.path) &&
+      this.isProtectedRemoteBinaryPlaceholder(file.path) &&
+      !this.hasPendingBinaryWrite(file.path)
+    ) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+
     if (
       this.getEntryByPath(resolved.workspaceId, resolved.serverPath) &&
       !this.hasPendingDelete(resolved.workspaceId, resolved.serverPath)
@@ -179,7 +211,7 @@ export class FileBridge {
       return;
     }
 
-    if (file instanceof TFile && file.extension === "md") {
+    if (file instanceof TFile && isMarkdownPath(file.path)) {
       await this.onCreateMarkdown(
         resolved.workspaceId,
         resolved.serverPath,
@@ -188,7 +220,76 @@ export class FileBridge {
       return;
     }
 
-    this.log(`Ignoring unsupported local create for ${file.path}. Blob upload is not implemented yet.`);
+    if (file instanceof TFile) {
+      const existingEntry = this.getEntryByPath(resolved.workspaceId, resolved.serverPath);
+      if (existingEntry && existingEntry.kind === "binary" && !existingEntry.deleted) {
+        await this.onUpdateBinary(
+          resolved.workspaceId,
+          existingEntry,
+          await this.readBinaryFile(file)
+        );
+        return;
+      }
+
+      await this.onCreateBinary(
+        resolved.workspaceId,
+        resolved.serverPath,
+        await this.readBinaryFile(file)
+      );
+      return;
+    }
+  }
+
+  async handleVaultModify(file: TAbstractFile): Promise<void> {
+    if (!(file instanceof TFile)) {
+      return;
+    }
+
+    const resolved = this.resolveRoomPath(file.path);
+    if (!resolved || this.isSuppressedPath(file.path) || isMarkdownPath(file.path)) {
+      return;
+    }
+
+    if (this.consumeRecentRemoteWrite(file.path) || this.consumeRecentRemoteCreate(file.path)) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+
+    if (this.wasPathRecentlyObservedAsRemote?.(resolved.workspaceId, file.path)) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+
+    if (
+      this.isProtectedRemoteBinaryPlaceholder(file.path) &&
+      !this.hasPendingBinaryWrite(file.path)
+    ) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+
+    const existingEntry = this.getEntryByPath(resolved.workspaceId, resolved.serverPath);
+    if (existingEntry && !existingEntry.deleted) {
+      if (!existingEntry.blob && !this.hasPendingBinaryWrite(file.path)) {
+        this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+        return;
+      }
+
+      await this.onUpdateBinary(
+        resolved.workspaceId,
+        existingEntry,
+        await this.readBinaryFile(file)
+      );
+      return;
+    }
+
+    if (!this.hasPendingDelete(resolved.workspaceId, resolved.serverPath)) {
+      await this.onCreateBinary(
+        resolved.workspaceId,
+        resolved.serverPath,
+        await this.readBinaryFile(file)
+      );
+    }
   }
 
   async handleVaultRename(file: TAbstractFile, oldPath: string): Promise<void> {
@@ -330,6 +431,7 @@ export class FileBridge {
     await this.withSuppressedPaths([oldLocalPath, newLocalPath], async () => {
       await this.app.fileManager.renameFile(existing, newLocalPath);
     });
+    this.moveProtectedRemoteBinaryPlaceholder(oldLocalPath, newLocalPath);
   }
 
   private async ensureLocalEntry(workspaceId: string, folderName: string, entry: FileEntry): Promise<void> {
@@ -356,7 +458,13 @@ export class FileBridge {
       return;
     }
 
-    this.log(`Skipping binary materialization for ${entry.path} until blob download is implemented.`);
+    this.markRecentRemoteCreate(localPath);
+    this.markRecentRemoteWrite(localPath);
+    this.markProtectedRemoteBinaryPlaceholder(localPath);
+    this.onRemotePathObserved?.(workspaceId, localPath, entry.path);
+    await this.withSuppressedPaths([localPath], async () => {
+      await this.app.vault.createBinary(localPath, new ArrayBuffer(0));
+    });
   }
 
   private async trashLocalEntry(folderName: string, serverPath: string): Promise<void> {
@@ -367,6 +475,7 @@ export class FileBridge {
     }
 
     this.markRecentRemoteDelete(localPath);
+    this.clearProtectedRemoteBinaryPlaceholder(localPath);
     await this.withSuppressedPaths([localPath], async () => {
       await this.app.vault.trash(existing, false);
     });
@@ -411,6 +520,48 @@ export class FileBridge {
       this.log(`Failed to read markdown content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
       return "";
     }
+  }
+
+  private async readBinaryFile(file: TFile): Promise<ArrayBuffer> {
+    try {
+      return await this.app.vault.readBinary(file);
+    } catch (error) {
+      this.log(`Failed to read binary content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
+      return new ArrayBuffer(0);
+    }
+  }
+
+  async writeBinaryContent(workspaceId: string, serverPath: string, data: ArrayBuffer): Promise<string | null> {
+    const folderName = this.getFolderName(workspaceId);
+    if (!folderName) {
+      return null;
+    }
+
+    const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, serverPath);
+    await this.ensureFolderExists(getParentPath(localPath));
+    const existing = this.app.vault.getAbstractFileByPath(localPath);
+
+    if (existing instanceof TFile) {
+      this.markRecentRemoteWrite(localPath);
+      await this.withSuppressedPaths([localPath], async () => {
+        await this.app.vault.modifyBinary(existing, data);
+      });
+      this.clearProtectedRemoteBinaryPlaceholder(localPath);
+      return localPath;
+    }
+
+    if (existing) {
+      throw new Error(`Cannot write binary content to ${localPath} because a folder already exists there.`);
+    }
+
+    this.markRecentRemoteCreate(localPath);
+    this.markRecentRemoteWrite(localPath);
+    this.onRemotePathObserved?.(workspaceId, localPath, serverPath);
+    await this.withSuppressedPaths([localPath], async () => {
+      await this.app.vault.createBinary(localPath, data);
+    });
+    this.clearProtectedRemoteBinaryPlaceholder(localPath);
+    return localPath;
   }
 
   private isSuppressedPath(path: string): boolean {
@@ -498,6 +649,32 @@ export class FileBridge {
     return true;
   }
 
+  private markRecentRemoteWrite(path: string): void {
+    const normalizedPath = normalizePath(path);
+    const previousHandle = this.recentRemoteWrites.get(normalizedPath);
+    if (previousHandle !== undefined) {
+      window.clearTimeout(previousHandle);
+    }
+
+    const handle = window.setTimeout(() => {
+      this.recentRemoteWrites.delete(normalizedPath);
+    }, FileBridge.REMOTE_WRITE_GUARD_MS);
+    this.recentRemoteWrites.set(normalizedPath, handle);
+  }
+
+  private consumeRecentRemoteWrite(path: string): boolean {
+    const normalizedPath = normalizePath(path);
+    const handle = this.recentRemoteWrites.get(normalizedPath);
+    if (handle === undefined) {
+      return false;
+    }
+
+    window.clearTimeout(handle);
+    this.recentRemoteWrites.delete(normalizedPath);
+    this.log(`Ignored modify echo for remotely materialized path ${normalizedPath}.`);
+    return true;
+  }
+
   private markRecentRemoteRename(oldPath: string, newPath: string): void {
     const key = this.buildRemoteRenameKey(oldPath, newPath);
     const previousHandle = this.recentRemoteRenames.get(key);
@@ -550,6 +727,46 @@ export class FileBridge {
     return true;
   }
 
+  private markProtectedRemoteBinaryPlaceholder(path: string): void {
+    const normalizedPath = normalizePath(path);
+    const previousHandle = this.protectedRemoteBinaryPlaceholders.get(normalizedPath);
+    if (previousHandle !== undefined) {
+      window.clearTimeout(previousHandle);
+    }
+
+    const handle = window.setTimeout(() => {
+      this.protectedRemoteBinaryPlaceholders.delete(normalizedPath);
+    }, FileBridge.REMOTE_BINARY_PLACEHOLDER_GUARD_MS);
+    this.protectedRemoteBinaryPlaceholders.set(normalizedPath, handle);
+  }
+
+  private clearProtectedRemoteBinaryPlaceholder(path: string): void {
+    const normalizedPath = normalizePath(path);
+    const handle = this.protectedRemoteBinaryPlaceholders.get(normalizedPath);
+    if (handle === undefined) {
+      return;
+    }
+
+    window.clearTimeout(handle);
+    this.protectedRemoteBinaryPlaceholders.delete(normalizedPath);
+  }
+
+  private moveProtectedRemoteBinaryPlaceholder(oldPath: string, newPath: string): void {
+    const normalizedOldPath = normalizePath(oldPath);
+    const handle = this.protectedRemoteBinaryPlaceholders.get(normalizedOldPath);
+    if (handle === undefined) {
+      return;
+    }
+
+    window.clearTimeout(handle);
+    this.protectedRemoteBinaryPlaceholders.delete(normalizedOldPath);
+    this.markProtectedRemoteBinaryPlaceholder(newPath);
+  }
+
+  private isProtectedRemoteBinaryPlaceholder(path: string): boolean {
+    return this.protectedRemoteBinaryPlaceholders.has(normalizePath(path));
+  }
+
   private forgetRecentRemoteHistory(path: string): void {
     const normalizedPath = normalizePath(path);
 
@@ -557,6 +774,12 @@ export class FileBridge {
     if (createHandle !== undefined) {
       window.clearTimeout(createHandle);
       this.recentRemoteCreates.delete(normalizedPath);
+    }
+
+    const writeHandle = this.recentRemoteWrites.get(normalizedPath);
+    if (writeHandle !== undefined) {
+      window.clearTimeout(writeHandle);
+      this.recentRemoteWrites.delete(normalizedPath);
     }
 
     const deleteHandle = this.recentRemoteDeletes.get(normalizedPath);

@@ -562,7 +562,8 @@ export class RolaySettingTab extends PluginSettingTab {
     this.createInfoBlock(syncCard.body, [
       ["Status", room.downloaded ? room.streamStatus : "not installed"],
       ["Last snapshot", room.lastSnapshotLabel],
-      ["Last cursor", room.lastCursorLabel]
+      ["Last cursor", room.lastCursorLabel],
+      ["File transfers", room.binaryTransferLabel]
     ]);
     if (room.downloaded) {
       const syncActions = this.createActionRow(syncCard.body);

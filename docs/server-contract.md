@@ -15,7 +15,7 @@ Rolay `v1` splits sync into three layers:
 4. Settings/admin realtime
    Dedicated SSE stream for profile, room-list, invite, and admin management UI.
 
-Binary content remains blob-based and is addressed by `sha256`.
+Binary content remains blob-based and is addressed by canonical `sha256:<base64>` digests. Legacy hex digests may still appear in older local/plugin state and should be normalized on read.
 
 ## Identity Model
 
@@ -182,6 +182,43 @@ The response provides:
 
 The websocket transport is standard Yjs-compatible transport, not a custom binary protocol. The plugin first fills local CRDT cache via `/markdown/bootstrap`, then still uses `crdt-token` for live collaborative editing.
 
+### Binary Blob Transfer
+
+- `POST /v1/files/{entryId}/blob/upload-ticket`
+- `PUT /v1/files/{entryId}/blob/uploads/{uploadId}/content`
+- `DELETE /v1/files/{entryId}/blob/uploads/{uploadId}`
+- `POST /v1/files/{entryId}/blob/download-ticket`
+
+Binary upload contract:
+
+1. create a tree entry through `create_binary_placeholder`
+2. ask the server for an upload ticket with `hash`, `sizeBytes`, `mimeType`
+3. if `alreadyExists=true`, skip byte upload
+4. otherwise upload the raw bytes to `PUT /v1/files/{entryId}/blob/uploads/{uploadId}/content` with Bearer auth and `Content-Type: application/octet-stream`
+5. publish the new revision through `commit_blob_revision`
+
+The plugin normalizes blob hashes to canonical `sha256:<base64>` before upload, commit, download verification, and local cache comparisons.
+6. if the new API endpoint is unavailable, the plugin may still fall back to the legacy raw `upload.url`, but that is no longer the primary flow
+
+Important upload fields:
+
+- `alreadyExists`
+- `uploadId`
+- `hash`
+- `sizeBytes`
+- `mimeType`
+- `expiresAt`
+- `upload` (legacy fallback only)
+- `cancel`
+
+Binary download contract:
+
+1. request a download ticket
+2. fetch the returned download URL
+3. trust `Content-Length` and `X-Rolay-Blob-Hash` for byte-aware progress and integrity checks
+
+The plugin treats only `.md` as CRDT content. Every other file extension, including `.txt`, uses this blob flow.
+
 ## Tree Mutation Rules
 
 Tree writes are sent through:
@@ -218,3 +255,4 @@ Supported server operation types:
 - Device label and startup auto-connect behavior are fixed by the plugin instead of being user-configurable.
 - Markdown bootstrap is kept separate from `/tree`; the plugin fetches tree metadata first, then byte metadata from `/markdown/bootstrap`, and finally pulls Yjs state in batches through the same endpoint.
 - SSE payload shape is treated defensively. The plugin advances cursor state and refreshes the authoritative tree snapshot when tree/blob events arrive instead of assuming a fully materialized `FileEntry` in every SSE payload.
+- For binary files, local vault changes are uploaded through the blob ticket flow, while incoming server revisions are downloaded through blob download tickets and applied only after integrity checks succeed.

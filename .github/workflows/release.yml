@@ -1,0 +1,84 @@
+name: Release Obsidian Plugin
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify release version
+        shell: bash
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          fi
+
+          MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+
+          if [ "v${MANIFEST_VERSION}" != "${TAG}" ]; then
+            echo "manifest.json version ${MANIFEST_VERSION} does not match tag ${TAG}"
+            exit 1
+          fi
+
+          if [ "${PACKAGE_VERSION}" != "${MANIFEST_VERSION}" ]; then
+            echo "package.json version ${PACKAGE_VERSION} does not match manifest.json version ${MANIFEST_VERSION}"
+            exit 1
+          fi
+
+          node -e "const versions=require('./versions.json'); const manifest=require('./manifest.json'); if(!versions[manifest.version]){ console.error('versions.json is missing ' + manifest.version); process.exit(1); }"
+
+      - name: Type-check
+        run: npm run check
+
+      - name: Build plugin
+        run: npm run build
+
+      - name: Create plugin archive
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp manifest.json main.js styles.css versions.json dist/
+          cd dist
+          zip -r "rolay-${GITHUB_REF_NAME#v}.zip" manifest.json main.js styles.css versions.json
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/manifest.json
+            dist/main.js
+            dist/styles.css
+            dist/versions.json
+            dist/rolay-*.zip

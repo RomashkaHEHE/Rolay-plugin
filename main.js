@@ -8424,6 +8424,7 @@ glo[importIdentifier] = true;
 
 // src/api/client.ts
 var import_obsidian = require("obsidian");
+var MAX_BINARY_REDIRECTS = 5;
 var RolayApiError = class extends Error {
   constructor(status, message, code = "http_error", details) {
     super(message);
@@ -8630,6 +8631,180 @@ var RolayApiClient = class {
       `/v1/files/${encodeURIComponent(entryId)}/blob/download-ticket`
     );
   }
+  async cancelBlobUpload(entryId, uploadId) {
+    return this.requestJson(
+      "DELETE",
+      `/v1/files/${encodeURIComponent(entryId)}/blob/uploads/${encodeURIComponent(uploadId)}`
+    );
+  }
+  async uploadBlobContent(entryId, uploadId, data, expectedHash, onProgress, signal, fallbackTarget) {
+    const path = `/v1/files/${encodeURIComponent(entryId)}/blob/uploads/${encodeURIComponent(uploadId)}/content`;
+    try {
+      return await this.uploadBlobContentWithRefresh(
+        path,
+        data,
+        expectedHash,
+        onProgress,
+        signal
+      );
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw error;
+      }
+      if (!fallbackTarget || !shouldFallbackToRawUpload(error)) {
+        throw error;
+      }
+      try {
+        await this.uploadBlobToTarget(fallbackTarget, data, onProgress, signal);
+        return {
+          ok: true,
+          hash: expectedHash,
+          sizeBytes: data.byteLength
+        };
+      } catch (fallbackError) {
+        if (fallbackError instanceof Error && fallbackError.name === "AbortError") {
+          throw fallbackError;
+        }
+        throw new Error(
+          `Authenticated blob upload failed (${formatUploadTransportError(error)}); raw upload fallback also failed (${formatUploadTransportError(fallbackError)}).`
+        );
+      }
+    }
+  }
+  async uploadBlobToTarget(target, data, onProgress, signal) {
+    const uploadTarget = target;
+    if (!uploadTarget) {
+      throw new Error("Blob upload target is missing.");
+    }
+    const transportErrors = [];
+    const electronUpload = tryElectronBinaryUpload(uploadTarget, data, onProgress, signal);
+    if (electronUpload) {
+      try {
+        await electronUpload;
+        return;
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          throw error;
+        }
+        transportErrors.push(`electron: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else {
+      transportErrors.push("electron: unavailable");
+    }
+    const nodeUpload = tryNodeBinaryUpload(uploadTarget, data, onProgress, signal);
+    if (nodeUpload) {
+      try {
+        await nodeUpload;
+        return;
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          throw error;
+        }
+        transportErrors.push(`node: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else {
+      transportErrors.push("node: unavailable");
+    }
+    try {
+      await xhrBinaryRequest({
+        method: uploadTarget.method,
+        url: uploadTarget.url,
+        headers: uploadTarget.headers,
+        body: data,
+        signal,
+        onUploadProgress: onProgress
+      });
+      return;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw error;
+      }
+      transportErrors.push(`xhr: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      const response = await fetch(uploadTarget.url, {
+        method: uploadTarget.method,
+        headers: uploadTarget.headers,
+        body: new Uint8Array(data),
+        signal
+      });
+      if (!response.ok) {
+        throw await this.createFetchError(response);
+      }
+      onProgress?.({
+        loadedBytes: data.byteLength,
+        totalBytes: data.byteLength
+      });
+      return;
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw error;
+      }
+      transportErrors.push(`fetch: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    throw new Error(`Blob upload failed via all transports (${transportErrors.join("; ")})`);
+  }
+  async downloadBlobFromUrl(url, onProgress, signal) {
+    const transportErrors = [];
+    const electronDownload = tryElectronBinaryDownload(url, onProgress, signal);
+    if (electronDownload) {
+      try {
+        return await electronDownload;
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          throw error;
+        }
+        transportErrors.push(`electron: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else {
+      transportErrors.push("electron: unavailable");
+    }
+    const nodeDownload = tryNodeBinaryDownload(url, onProgress, signal);
+    if (nodeDownload) {
+      try {
+        return await nodeDownload;
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          throw error;
+        }
+        transportErrors.push(`node: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    } else {
+      transportErrors.push("node: unavailable");
+    }
+    try {
+      return await xhrBinaryRequest({
+        method: "GET",
+        url,
+        responseType: "arraybuffer",
+        signal,
+        onDownloadProgress: onProgress,
+        mapResponse: (request) => {
+          const data = normalizeArrayBufferResponse(request.response);
+          return {
+            data,
+            contentType: request.getResponseHeader("Content-Type"),
+            contentLength: parseContentLengthHeader(request.getResponseHeader("Content-Length")),
+            hash: request.getResponseHeader("X-Rolay-Blob-Hash")
+          };
+        }
+      });
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw error;
+      }
+      transportErrors.push(`xhr: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      return await fetchBinaryDownload(url, onProgress, signal);
+    } catch (error) {
+      if (error instanceof Error && error.name === "AbortError") {
+        throw error;
+      }
+      transportErrors.push(`fetch: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    throw new Error(`Blob download failed via all transports (${transportErrors.join("; ")})`);
+  }
   async fetchAuthorizedStream(path, init = {}) {
     const initialToken = await this.getAccessToken();
     let response = await this.fetchStream(path, initialToken, init);
@@ -8718,9 +8893,658 @@ var RolayApiClient = class {
     const responseText = await response.text();
     return createTextError(response.status, responseText, fallbackMessage);
   }
+  async uploadBlobContentWithRefresh(path, data, expectedHash, onProgress, signal) {
+    const initialToken = await this.getAccessToken();
+    try {
+      return await this.performAuthorizedBlobUpload(
+        path,
+        initialToken,
+        data,
+        expectedHash,
+        onProgress,
+        signal
+      );
+    } catch (error) {
+      if (!(error instanceof RolayApiError) || error.status !== 401) {
+        throw error;
+      }
+      await this.refresh();
+      const nextToken = await this.getAccessToken();
+      return this.performAuthorizedBlobUpload(
+        path,
+        nextToken,
+        data,
+        expectedHash,
+        onProgress,
+        signal
+      );
+    }
+  }
+  async performAuthorizedBlobUpload(path, accessToken, data, expectedHash, onProgress, signal) {
+    const headers = {
+      Accept: "application/json",
+      Authorization: `Bearer ${accessToken}`,
+      "Content-Type": "application/octet-stream"
+    };
+    const absoluteUrl = this.buildUrl(path);
+    const nodeResponse = tryNodeBinaryRequest(
+      {
+        method: "PUT",
+        url: absoluteUrl,
+        headers
+      },
+      data,
+      onProgress,
+      signal
+    );
+    if (nodeResponse) {
+      const response2 = await nodeResponse;
+      if (response2.status >= 200 && response2.status < 300) {
+        return parseBlobUploadContentResponse(
+          response2.text,
+          expectedHash,
+          data.byteLength
+        );
+      }
+      throw createTextError(response2.status, response2.text, response2.statusText || `HTTP ${response2.status}`);
+    }
+    try {
+      return await xhrBinaryRequest({
+        method: "PUT",
+        url: absoluteUrl,
+        headers,
+        body: data,
+        signal,
+        onUploadProgress: onProgress,
+        mapResponse: (request) => {
+          return parseBlobUploadContentResponse(
+            extractXhrResponseText(request),
+            expectedHash,
+            data.byteLength
+          );
+        }
+      });
+    } catch (error) {
+      if (error instanceof RolayApiError || error instanceof Error && error.name === "AbortError") {
+        throw error;
+      }
+    }
+    const response = await fetch(absoluteUrl, {
+      method: "PUT",
+      headers,
+      body: new Uint8Array(data),
+      signal
+    });
+    if (!response.ok) {
+      throw await this.createFetchError(response);
+    }
+    onProgress?.({
+      loadedBytes: data.byteLength,
+      totalBytes: data.byteLength
+    });
+    return parseBlobUploadContentResponse(
+      await response.text(),
+      expectedHash,
+      data.byteLength
+    );
+  }
 };
+function xhrBinaryRequest(options) {
+  return new Promise((resolve, reject) => {
+    const request = new XMLHttpRequest();
+    request.open(options.method, options.url, true);
+    request.responseType = options.responseType ?? "";
+    for (const [header, value] of Object.entries(options.headers ?? {})) {
+      request.setRequestHeader(header, value);
+    }
+    const cleanup = () => {
+      options.signal?.removeEventListener("abort", abortHandler);
+    };
+    const abortHandler = () => {
+      request.abort();
+      cleanup();
+      reject(createAbortError());
+    };
+    if (options.signal) {
+      if (options.signal.aborted) {
+        reject(createAbortError());
+        return;
+      }
+      options.signal.addEventListener("abort", abortHandler, { once: true });
+    }
+    request.upload.onprogress = (event) => {
+      if (!options.onUploadProgress) {
+        return;
+      }
+      options.onUploadProgress({
+        loadedBytes: event.loaded,
+        totalBytes: event.lengthComputable ? event.total : options.body?.byteLength ?? 0
+      });
+    };
+    request.onprogress = (event) => {
+      if (!options.onDownloadProgress) {
+        return;
+      }
+      options.onDownloadProgress({
+        loadedBytes: event.loaded,
+        totalBytes: event.lengthComputable ? event.total : 0
+      });
+    };
+    request.onerror = () => {
+      cleanup();
+      reject(new Error(`Request to ${options.url} failed.`));
+    };
+    request.onabort = () => {
+      cleanup();
+      reject(createAbortError());
+    };
+    request.onload = () => {
+      cleanup();
+      if (request.status < 200 || request.status >= 300) {
+        reject(
+          createTextError(
+            request.status,
+            extractXhrResponseText(request),
+            request.statusText || `HTTP ${request.status}`
+          )
+        );
+        return;
+      }
+      if (options.mapResponse) {
+        resolve(options.mapResponse(request));
+        return;
+      }
+      resolve(void 0);
+    };
+    request.send(options.body);
+  });
+}
+function tryNodeBinaryUpload(target, data, onProgress, signal) {
+  const nodeRequire = getNodeRequire();
+  if (!nodeRequire) {
+    return null;
+  }
+  const targetUrl = new URL(target.url);
+  const requestModule = nodeRequire(targetUrl.protocol === "https:" ? "node:https" : "node:http");
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const headers = { ...target.headers };
+    if (!hasHeader(headers, "content-length")) {
+      headers["Content-Length"] = String(data.byteLength);
+    }
+    const cleanup = () => {
+      signal?.removeEventListener("abort", abortHandler);
+    };
+    const finishReject = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const finishResolve = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const abortHandler = () => {
+      request.destroy(createAbortError());
+      finishReject(createAbortError());
+    };
+    if (signal?.aborted) {
+      finishReject(createAbortError());
+      return;
+    }
+    signal?.addEventListener("abort", abortHandler, { once: true });
+    const request = requestModule.request(
+      {
+        protocol: targetUrl.protocol,
+        hostname: targetUrl.hostname,
+        port: targetUrl.port ? Number(targetUrl.port) : void 0,
+        path: `${targetUrl.pathname}${targetUrl.search}`,
+        method: target.method,
+        headers
+      },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => {
+          if (typeof chunk === "string") {
+            chunks.push(Buffer.from(chunk));
+            return;
+          }
+          chunks.push(chunk instanceof Uint8Array ? chunk : Buffer.from(chunk));
+        });
+        response.on("end", () => {
+          const status = response.statusCode ?? 0;
+          if (status < 200 || status >= 300) {
+            const responseText = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+            finishReject(createTextError(status, responseText, response.statusMessage || `HTTP ${status}`));
+            return;
+          }
+          onProgress?.({
+            loadedBytes: data.byteLength,
+            totalBytes: data.byteLength
+          });
+          finishResolve();
+        });
+      }
+    );
+    request.on("error", (error) => {
+      finishReject(new Error(`Request to ${target.url} failed: ${error.message}`));
+    });
+    request.write(Buffer.from(new Uint8Array(data)));
+    request.end();
+  });
+}
+function tryElectronBinaryUpload(target, data, onProgress, signal) {
+  const nodeRequire = getNodeRequire();
+  if (!nodeRequire) {
+    return null;
+  }
+  let electronModule = null;
+  try {
+    electronModule = nodeRequire("electron");
+  } catch {
+    return null;
+  }
+  if (!electronModule?.net?.request) {
+    return null;
+  }
+  const electronNet = electronModule.net;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const request = electronNet.request({
+      method: target.method,
+      url: target.url
+    });
+    const cleanup = () => {
+      signal?.removeEventListener("abort", abortHandler);
+    };
+    const finishReject = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const finishResolve = () => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const abortHandler = () => {
+      request.abort();
+      finishReject(createAbortError());
+    };
+    if (signal?.aborted) {
+      finishReject(createAbortError());
+      return;
+    }
+    signal?.addEventListener("abort", abortHandler, { once: true });
+    for (const [header, value] of Object.entries(target.headers)) {
+      request.setHeader(header, value);
+    }
+    if (!hasHeader(target.headers, "content-length")) {
+      request.setHeader("Content-Length", String(data.byteLength));
+    }
+    request.on("response", (response) => {
+      const chunks = [];
+      response.on("data", (chunk) => {
+        if (typeof chunk === "string") {
+          chunks.push(Buffer.from(chunk));
+          return;
+        }
+        chunks.push(chunk instanceof Uint8Array ? chunk : Buffer.from(chunk));
+      });
+      response.on("end", () => {
+        const status = response.statusCode ?? 0;
+        if (status < 200 || status >= 300) {
+          const responseText = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
+          finishReject(createTextError(status, responseText, response.statusMessage || `HTTP ${status}`));
+          return;
+        }
+        onProgress?.({
+          loadedBytes: data.byteLength,
+          totalBytes: data.byteLength
+        });
+        finishResolve();
+      });
+    });
+    request.on("error", (error) => {
+      finishReject(new Error(`Request to ${target.url} failed: ${error.message}`));
+    });
+    request.write(Buffer.from(new Uint8Array(data)));
+    request.end();
+  });
+}
+function tryNodeBinaryDownload(urlString, onProgress, signal) {
+  const nodeRequire = getNodeRequire();
+  if (!nodeRequire) {
+    return null;
+  }
+  return startNodeBinaryDownload(urlString, onProgress, signal, nodeRequire, 0);
+}
+function startNodeBinaryDownload(urlString, onProgress, signal, nodeRequire, redirectCount) {
+  if (redirectCount > MAX_BINARY_REDIRECTS) {
+    return Promise.reject(new Error(`Binary download redirect limit exceeded for ${urlString}.`));
+  }
+  const targetUrl = new URL(urlString);
+  const requestModule = nodeRequire(targetUrl.protocol === "https:" ? "node:https" : "node:http");
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let request;
+    const cleanup = () => {
+      signal?.removeEventListener("abort", abortHandler);
+    };
+    const finishReject = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const finishResolve = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const abortHandler = () => {
+      request.destroy(createAbortError());
+      finishReject(createAbortError());
+    };
+    if (signal?.aborted) {
+      finishReject(createAbortError());
+      return;
+    }
+    signal?.addEventListener("abort", abortHandler, { once: true });
+    request = requestModule.request(
+      {
+        protocol: targetUrl.protocol,
+        hostname: targetUrl.hostname,
+        port: targetUrl.port ? Number(targetUrl.port) : void 0,
+        path: `${targetUrl.pathname}${targetUrl.search}`,
+        method: "GET"
+      },
+      (response) => {
+        const totalBytes = parseContentLengthHeader(getHeaderValue(response.headers, "content-length"));
+        const chunks = [];
+        let loadedBytes = 0;
+        response.on("data", (chunk) => {
+          const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk instanceof Uint8Array ? chunk : Buffer.from(chunk);
+          chunks.push(bytes);
+          loadedBytes += bytes.byteLength;
+          onProgress?.({
+            loadedBytes,
+            totalBytes: totalBytes ?? loadedBytes
+          });
+        });
+        response.on("end", async () => {
+          const status = response.statusCode ?? 0;
+          const buffer = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+          const location2 = getHeaderValue(response.headers, "location");
+          if (status >= 300 && status < 400 && location2) {
+            try {
+              const redirectedUrl = new URL(location2, urlString).toString();
+              const redirectedResult = await startNodeBinaryDownload(
+                redirectedUrl,
+                onProgress,
+                signal,
+                nodeRequire,
+                redirectCount + 1
+              );
+              finishResolve(redirectedResult);
+            } catch (error) {
+              finishReject(error);
+            }
+            return;
+          }
+          if (status < 200 || status >= 300) {
+            finishReject(createTextError(status, buffer.toString("utf8"), response.statusMessage || `HTTP ${status}`));
+            return;
+          }
+          finishResolve({
+            data: normalizeArrayBufferResponse(buffer),
+            contentType: getHeaderValue(response.headers, "content-type"),
+            contentLength: totalBytes,
+            hash: getHeaderValue(response.headers, "x-rolay-blob-hash")
+          });
+        });
+      }
+    );
+    request.on("error", (error) => {
+      finishReject(new Error(`Request to ${urlString} failed: ${error.message}`));
+    });
+    request.end();
+  });
+}
+function tryElectronBinaryDownload(url, onProgress, signal) {
+  const nodeRequire = getNodeRequire();
+  if (!nodeRequire) {
+    return null;
+  }
+  let electronModule = null;
+  try {
+    electronModule = nodeRequire("electron");
+  } catch {
+    return null;
+  }
+  if (!electronModule?.net?.request) {
+    return null;
+  }
+  return startElectronBinaryDownload(url, onProgress, signal, electronModule.net, 0);
+}
+function startElectronBinaryDownload(url, onProgress, signal, electronNet, redirectCount) {
+  if (redirectCount > MAX_BINARY_REDIRECTS) {
+    return Promise.reject(new Error(`Binary download redirect limit exceeded for ${url}.`));
+  }
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const request = electronNet.request({
+      method: "GET",
+      url
+    });
+    const cleanup = () => {
+      signal?.removeEventListener("abort", abortHandler);
+    };
+    const finishReject = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const finishResolve = (result) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+    const abortHandler = () => {
+      request.abort();
+      finishReject(createAbortError());
+    };
+    if (signal?.aborted) {
+      finishReject(createAbortError());
+      return;
+    }
+    signal?.addEventListener("abort", abortHandler, { once: true });
+    request.on("response", (response) => {
+      const totalBytes = parseContentLengthHeader(getHeaderValue(response.headers, "content-length"));
+      const chunks = [];
+      let loadedBytes = 0;
+      response.on("data", (chunk) => {
+        const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk instanceof Uint8Array ? chunk : Buffer.from(chunk);
+        chunks.push(bytes);
+        loadedBytes += bytes.byteLength;
+        onProgress?.({
+          loadedBytes,
+          totalBytes: totalBytes ?? loadedBytes
+        });
+      });
+      response.on("end", async () => {
+        const status = response.statusCode ?? 0;
+        const buffer = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)));
+        const location2 = getHeaderValue(response.headers, "location");
+        if (status >= 300 && status < 400 && location2) {
+          try {
+            const redirectedUrl = new URL(location2, url).toString();
+            const redirectedResult = await startElectronBinaryDownload(
+              redirectedUrl,
+              onProgress,
+              signal,
+              electronNet,
+              redirectCount + 1
+            );
+            finishResolve(redirectedResult);
+          } catch (error) {
+            finishReject(error);
+          }
+          return;
+        }
+        if (status < 200 || status >= 300) {
+          finishReject(createTextError(status, buffer.toString("utf8"), response.statusMessage || `HTTP ${status}`));
+          return;
+        }
+        finishResolve({
+          data: normalizeArrayBufferResponse(buffer),
+          contentType: getHeaderValue(response.headers, "content-type"),
+          contentLength: totalBytes,
+          hash: getHeaderValue(response.headers, "x-rolay-blob-hash")
+        });
+      });
+    });
+    request.on("error", (error) => {
+      finishReject(new Error(`Request to ${url} failed: ${error.message}`));
+    });
+    request.end();
+  });
+}
+function hasHeader(headers, expectedName) {
+  const normalizedExpected = expectedName.toLowerCase();
+  return Object.keys(headers).some((header) => header.toLowerCase() === normalizedExpected);
+}
+function tryNodeBinaryRequest(requestTarget, data, onProgress, signal) {
+  const nodeRequire = getNodeRequire();
+  if (!nodeRequire) {
+    return null;
+  }
+  const targetUrl = new URL(requestTarget.url);
+  const requestModule = nodeRequire(targetUrl.protocol === "https:" ? "node:https" : "node:http");
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const headers = { ...requestTarget.headers };
+    if (!hasHeader(headers, "content-length")) {
+      headers["Content-Length"] = String(data.byteLength);
+    }
+    let request;
+    const cleanup = () => {
+      signal?.removeEventListener("abort", abortHandler);
+    };
+    const finishReject = (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+    const finishResolve = (response) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(response);
+    };
+    const abortHandler = () => {
+      request.destroy(createAbortError());
+      finishReject(createAbortError());
+    };
+    if (signal?.aborted) {
+      finishReject(createAbortError());
+      return;
+    }
+    signal?.addEventListener("abort", abortHandler, { once: true });
+    request = requestModule.request(
+      {
+        protocol: targetUrl.protocol,
+        hostname: targetUrl.hostname,
+        port: targetUrl.port ? Number(targetUrl.port) : void 0,
+        path: `${targetUrl.pathname}${targetUrl.search}`,
+        method: requestTarget.method,
+        headers
+      },
+      (response) => {
+        const chunks = [];
+        response.on("data", (chunk) => {
+          if (typeof chunk === "string") {
+            chunks.push(Buffer.from(chunk));
+            return;
+          }
+          chunks.push(chunk instanceof Uint8Array ? chunk : Buffer.from(chunk));
+        });
+        response.on("end", () => {
+          onProgress?.({
+            loadedBytes: data.byteLength,
+            totalBytes: data.byteLength
+          });
+          finishResolve({
+            status: response.statusCode ?? 0,
+            statusText: response.statusMessage ?? "",
+            text: Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8")
+          });
+        });
+      }
+    );
+    request.on("error", (error) => {
+      finishReject(new Error(`Request to ${requestTarget.url} failed: ${error.message}`));
+    });
+    request.write(Buffer.from(new Uint8Array(data)));
+    request.end();
+  });
+}
 function createRequestUrlError(response) {
   return createTextError(response.status, response.text, `HTTP ${response.status}`);
+}
+function parseBlobUploadContentResponse(responseText, expectedHash, fallbackSizeBytes) {
+  if (!responseText.trim()) {
+    return {
+      ok: true,
+      hash: expectedHash,
+      sizeBytes: fallbackSizeBytes
+    };
+  }
+  try {
+    const parsed = JSON.parse(responseText);
+    if (parsed?.ok === true) {
+      return {
+        ok: true,
+        hash: typeof parsed.hash === "string" && parsed.hash.trim() ? parsed.hash : expectedHash,
+        sizeBytes: typeof parsed.sizeBytes === "number" && parsed.sizeBytes >= 0 ? parsed.sizeBytes : fallbackSizeBytes
+      };
+    }
+  } catch {
+  }
+  return {
+    ok: true,
+    hash: expectedHash,
+    sizeBytes: fallbackSizeBytes
+  };
 }
 function createTextError(status, responseText, fallbackMessage) {
   try {
@@ -8736,6 +9560,136 @@ function createTextError(status, responseText, fallbackMessage) {
   } catch {
   }
   return new RolayApiError(status, responseText || fallbackMessage);
+}
+function parseContentLengthHeader(value) {
+  if (!value) {
+    return null;
+  }
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+}
+function getHeaderValue(headers, expectedName) {
+  if (!headers) {
+    return null;
+  }
+  const normalizedExpected = expectedName.toLowerCase();
+  for (const [headerName, value] of Object.entries(headers)) {
+    if (headerName.toLowerCase() !== normalizedExpected) {
+      continue;
+    }
+    if (Array.isArray(value)) {
+      return value[0] ?? null;
+    }
+    return value ?? null;
+  }
+  return null;
+}
+function createAbortError() {
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+function normalizeArrayBufferResponse(response) {
+  if (response instanceof ArrayBuffer) {
+    return response;
+  }
+  if (ArrayBuffer.isView(response)) {
+    const view = response;
+    return toOwnedArrayBuffer(new Uint8Array(view.buffer, view.byteOffset, view.byteLength));
+  }
+  return new ArrayBuffer(0);
+}
+function toOwnedArrayBuffer(bytes) {
+  const copy2 = new Uint8Array(bytes.byteLength);
+  copy2.set(bytes);
+  return copy2.buffer;
+}
+async function fetchBinaryDownload(url, onProgress, signal) {
+  const response = await fetch(url, {
+    method: "GET",
+    signal
+  });
+  if (!response.ok) {
+    const responseText = await response.text();
+    throw createTextError(response.status, responseText, `HTTP ${response.status}`);
+  }
+  if (!response.body) {
+    throw new Error("Binary download response body is empty.");
+  }
+  const totalBytes = parseContentLengthHeader(response.headers.get("Content-Length"));
+  const reader = response.body.getReader();
+  const chunks = [];
+  let loadedBytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+    if (!value) {
+      continue;
+    }
+    chunks.push(value);
+    loadedBytes += value.byteLength;
+    onProgress?.({
+      loadedBytes,
+      totalBytes: totalBytes ?? loadedBytes
+    });
+  }
+  return {
+    data: toOwnedArrayBuffer(concatUint8Arrays(chunks)),
+    contentType: response.headers.get("Content-Type"),
+    contentLength: totalBytes,
+    hash: response.headers.get("X-Rolay-Blob-Hash")
+  };
+}
+function concatUint8Arrays(chunks) {
+  const totalLength = chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    result.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return result;
+}
+function extractXhrResponseText(request) {
+  try {
+    if (typeof request.responseText === "string") {
+      return request.responseText;
+    }
+  } catch {
+  }
+  const response = request.response;
+  if (typeof response === "string") {
+    return response;
+  }
+  return "";
+}
+function shouldFallbackToRawUpload(error) {
+  if (!(error instanceof RolayApiError)) {
+    return true;
+  }
+  return error.status === 404 || error.status === 405 || error.status === 408 || error.status === 425 || error.status === 429 || error.status >= 500;
+}
+function formatUploadTransportError(error) {
+  if (error instanceof RolayApiError) {
+    return `${error.code}: ${error.message}`;
+  }
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+function getNodeRequire() {
+  const candidate = globalThis.require ?? globalThis.window?.require;
+  if (typeof candidate === "function") {
+    return candidate;
+  }
+  try {
+    return Function("return typeof require === 'function' ? require : undefined;")() ?? null;
+  } catch {
+    return null;
+  }
 }
 
 // src/obsidian/file-bridge.ts
@@ -8802,13 +9756,72 @@ function isManagedPathForRoom(localPath, syncRoot, folderName) {
   return normalizedLocalPath === roomRoot || normalizedLocalPath.startsWith(`${roomRoot}/`);
 }
 
+// src/utils/file-kind.ts
+function isMarkdownPath(path) {
+  return /\.md$/i.test(path.trim());
+}
+function isBinaryPath(path) {
+  return !isMarkdownPath(path);
+}
+function guessMimeTypeFromPath(path) {
+  const extension = getLowerCaseExtension(path);
+  switch (extension) {
+    case "txt":
+      return "text/plain";
+    case "json":
+      return "application/json";
+    case "csv":
+      return "text/csv";
+    case "pdf":
+      return "application/pdf";
+    case "png":
+      return "image/png";
+    case "jpg":
+    case "jpeg":
+      return "image/jpeg";
+    case "gif":
+      return "image/gif";
+    case "webp":
+      return "image/webp";
+    case "svg":
+      return "image/svg+xml";
+    case "mp3":
+      return "audio/mpeg";
+    case "wav":
+      return "audio/wav";
+    case "m4a":
+      return "audio/mp4";
+    case "mp4":
+      return "video/mp4";
+    case "mov":
+      return "video/quicktime";
+    case "zip":
+      return "application/zip";
+    case "7z":
+      return "application/x-7z-compressed";
+    default:
+      return "application/octet-stream";
+  }
+}
+function getLowerCaseExtension(path) {
+  const normalized = path.replace(/\\/g, "/");
+  const fileName = normalized.slice(normalized.lastIndexOf("/") + 1);
+  const dotIndex = fileName.lastIndexOf(".");
+  if (dotIndex <= 0 || dotIndex === fileName.length - 1) {
+    return "";
+  }
+  return fileName.slice(dotIndex + 1).toLowerCase();
+}
+
 // src/obsidian/file-bridge.ts
 var _FileBridge = class _FileBridge {
   constructor(config) {
     this.suppressedPrefixes = /* @__PURE__ */ new Map();
     this.recentRemoteCreates = /* @__PURE__ */ new Map();
+    this.recentRemoteWrites = /* @__PURE__ */ new Map();
     this.recentRemoteRenames = /* @__PURE__ */ new Map();
     this.recentRemoteDeletes = /* @__PURE__ */ new Map();
+    this.protectedRemoteBinaryPlaceholders = /* @__PURE__ */ new Map();
     this.app = config.app;
     this.getSyncRoot = config.getSyncRoot;
     this.getFolderName = config.getFolderName;
@@ -8816,12 +9829,16 @@ var _FileBridge = class _FileBridge {
     this.getEntryByPath = config.getEntryByPath;
     this.hasPendingCreate = config.hasPendingCreate;
     this.hasPendingDelete = config.hasPendingDelete;
+    this.hasPendingBinaryWrite = config.hasPendingBinaryWrite;
     this.log = config.log;
     this.onCreateFolder = config.onCreateFolder;
     this.onCreateMarkdown = config.onCreateMarkdown;
+    this.onCreateBinary = config.onCreateBinary;
+    this.onUpdateBinary = config.onUpdateBinary;
     this.onRenameOrMove = config.onRenameOrMove;
     this.onDeleteEntry = config.onDeleteEntry;
     this.onRemotePathObserved = config.onRemotePathObserved;
+    this.wasPathRecentlyObservedAsRemote = config.wasPathRecentlyObservedAsRemote;
   }
   async applySnapshot(snapshot, previousEntries) {
     const folderName = this.getFolderName(snapshot.workspace.id);
@@ -8883,6 +9900,14 @@ var _FileBridge = class _FileBridge {
       this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
       return;
     }
+    if (this.wasPathRecentlyObservedAsRemote?.(resolved.workspaceId, file.path)) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+    if (file instanceof import_obsidian3.TFile && !isMarkdownPath(file.path) && this.isProtectedRemoteBinaryPlaceholder(file.path) && !this.hasPendingBinaryWrite(file.path)) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
     if (this.getEntryByPath(resolved.workspaceId, resolved.serverPath) && !this.hasPendingDelete(resolved.workspaceId, resolved.serverPath)) {
       this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
       return;
@@ -8891,7 +9916,7 @@ var _FileBridge = class _FileBridge {
       await this.onCreateFolder(resolved.workspaceId, resolved.serverPath);
       return;
     }
-    if (file instanceof import_obsidian3.TFile && file.extension === "md") {
+    if (file instanceof import_obsidian3.TFile && isMarkdownPath(file.path)) {
       await this.onCreateMarkdown(
         resolved.workspaceId,
         resolved.serverPath,
@@ -8899,7 +9924,64 @@ var _FileBridge = class _FileBridge {
       );
       return;
     }
-    this.log(`Ignoring unsupported local create for ${file.path}. Blob upload is not implemented yet.`);
+    if (file instanceof import_obsidian3.TFile) {
+      const existingEntry = this.getEntryByPath(resolved.workspaceId, resolved.serverPath);
+      if (existingEntry && existingEntry.kind === "binary" && !existingEntry.deleted) {
+        await this.onUpdateBinary(
+          resolved.workspaceId,
+          existingEntry,
+          await this.readBinaryFile(file)
+        );
+        return;
+      }
+      await this.onCreateBinary(
+        resolved.workspaceId,
+        resolved.serverPath,
+        await this.readBinaryFile(file)
+      );
+      return;
+    }
+  }
+  async handleVaultModify(file) {
+    if (!(file instanceof import_obsidian3.TFile)) {
+      return;
+    }
+    const resolved = this.resolveRoomPath(file.path);
+    if (!resolved || this.isSuppressedPath(file.path) || isMarkdownPath(file.path)) {
+      return;
+    }
+    if (this.consumeRecentRemoteWrite(file.path) || this.consumeRecentRemoteCreate(file.path)) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+    if (this.wasPathRecentlyObservedAsRemote?.(resolved.workspaceId, file.path)) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+    if (this.isProtectedRemoteBinaryPlaceholder(file.path) && !this.hasPendingBinaryWrite(file.path)) {
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+    const existingEntry = this.getEntryByPath(resolved.workspaceId, resolved.serverPath);
+    if (existingEntry && !existingEntry.deleted) {
+      if (!existingEntry.blob && !this.hasPendingBinaryWrite(file.path)) {
+        this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+        return;
+      }
+      await this.onUpdateBinary(
+        resolved.workspaceId,
+        existingEntry,
+        await this.readBinaryFile(file)
+      );
+      return;
+    }
+    if (!this.hasPendingDelete(resolved.workspaceId, resolved.serverPath)) {
+      await this.onCreateBinary(
+        resolved.workspaceId,
+        resolved.serverPath,
+        await this.readBinaryFile(file)
+      );
+    }
   }
   async handleVaultRename(file, oldPath) {
     if (this.isSuppressedPath(oldPath) || this.isSuppressedPath(file.path)) {
@@ -9007,6 +10089,7 @@ var _FileBridge = class _FileBridge {
     await this.withSuppressedPaths([oldLocalPath, newLocalPath], async () => {
       await this.app.fileManager.renameFile(existing, newLocalPath);
     });
+    this.moveProtectedRemoteBinaryPlaceholder(oldLocalPath, newLocalPath);
   }
   async ensureLocalEntry(workspaceId, folderName, entry) {
     const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, entry.path);
@@ -9027,7 +10110,13 @@ var _FileBridge = class _FileBridge {
       });
       return;
     }
-    this.log(`Skipping binary materialization for ${entry.path} until blob download is implemented.`);
+    this.markRecentRemoteCreate(localPath);
+    this.markRecentRemoteWrite(localPath);
+    this.markProtectedRemoteBinaryPlaceholder(localPath);
+    this.onRemotePathObserved?.(workspaceId, localPath, entry.path);
+    await this.withSuppressedPaths([localPath], async () => {
+      await this.app.vault.createBinary(localPath, new ArrayBuffer(0));
+    });
   }
   async trashLocalEntry(folderName, serverPath) {
     const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, serverPath);
@@ -9036,6 +10125,7 @@ var _FileBridge = class _FileBridge {
       return;
     }
     this.markRecentRemoteDelete(localPath);
+    this.clearProtectedRemoteBinaryPlaceholder(localPath);
     await this.withSuppressedPaths([localPath], async () => {
       await this.app.vault.trash(existing, false);
     });
@@ -9072,6 +10162,42 @@ var _FileBridge = class _FileBridge {
       this.log(`Failed to read markdown content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
       return "";
     }
+  }
+  async readBinaryFile(file) {
+    try {
+      return await this.app.vault.readBinary(file);
+    } catch (error) {
+      this.log(`Failed to read binary content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
+      return new ArrayBuffer(0);
+    }
+  }
+  async writeBinaryContent(workspaceId, serverPath, data) {
+    const folderName = this.getFolderName(workspaceId);
+    if (!folderName) {
+      return null;
+    }
+    const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, serverPath);
+    await this.ensureFolderExists(getParentPath(localPath));
+    const existing = this.app.vault.getAbstractFileByPath(localPath);
+    if (existing instanceof import_obsidian3.TFile) {
+      this.markRecentRemoteWrite(localPath);
+      await this.withSuppressedPaths([localPath], async () => {
+        await this.app.vault.modifyBinary(existing, data);
+      });
+      this.clearProtectedRemoteBinaryPlaceholder(localPath);
+      return localPath;
+    }
+    if (existing) {
+      throw new Error(`Cannot write binary content to ${localPath} because a folder already exists there.`);
+    }
+    this.markRecentRemoteCreate(localPath);
+    this.markRecentRemoteWrite(localPath);
+    this.onRemotePathObserved?.(workspaceId, localPath, serverPath);
+    await this.withSuppressedPaths([localPath], async () => {
+      await this.app.vault.createBinary(localPath, data);
+    });
+    this.clearProtectedRemoteBinaryPlaceholder(localPath);
+    return localPath;
   }
   isSuppressedPath(path) {
     const normalizedPath = (0, import_obsidian3.normalizePath)(path);
@@ -9143,6 +10269,28 @@ var _FileBridge = class _FileBridge {
     this.log(`Ignored create echo for remotely materialized path ${normalizedPath}.`);
     return true;
   }
+  markRecentRemoteWrite(path) {
+    const normalizedPath = (0, import_obsidian3.normalizePath)(path);
+    const previousHandle = this.recentRemoteWrites.get(normalizedPath);
+    if (previousHandle !== void 0) {
+      window.clearTimeout(previousHandle);
+    }
+    const handle = window.setTimeout(() => {
+      this.recentRemoteWrites.delete(normalizedPath);
+    }, _FileBridge.REMOTE_WRITE_GUARD_MS);
+    this.recentRemoteWrites.set(normalizedPath, handle);
+  }
+  consumeRecentRemoteWrite(path) {
+    const normalizedPath = (0, import_obsidian3.normalizePath)(path);
+    const handle = this.recentRemoteWrites.get(normalizedPath);
+    if (handle === void 0) {
+      return false;
+    }
+    window.clearTimeout(handle);
+    this.recentRemoteWrites.delete(normalizedPath);
+    this.log(`Ignored modify echo for remotely materialized path ${normalizedPath}.`);
+    return true;
+  }
   markRecentRemoteRename(oldPath, newPath) {
     const key = this.buildRemoteRenameKey(oldPath, newPath);
     const previousHandle = this.recentRemoteRenames.get(key);
@@ -9187,12 +10335,50 @@ var _FileBridge = class _FileBridge {
     this.log(`Ignored delete echo for remotely materialized path ${normalizedPath}.`);
     return true;
   }
+  markProtectedRemoteBinaryPlaceholder(path) {
+    const normalizedPath = (0, import_obsidian3.normalizePath)(path);
+    const previousHandle = this.protectedRemoteBinaryPlaceholders.get(normalizedPath);
+    if (previousHandle !== void 0) {
+      window.clearTimeout(previousHandle);
+    }
+    const handle = window.setTimeout(() => {
+      this.protectedRemoteBinaryPlaceholders.delete(normalizedPath);
+    }, _FileBridge.REMOTE_BINARY_PLACEHOLDER_GUARD_MS);
+    this.protectedRemoteBinaryPlaceholders.set(normalizedPath, handle);
+  }
+  clearProtectedRemoteBinaryPlaceholder(path) {
+    const normalizedPath = (0, import_obsidian3.normalizePath)(path);
+    const handle = this.protectedRemoteBinaryPlaceholders.get(normalizedPath);
+    if (handle === void 0) {
+      return;
+    }
+    window.clearTimeout(handle);
+    this.protectedRemoteBinaryPlaceholders.delete(normalizedPath);
+  }
+  moveProtectedRemoteBinaryPlaceholder(oldPath, newPath) {
+    const normalizedOldPath = (0, import_obsidian3.normalizePath)(oldPath);
+    const handle = this.protectedRemoteBinaryPlaceholders.get(normalizedOldPath);
+    if (handle === void 0) {
+      return;
+    }
+    window.clearTimeout(handle);
+    this.protectedRemoteBinaryPlaceholders.delete(normalizedOldPath);
+    this.markProtectedRemoteBinaryPlaceholder(newPath);
+  }
+  isProtectedRemoteBinaryPlaceholder(path) {
+    return this.protectedRemoteBinaryPlaceholders.has((0, import_obsidian3.normalizePath)(path));
+  }
   forgetRecentRemoteHistory(path) {
     const normalizedPath = (0, import_obsidian3.normalizePath)(path);
     const createHandle = this.recentRemoteCreates.get(normalizedPath);
     if (createHandle !== void 0) {
       window.clearTimeout(createHandle);
       this.recentRemoteCreates.delete(normalizedPath);
+    }
+    const writeHandle = this.recentRemoteWrites.get(normalizedPath);
+    if (writeHandle !== void 0) {
+      window.clearTimeout(writeHandle);
+      this.recentRemoteWrites.delete(normalizedPath);
     }
     const deleteHandle = this.recentRemoteDeletes.get(normalizedPath);
     if (deleteHandle !== void 0) {
@@ -9212,6 +10398,8 @@ var _FileBridge = class _FileBridge {
   }
 };
 _FileBridge.REMOTE_CREATE_GUARD_MS = 1e4;
+_FileBridge.REMOTE_WRITE_GUARD_MS = 4e3;
+_FileBridge.REMOTE_BINARY_PLACEHOLDER_GUARD_MS = 5 * 6e4;
 var FileBridge = _FileBridge;
 function getParentPath(path) {
   const normalized = (0, import_obsidian3.normalizePath)(path);
@@ -11259,6 +12447,7 @@ var CrdtSessionManager = class {
   constructor(config) {
     this.pendingOfflineUpdates = /* @__PURE__ */ new Map();
     this.activeSession = null;
+    this.sessionOperationQueue = Promise.resolve();
     this.app = config.app;
     this.apiClient = config.apiClient;
     this.getCurrentUser = config.getCurrentUser;
@@ -11269,13 +12458,46 @@ var CrdtSessionManager = class {
     this.log = config.log;
   }
   async bindToFile(file) {
+    return this.runSessionOperation(async () => {
+      await this.bindToFileNow(file);
+    });
+  }
+  async refreshActiveSession() {
+    return this.runSessionOperation(async () => {
+      if (!this.activeSession) {
+        return;
+      }
+      const { file } = this.activeSession;
+      await this.bindToFileNow(file);
+    });
+  }
+  async disconnect() {
+    return this.runSessionOperation(async () => {
+      this.detachActiveSession();
+      await this.activeSession?.destroy();
+      this.activeSession = null;
+    });
+  }
+  async goOffline() {
+    return this.runSessionOperation(async () => {
+      if (!this.activeSession) {
+        return;
+      }
+      await this.activeSession.goOffline();
+    });
+  }
+  async bindToFileNow(file) {
     if (!file || file.extension !== "md") {
-      await this.disconnect();
+      this.detachActiveSession();
+      await this.activeSession?.destroy();
+      this.activeSession = null;
       return;
     }
     const entry = this.resolveEntryByLocalPath(file.path);
     if (!entry || entry.kind !== "markdown") {
-      await this.disconnect();
+      this.detachActiveSession();
+      await this.activeSession?.destroy();
+      this.activeSession = null;
       return;
     }
     const liveSyncEnabled = this.isLiveSyncEnabledForLocalPath(file.path);
@@ -11296,7 +12518,9 @@ var CrdtSessionManager = class {
       this.activeSession.syncEditorContext();
       return;
     }
-    await this.disconnect();
+    this.detachActiveSession();
+    await this.activeSession?.destroy();
+    this.activeSession = null;
     if (liveSyncEnabled) {
       if (localBootstrapState) {
         this.log(
@@ -11315,23 +12539,15 @@ var CrdtSessionManager = class {
     }
     this.log(`No persisted CRDT cache is available for offline markdown ${file.path}. Remote-safe merge will start after the next live sync.`);
   }
-  async refreshActiveSession() {
-    if (!this.activeSession) {
-      return;
-    }
-    const { file } = this.activeSession;
-    await this.bindToFile(file);
-  }
-  async disconnect() {
-    this.detachActiveSession();
-    await this.activeSession?.destroy();
-    this.activeSession = null;
-  }
   handleEditorChange(editor, view) {
     if (!this.activeSession || !view.file) {
       return;
     }
     if (view.file.path !== this.activeSession.file.path) {
+      return;
+    }
+    const editorView = getCodeMirrorEditorView(editor);
+    if (!editorView?.hasFocus) {
       return;
     }
     this.activeSession.pushLocalText(editor.getValue());
@@ -11341,12 +12557,6 @@ var CrdtSessionManager = class {
       return;
     }
     this.activeSession.updateLocalPresence(editor, focused);
-  }
-  async goOffline() {
-    if (!this.activeSession) {
-      return;
-    }
-    await this.activeSession.goOffline();
   }
   getState() {
     if (!this.activeSession) {
@@ -11430,6 +12640,14 @@ var CrdtSessionManager = class {
       this.persistCrdtState(this.activeSession.entry.id, this.activeSession.file.path, pendingOfflineUpdate);
     }
     return pendingOfflineUpdate;
+  }
+  async runSessionOperation(operation) {
+    const next = this.sessionOperationQueue.then(operation, operation);
+    this.sessionOperationQueue = next.then(
+      () => void 0,
+      () => void 0
+    );
+    return next;
   }
 };
 var BoundCrdtSession = class {
@@ -11845,6 +13063,129 @@ function createMarkdownTextState(text2) {
 
 // src/settings/data.ts
 var import_obsidian6 = require("obsidian");
+
+// src/utils/sha256.ts
+async function sha256Hash(data) {
+  const bytes = data instanceof Uint8Array ? Uint8Array.from(data) : new Uint8Array(data);
+  if (globalThis.crypto?.subtle) {
+    const digest = await globalThis.crypto.subtle.digest("SHA-256", bytes);
+    return normalizeSha256Hash(bytesToBase64(new Uint8Array(digest))) ?? "";
+  }
+  const nodeRequire = getNodeRequire2();
+  if (nodeRequire) {
+    const { createHash } = nodeRequire("node:crypto");
+    const hash = createHash("sha256");
+    hash.update(bytes);
+    const digest = hash.digest("base64");
+    return normalizeSha256Hash(typeof digest === "string" ? digest : bytesToBase64(digest)) ?? "";
+  }
+  throw new Error("No SHA-256 implementation is available in this environment.");
+}
+function normalizeSha256Hash(hash) {
+  if (typeof hash !== "string") {
+    return null;
+  }
+  const trimmed = hash.trim();
+  if (!trimmed) {
+    return null;
+  }
+  const digest = trimmed.replace(/^sha256:/i, "");
+  if (!digest) {
+    return null;
+  }
+  const canonicalBase64 = canonicalizeDigestToBase64(digest);
+  if (canonicalBase64) {
+    return `sha256:${canonicalBase64}`;
+  }
+  return `sha256:${digest}`;
+}
+function getNodeRequire2() {
+  const candidate = globalThis.require ?? globalThis.window?.require;
+  if (typeof candidate === "function") {
+    return candidate;
+  }
+  try {
+    return Function("return typeof require === 'function' ? require : undefined;")() ?? null;
+  } catch {
+    return null;
+  }
+}
+function canonicalizeDigestToBase64(digest) {
+  const bytes = decodeDigestToBytes(digest);
+  if (!bytes || bytes.length !== 32) {
+    return null;
+  }
+  return bytesToBase64(bytes);
+}
+function decodeDigestToBytes(digest) {
+  if (/^[0-9a-f]{64}$/i.test(digest)) {
+    return decodeHexDigest(digest);
+  }
+  return decodeBase64Digest(digest);
+}
+function decodeHexDigest(digest) {
+  if (!/^[0-9a-f]{64}$/i.test(digest)) {
+    return null;
+  }
+  const bytes = new Uint8Array(32);
+  for (let index = 0; index < 32; index += 1) {
+    const offset = index * 2;
+    bytes[index] = Number.parseInt(digest.slice(offset, offset + 2), 16);
+  }
+  return bytes;
+}
+function decodeBase64Digest(digest) {
+  const paddedDigest = padBase64(digest.trim());
+  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(paddedDigest)) {
+    return null;
+  }
+  const nodeRequire = getNodeRequire2();
+  if (nodeRequire) {
+    try {
+      const { Buffer: Buffer2 } = nodeRequire("node:buffer");
+      return Uint8Array.from(Buffer2.from(paddedDigest, "base64"));
+    } catch {
+      return null;
+    }
+  }
+  if (typeof globalThis.atob === "function") {
+    try {
+      const decoded = globalThis.atob(paddedDigest);
+      const bytes = new Uint8Array(decoded.length);
+      for (let index = 0; index < decoded.length; index += 1) {
+        bytes[index] = decoded.charCodeAt(index);
+      }
+      return bytes;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+function padBase64(value) {
+  const remainder = value.length % 4;
+  if (remainder === 0) {
+    return value;
+  }
+  return value.padEnd(value.length + (4 - remainder), "=");
+}
+function bytesToBase64(bytes) {
+  const nodeRequire = getNodeRequire2();
+  if (nodeRequire) {
+    const { Buffer: Buffer2 } = nodeRequire("node:buffer");
+    return Buffer2.from(bytes).toString("base64");
+  }
+  let binary = "";
+  for (const byte of bytes) {
+    binary += String.fromCharCode(byte);
+  }
+  if (typeof globalThis.btoa === "function") {
+    return globalThis.btoa(binary);
+  }
+  throw new Error("No base64 encoder is available in this environment.");
+}
+
+// src/settings/data.ts
 var ROLAY_SERVER_URL = "http://46.16.36.87:3000";
 var ROLAY_DEVICE_NAME = import_obsidian6.Platform.isMobile ? "Obsidian Mobile" : "Obsidian Desktop";
 var ROLAY_AUTO_CONNECT = true;
@@ -11877,8 +13218,12 @@ function createDefaultPluginData() {
     crdtCache: {
       entries: {}
     },
+    binaryCache: {
+      entries: {}
+    },
     pendingMarkdownCreates: {},
     pendingMarkdownMerges: {},
+    pendingBinaryWrites: {},
     deviceId: createDeviceId(),
     logs: []
   };
@@ -11896,8 +13241,13 @@ function mergePluginData(rawData) {
     autoConnect: ROLAY_AUTO_CONNECT,
     roomBindings: normalizeRoomBindings(rawSettings)
   };
-  const normalizedSession = rawSession ? {
+  const hasSessionTokens = Boolean(
+    rawSession?.accessToken?.trim() || rawSession?.refreshToken?.trim()
+  );
+  const normalizedSession = rawSession && hasSessionTokens ? {
     ...rawSession,
+    accessToken: typeof rawSession.accessToken === "string" ? rawSession.accessToken : "",
+    refreshToken: typeof rawSession.refreshToken === "string" ? rawSession.refreshToken : "",
     user: normalizeUser(rawSession.user)
   } : defaults.session;
   return {
@@ -11909,8 +13259,10 @@ function mergePluginData(rawData) {
       rooms: normalizeRoomSyncMap(rawData?.sync)
     },
     crdtCache: normalizeCrdtCacheState(rawData?.crdtCache),
+    binaryCache: normalizeBinaryCacheState(rawData?.binaryCache),
     pendingMarkdownCreates: normalizePendingMarkdownCreates(rawData?.pendingMarkdownCreates),
     pendingMarkdownMerges: normalizePendingMarkdownMerges(rawData?.pendingMarkdownMerges),
+    pendingBinaryWrites: normalizePendingBinaryWrites(rawData?.pendingBinaryWrites),
     deviceId: rawData?.deviceId ?? defaults.deviceId,
     logs: Array.isArray(rawData?.logs) ? rawData.logs.slice(-100) : defaults.logs
   };
@@ -12053,6 +13405,66 @@ function normalizePendingMarkdownMerges(rawPendingMerges) {
       entryId,
       localPath,
       filePath,
+      createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : (/* @__PURE__ */ new Date()).toISOString(),
+      lastAttemptAt: typeof candidate.lastAttemptAt === "string" ? candidate.lastAttemptAt : null,
+      lastError: typeof candidate.lastError === "string" ? candidate.lastError : null
+    };
+  }
+  return entries;
+}
+function normalizeBinaryCacheState(rawCache) {
+  if (!rawCache || typeof rawCache !== "object") {
+    return {
+      entries: {}
+    };
+  }
+  const rawEntries = rawCache.entries;
+  if (!rawEntries || typeof rawEntries !== "object") {
+    return {
+      entries: {}
+    };
+  }
+  const entries = {};
+  for (const [entryId, rawEntry] of Object.entries(rawEntries)) {
+    if (!rawEntry || typeof rawEntry !== "object") {
+      continue;
+    }
+    const candidate = rawEntry;
+    const normalizedHash = normalizeSha256Hash(candidate.hash);
+    if (!normalizedHash) {
+      continue;
+    }
+    entries[entryId] = {
+      hash: normalizedHash,
+      sizeBytes: typeof candidate.sizeBytes === "number" && candidate.sizeBytes >= 0 ? candidate.sizeBytes : 0,
+      mimeType: typeof candidate.mimeType === "string" && candidate.mimeType ? candidate.mimeType : "application/octet-stream",
+      filePath: typeof candidate.filePath === "string" ? normalizeStoredPath(candidate.filePath) : "",
+      updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : (/* @__PURE__ */ new Date(0)).toISOString()
+    };
+  }
+  return { entries };
+}
+function normalizePendingBinaryWrites(rawPendingWrites) {
+  if (!rawPendingWrites || typeof rawPendingWrites !== "object") {
+    return {};
+  }
+  const entries = {};
+  for (const [rawLocalPath, rawPendingWrite] of Object.entries(rawPendingWrites)) {
+    if (!rawPendingWrite || typeof rawPendingWrite !== "object") {
+      continue;
+    }
+    const candidate = rawPendingWrite;
+    const localPath = normalizeStoredPath(candidate.localPath ?? rawLocalPath);
+    const serverPath = normalizeStoredPath(candidate.serverPath ?? "");
+    const workspaceId = typeof candidate.workspaceId === "string" ? candidate.workspaceId.trim() : "";
+    if (!localPath || !serverPath || !workspaceId) {
+      continue;
+    }
+    entries[localPath] = {
+      workspaceId,
+      localPath,
+      serverPath,
+      entryId: typeof candidate.entryId === "string" && candidate.entryId.trim() ? candidate.entryId.trim() : null,
       createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : (/* @__PURE__ */ new Date()).toISOString(),
       lastAttemptAt: typeof candidate.lastAttemptAt === "string" ? candidate.lastAttemptAt : null,
       lastError: typeof candidate.lastError === "string" ? candidate.lastError : null
@@ -12603,7 +14015,8 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
     this.createInfoBlock(syncCard.body, [
       ["Status", room.downloaded ? room.streamStatus : "not installed"],
       ["Last snapshot", room.lastSnapshotLabel],
-      ["Last cursor", room.lastCursorLabel]
+      ["Last cursor", room.lastCursorLabel],
+      ["File transfers", room.binaryTransferLabel]
     ]);
     if (room.downloaded) {
       const syncActions = this.createActionRow(syncCard.body);
@@ -13254,7 +14667,7 @@ var WorkspaceEventStream = class {
       response.setEncoding("utf8");
       await new Promise((resolve, reject) => {
         const abortHandler = () => {
-          reject(createAbortError());
+          reject(createAbortError2());
         };
         signal.addEventListener("abort", abortHandler, { once: true });
         response.on("data", (chunk) => {
@@ -13290,6 +14703,9 @@ var WorkspaceEventStream = class {
     }
     const eventId = Number(message.id);
     if (Number.isFinite(eventId)) {
+      if (this.currentCursor !== null && eventId <= this.currentCursor) {
+        return;
+      }
       this.currentCursor = eventId;
     }
     let data;
@@ -13333,7 +14749,7 @@ var WorkspaceEventStream = class {
     return response;
   }
   async openStream(url, accessToken, signal) {
-    const nodeRequire = getNodeRequire();
+    const nodeRequire = getNodeRequire3();
     if (nodeRequire) {
       return openNodeRequest(url, accessToken, signal, nodeRequire);
     }
@@ -13356,12 +14772,12 @@ function isNodeResponse(response) {
 function getResponseStatus(response) {
   return isNodeResponse(response) ? response.statusCode ?? 0 : response.status;
 }
-function createAbortError() {
+function createAbortError2() {
   const error = new Error("The operation was aborted.");
   error.name = "AbortError";
   return error;
 }
-function getNodeRequire() {
+function getNodeRequire3() {
   const candidate = globalThis.require ?? globalThis.window?.require;
   if (typeof candidate === "function") {
     return candidate;
@@ -13392,9 +14808,9 @@ async function openNodeRequest(urlString, accessToken, signal, nodeRequire) {
       resolve(response);
     });
     const abortHandler = () => {
-      request.destroy(createAbortError());
+      request.destroy(createAbortError2());
       cleanup();
-      reject(createAbortError());
+      reject(createAbortError2());
     };
     const errorHandler = (error) => {
       cleanup();
@@ -13535,7 +14951,7 @@ var SettingsEventStream = class {
       response.setEncoding("utf8");
       await new Promise((resolve, reject) => {
         const abortHandler = () => {
-          reject(createAbortError2());
+          reject(createAbortError3());
         };
         signal.addEventListener("abort", abortHandler, { once: true });
         response.on("data", (chunk) => {
@@ -13571,6 +14987,9 @@ var SettingsEventStream = class {
     }
     const eventId = Number(message.id);
     if (Number.isFinite(eventId)) {
+      if (this.currentCursor !== null && eventId <= this.currentCursor) {
+        return;
+      }
       this.currentCursor = eventId;
     }
     let data;
@@ -13614,7 +15033,7 @@ var SettingsEventStream = class {
   }
   async openStream(accessToken, signal) {
     const url = this.buildUrl();
-    const nodeRequire = getNodeRequire2();
+    const nodeRequire = getNodeRequire4();
     if (nodeRequire) {
       return openNodeRequest2(url, accessToken, this.currentCursor, signal, nodeRequire);
     }
@@ -13645,12 +15064,12 @@ function isNodeResponse2(response) {
 function getResponseStatus2(response) {
   return isNodeResponse2(response) ? response.statusCode ?? 0 : response.status;
 }
-function createAbortError2() {
+function createAbortError3() {
   const error = new Error("The operation was aborted.");
   error.name = "AbortError";
   return error;
 }
-function getNodeRequire2() {
+function getNodeRequire4() {
   const candidate = globalThis.require ?? globalThis.window?.require;
   if (typeof candidate === "function") {
     return candidate;
@@ -13685,9 +15104,9 @@ async function openNodeRequest2(urlString, accessToken, lastEventId, signal, nod
       resolve(response);
     });
     const abortHandler = () => {
-      request.destroy(createAbortError2());
+      request.destroy(createAbortError3());
       cleanup();
-      reject(createAbortError2());
+      reject(createAbortError3());
     };
     const errorHandler = (error) => {
       cleanup();
@@ -13803,6 +15222,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.roomInvites = /* @__PURE__ */ new Map();
     this.pendingLocalCreates = /* @__PURE__ */ new Map();
     this.pendingLocalDeletes = /* @__PURE__ */ new Set();
+    this.binaryTransferState = /* @__PURE__ */ new Map();
+    this.binarySyncTokens = /* @__PURE__ */ new Map();
+    this.binarySyncPathsByToken = /* @__PURE__ */ new Map();
+    this.pendingBinarySyncReruns = /* @__PURE__ */ new Set();
     this.recentRemoteObservedPaths = /* @__PURE__ */ new Map();
     this.pendingRemoteMarkdownSettles = /* @__PURE__ */ new Map();
     this.persistHandle = null;
@@ -13816,6 +15239,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.logFileWrite = Promise.resolve();
     this.pendingLogLines = [];
     this.settingsEventStream = null;
+    this.settingsEventStreamGeneration = 0;
     this.settingsEventCursor = null;
     this.settingsEventStreamStatus = "stopped";
     this.settingsStreamRecoveryInFlight = false;
@@ -13888,14 +15312,18 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       getEntryByPath: (workspaceId, path) => this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null,
       hasPendingCreate: (workspaceId, path) => this.hasPendingLocalCreate(workspaceId, path),
       hasPendingDelete: (workspaceId, path) => this.hasPendingLocalDelete(workspaceId, path),
+      hasPendingBinaryWrite: (localPath) => (0, import_obsidian9.normalizePath)(localPath) in this.data.pendingBinaryWrites,
       log: (message) => this.recordLog("bridge", message),
       onCreateFolder: (workspaceId, path) => this.queueCreateFolder(workspaceId, path),
       onCreateMarkdown: (workspaceId, path, localContent) => this.queueCreateMarkdown(workspaceId, path, localContent),
+      onCreateBinary: (workspaceId, path, localContent) => this.queueBinaryWrite(workspaceId, path, localContent, null),
+      onUpdateBinary: (workspaceId, entry, localContent) => this.queueBinaryWrite(workspaceId, entry.path, localContent, entry),
       onRenameOrMove: (workspaceId, entry, newPath, type) => this.queueRenameOrMove(workspaceId, entry, newPath, type),
       onDeleteEntry: (workspaceId, entry) => this.queueDeleteEntry(workspaceId, entry),
       onRemotePathObserved: (workspaceId, localPath, serverPath) => {
         this.noteRemoteObservedPath(workspaceId, localPath, serverPath);
-      }
+      },
+      wasPathRecentlyObservedAsRemote: (workspaceId, localPath) => this.wasPathRecentlyObservedAsRemote(workspaceId, localPath)
     });
     this.statusBarEl = this.addStatusBarItem();
     this.updateStatusBar();
@@ -13930,6 +15358,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       })
     );
     this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        void this.handleVaultModify(file);
+      })
+    );
+    this.registerEvent(
       this.app.vault.on("delete", (file) => {
         void this.handleVaultDelete(file);
       })
@@ -13960,6 +15393,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         window.clearTimeout(handle);
       }
       this.pendingRemoteMarkdownSettles.clear();
+      for (const transfer of this.binaryTransferState.values()) {
+        transfer.abortController?.abort();
+      }
+      this.binaryTransferState.clear();
+      this.binarySyncTokens.clear();
+      this.binarySyncPathsByToken.clear();
     });
     this.recordLog("plugin", "Rolay plugin loaded.");
     await this.bootstrapSync("startup");
@@ -13990,6 +15429,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       const treeStore = runtime?.treeStore ?? null;
       const markdownEntries = treeStore?.getEntries().filter((entry) => !entry.deleted && entry.kind === "markdown") ?? [];
       const cachedMarkdownCount = markdownEntries.filter((entry) => this.hasPersistedCrdtCache(entry.id)).length;
+      const binaryTransferLabel = this.formatRoomBinaryTransferLabel(room.workspace.id);
       return {
         room,
         folderName,
@@ -14003,6 +15443,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         markdownEntryCount: markdownEntries.length,
         cachedMarkdownCount,
         crdtCacheLabel: this.formatRoomCrdtCacheLabel(runtime?.markdownBootstrap, markdownEntries.length, cachedMarkdownCount),
+        binaryTransferLabel,
         invite: this.roomInvites.get(room.workspace.id) ?? null
       };
     });
@@ -14210,6 +15651,15 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.stopSettingsEventStream();
     this.stopAllRoomEventStreams();
     await this.crdtManager.disconnect();
+    for (const localPath of [...this.binaryTransferState.keys()]) {
+      this.invalidateBinarySyncToken(localPath);
+    }
+    for (const localPath of [...this.binaryTransferState.keys()]) {
+      await this.cancelBinaryTransferForLocalPath(localPath, "logout");
+    }
+    this.binaryTransferState.clear();
+    this.binarySyncTokens.clear();
+    this.binarySyncPathsByToken.clear();
     this.roomRuntime.clear();
     this.roomInvites.clear();
     this.roomList = [];
@@ -14665,43 +16115,88 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
   }
   async refreshRoomSnapshot(workspaceId, reason = "manual") {
-    const room = this.requireDownloadedRoom(workspaceId);
-    const runtime = this.ensureRoomRuntime(room.workspace.id);
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    if (runtime.snapshotRefreshInFlight) {
+      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
+      return;
+    }
+    runtime.snapshotRefreshInFlight = true;
     try {
-      const previousEntries = runtime.treeStore.getEntries();
-      const snapshot = await this.apiClient.getWorkspaceTree(room.workspace.id);
-      runtime.treeStore.applySnapshot(snapshot);
-      this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
-      await this.fileBridge.applySnapshot(snapshot, previousEntries);
-      this.setRoomSyncState(room.workspace.id, {
-        lastCursor: snapshot.cursor,
-        lastSnapshotAt: (/* @__PURE__ */ new Date()).toISOString()
-      });
-      this.recordLog(
-        "tree",
-        `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
-      );
-      await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
-      this.scheduleBackgroundMarkdownRefresh(
-        room.workspace.id,
-        "post-snapshot-background-refresh",
-        _RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS,
-        true
-      );
-      await this.reconcilePendingMarkdownCreates(room.workspace.id, reason);
-      await this.reconcilePendingMarkdownMerges(room.workspace.id, reason);
-      await this.persistNow();
-      this.updateStatusBar();
-      await this.bindActiveMarkdownToCrdt();
+      await this.performRoomSnapshotRefresh(workspaceId, reason);
     } catch (error) {
+      if (this.shouldRetrySnapshotAfterAuthRecovery(error)) {
+        try {
+          await this.ensureAuthenticated(true);
+          await this.performRoomSnapshotRefresh(workspaceId, `${reason}-auth-retry`);
+          return;
+        } catch (retryError) {
+          this.handleError("Tree snapshot failed", retryError);
+          throw retryError;
+        }
+      }
       this.handleError("Tree snapshot failed", error);
       throw error;
+    } finally {
+      runtime.snapshotRefreshInFlight = false;
+      const queuedReason = runtime.snapshotRefreshQueuedReason;
+      runtime.snapshotRefreshQueuedReason = null;
+      if (queuedReason) {
+        this.scheduleSnapshotRefresh(workspaceId, queuedReason);
+      }
     }
+  }
+  async performRoomSnapshotRefresh(workspaceId, reason) {
+    if (!this.hasUsableSessionTokens() && this.canAttemptAuth()) {
+      await this.ensureAuthenticated(true);
+    }
+    const room = this.requireDownloadedRoom(workspaceId);
+    const runtime = this.ensureRoomRuntime(room.workspace.id);
+    const previousEntries = runtime.treeStore.getEntries();
+    const snapshot = await this.apiClient.getWorkspaceTree(room.workspace.id);
+    runtime.treeStore.applySnapshot(snapshot);
+    this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
+    await this.fileBridge.applySnapshot(snapshot, previousEntries);
+    this.setRoomSyncState(room.workspace.id, {
+      lastCursor: snapshot.cursor,
+      lastSnapshotAt: (/* @__PURE__ */ new Date()).toISOString()
+    });
+    this.recordLog(
+      "tree",
+      `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
+    );
+    await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
+    await this.syncBinaryEntriesFromSnapshot(room.workspace.id, snapshot.entries, reason);
+    this.scheduleBackgroundMarkdownRefresh(
+      room.workspace.id,
+      "post-snapshot-background-refresh",
+      _RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS,
+      true
+    );
+    await this.reconcilePendingMarkdownCreates(room.workspace.id, reason);
+    await this.reconcilePendingMarkdownMerges(room.workspace.id, reason);
+    await this.reconcilePendingBinaryWrites(room.workspace.id, reason);
+    await this.persistNow();
+    this.updateStatusBar();
+    await this.bindActiveMarkdownToCrdt();
+  }
+  shouldRetrySnapshotAfterAuthRecovery(error) {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+    const normalizedMessage = error.message.toLowerCase();
+    return (normalizedMessage.includes("you are not authenticated yet") || normalizedMessage.includes("no refresh token is stored yet.")) && this.canAttemptAuth();
+  }
+  hasUsableSessionTokens() {
+    return Boolean(
+      this.data.session?.accessToken?.trim() || this.data.session?.refreshToken?.trim()
+    );
   }
   async startRoomEventStream(workspaceId) {
     const room = this.requireDownloadedRoom(workspaceId);
     const runtime = this.ensureRoomRuntime(room.workspace.id);
     this.stopRoomEventStream(room.workspace.id);
+    const generation = runtime.eventStreamGeneration + 1;
+    runtime.eventStreamGeneration = generation;
     const roomSync = getRoomSyncState(this.data.sync, room.workspace.id);
     const treeCursor = runtime.treeStore.getCursor();
     if (treeCursor === null && roomSync.lastCursor === null) {
@@ -14714,9 +16209,20 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     runtime.eventStream = stream;
     stream.start(room.workspace.id, cursor, {
       onOpen: () => {
+        if (runtime.eventStreamGeneration !== generation) {
+          return;
+        }
         this.recordLog("sse", `Subscribed to room ${room.workspace.id} events.`);
       },
       onEvent: async (event) => {
+        if (runtime.eventStreamGeneration !== generation) {
+          return;
+        }
+        const lastHandledEventId = runtime.lastHandledEventId ?? runtime.treeStore.getCursor();
+        if (lastHandledEventId !== null && event.id <= lastHandledEventId) {
+          return;
+        }
+        runtime.lastHandledEventId = event.id;
         runtime.treeStore.recordCursor(event.id);
         this.updateRoomSyncCursor(room.workspace.id, event.id);
         this.schedulePersist();
@@ -14726,11 +16232,17 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         }
       },
       onStatusChange: (status) => {
+        if (runtime.eventStreamGeneration !== generation) {
+          return;
+        }
         runtime.streamStatus = status;
         this.updateStatusBar();
         this.scheduleExplorerLoadingDecorations();
       },
       onError: (error) => {
+        if (runtime.eventStreamGeneration !== generation) {
+          return;
+        }
         this.handleError(`Workspace event stream error (${room.workspace.id})`, error, false);
       }
     });
@@ -14740,12 +16252,19 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     if (!runtime) {
       return;
     }
+    if (runtime.snapshotRefreshHandle !== null) {
+      window.clearTimeout(runtime.snapshotRefreshHandle);
+      runtime.snapshotRefreshHandle = null;
+    }
+    runtime.snapshotRefreshQueuedReason = null;
     this.clearBackgroundMarkdownRefresh(workspaceId);
     this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
     this.cancelRoomMarkdownBootstrap(workspaceId);
+    runtime.eventStreamGeneration += 1;
     runtime.eventStream?.stop();
     runtime.eventStream = null;
     runtime.streamStatus = "stopped";
+    runtime.lastHandledEventId = runtime.treeStore.getCursor();
     this.updateStatusBar();
     this.scheduleExplorerLoadingDecorations();
   }
@@ -14759,6 +16278,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     if (!this.getCurrentUser()) {
       return;
     }
+    const generation = this.settingsEventStreamGeneration + 1;
+    this.settingsEventStreamGeneration = generation;
     this.settingsEventCursor = cursor;
     const stream = new SettingsEventStream(this.apiClient, (message) => {
       this.recordLog("settings-sse", message);
@@ -14766,16 +16287,28 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.settingsEventStream = stream;
     stream.start(cursor, {
       onOpen: () => {
+        if (this.settingsEventStreamGeneration !== generation) {
+          return;
+        }
         this.recordLog("settings-sse", "Subscribed to settings events.");
       },
       onEvent: async (event) => {
+        if (this.settingsEventStreamGeneration !== generation) {
+          return;
+        }
         await this.handleSettingsEventStreamEvent(event);
       },
       onStatusChange: (status) => {
+        if (this.settingsEventStreamGeneration !== generation) {
+          return;
+        }
         this.settingsEventStreamStatus = status;
         this.updateStatusBar();
       },
       onError: (error) => {
+        if (this.settingsEventStreamGeneration !== generation) {
+          return;
+        }
         this.handleError("Settings event stream error", error, false);
         if (this.shouldRecoverSettingsStream(error)) {
           void this.recoverSettingsEventStream();
@@ -14784,6 +16317,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     });
   }
   stopSettingsEventStream() {
+    this.settingsEventStreamGeneration += 1;
     this.settingsEventStream?.stop();
     this.settingsEventStream = null;
     this.settingsEventStreamStatus = "stopped";
@@ -14963,10 +16497,19 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async handleVaultCreate(file) {
     try {
-      this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       await this.fileBridge.handleVaultCreate(file);
     } catch (error) {
       this.handleError(`Local create sync failed for ${file.path}`, error, false);
+    }
+  }
+  async handleVaultModify(file) {
+    try {
+      if (!(file instanceof import_obsidian9.TFile) || isMarkdownPath(file.path)) {
+        return;
+      }
+      await this.fileBridge.handleVaultModify(file);
+    } catch (error) {
+      this.handleError(`Local binary modify sync failed for ${file.path}`, error, false);
     }
   }
   async handleVaultRename(file, oldPath) {
@@ -14975,11 +16518,16 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         await this.bindActiveMarkdownToCrdt();
         return;
       }
+      if (await this.revertDownloadingBinaryRename(file, oldPath)) {
+        await this.bindActiveMarkdownToCrdt();
+        return;
+      }
       await this.refreshMarkdownContentBeforeRoomExit(file, oldPath);
       this.forgetRecentRemoteHintsForLocalPath(oldPath, true);
       this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       this.handlePendingMarkdownCreateRename(oldPath, file.path);
       this.handlePendingMarkdownMergeRename(oldPath, file.path);
+      await this.handlePendingBinaryWriteRename(oldPath, file.path);
       await this.fileBridge.handleVaultRename(file, oldPath);
       await this.bindActiveMarkdownToCrdt();
     } catch (error) {
@@ -14992,9 +16540,14 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         await this.bindActiveMarkdownToCrdt();
         return;
       }
+      if (await this.restoreDownloadingBinaryDelete(file)) {
+        await this.bindActiveMarkdownToCrdt();
+        return;
+      }
       this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       this.clearPendingMarkdownCreate(file.path);
       this.clearPendingMarkdownMergesForLocalPath(file.path);
+      await this.clearPendingBinaryWriteForLocalPath(file.path, true);
       if (await this.handlePotentialRoomRootRemoval(file.path, "delete")) {
         return;
       }
@@ -15058,7 +16611,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   scheduleSnapshotRefresh(workspaceId, reason = "event-stream") {
     const runtime = this.ensureRoomRuntime(workspaceId);
+    if (runtime.snapshotRefreshInFlight) {
+      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
+      return;
+    }
     if (runtime.snapshotRefreshHandle !== null) {
+      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
       return;
     }
     runtime.snapshotRefreshHandle = window.setTimeout(() => {
@@ -15291,8 +16849,12 @@ ${keptTail}`;
     const runtime = {
       treeStore: new TreeStore(),
       eventStream: null,
+      eventStreamGeneration: 0,
       streamStatus: "stopped",
+      lastHandledEventId: null,
       snapshotRefreshHandle: null,
+      snapshotRefreshInFlight: false,
+      snapshotRefreshQueuedReason: null,
       backgroundMarkdownRefreshHandle: null,
       backgroundMarkdownRefreshInFlight: false,
       lockedBootstrapRetryHandle: null,
@@ -15451,13 +17013,8 @@ ${keptTail}`;
     if (!container) {
       return;
     }
-    const lockedPaths = /* @__PURE__ */ new Set();
-    for (const runtime of this.roomRuntime.values()) {
-      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
-        lockedPaths.add(lockedPath);
-      }
-    }
-    const uploadingPaths = this.getUploadingMarkdownExplorerPaths();
+    const loadingPaths = this.getLoadingExplorerPaths();
+    const uploadingPaths = this.getUploadingExplorerPaths();
     const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
     const pathElements = container.querySelectorAll("[data-path]");
     for (const element2 of pathElements) {
@@ -15476,9 +17033,9 @@ ${keptTail}`;
         continue;
       }
       const normalizedPath = (0, import_obsidian9.normalizePath)(dataPath);
-      const exactMatch = lockedPaths.has(normalizedPath);
-      const descendantMatch = !exactMatch && [...lockedPaths].some((lockedPath) => {
-        return lockedPath.startsWith(`${normalizedPath}/`);
+      const exactMatch = loadingPaths.has(normalizedPath);
+      const descendantMatch = !exactMatch && [...loadingPaths].some((loadingPath) => {
+        return loadingPath.startsWith(`${normalizedPath}/`);
       });
       const exactUploadingMatch = uploadingPaths.has(normalizedPath);
       const descendantUploadingMatch = !exactUploadingMatch && [...uploadingPaths].some((uploadingPath) => {
@@ -15509,13 +17066,41 @@ ${keptTail}`;
       }
     }
   }
-  getUploadingMarkdownExplorerPaths() {
+  getLoadingExplorerPaths() {
+    const loadingPaths = /* @__PURE__ */ new Set();
+    for (const runtime of this.roomRuntime.values()) {
+      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
+        loadingPaths.add(lockedPath);
+      }
+    }
+    for (const transfer of this.binaryTransferState.values()) {
+      if (transfer.kind !== "download") {
+        continue;
+      }
+      if (transfer.status === "preparing" || transfer.status === "downloading") {
+        loadingPaths.add((0, import_obsidian9.normalizePath)(transfer.localPath));
+      }
+    }
+    return loadingPaths;
+  }
+  getUploadingExplorerPaths() {
     const uploadingPaths = /* @__PURE__ */ new Set();
     for (const pendingCreate of Object.values(this.data.pendingMarkdownCreates)) {
       uploadingPaths.add((0, import_obsidian9.normalizePath)(pendingCreate.localPath));
     }
     for (const pendingMerge of Object.values(this.data.pendingMarkdownMerges)) {
       uploadingPaths.add((0, import_obsidian9.normalizePath)(pendingMerge.localPath));
+    }
+    for (const pendingWrite of Object.values(this.data.pendingBinaryWrites)) {
+      uploadingPaths.add((0, import_obsidian9.normalizePath)(pendingWrite.localPath));
+    }
+    for (const transfer of this.binaryTransferState.values()) {
+      if (transfer.kind !== "upload") {
+        continue;
+      }
+      if (transfer.status === "preparing" || transfer.status === "uploading" || transfer.status === "canceling" || transfer.status === "committing") {
+        uploadingPaths.add((0, import_obsidian9.normalizePath)(transfer.localPath));
+      }
     }
     return uploadingPaths;
   }
@@ -15532,6 +17117,203 @@ ${keptTail}`;
       );
     }
     return statuses;
+  }
+  getBinaryTransfersForWorkspace(workspaceId) {
+    return [...this.binaryTransferState.values()].filter((transfer) => transfer.workspaceId === workspaceId);
+  }
+  formatRoomBinaryTransferLabel(workspaceId) {
+    const transfers = this.getBinaryTransfersForWorkspace(workspaceId).filter((transfer) => {
+      return transfer.status !== "done";
+    });
+    if (transfers.length === 0) {
+      return "idle";
+    }
+    const activeUploads = transfers.filter((transfer) => transfer.kind === "upload");
+    const activeDownloads = transfers.filter((transfer) => transfer.kind === "download");
+    const totalBytes = transfers.reduce((sum, transfer) => sum + Math.max(0, transfer.bytesTotal), 0);
+    const completedBytes = transfers.reduce((sum, transfer) => {
+      return sum + Math.min(Math.max(0, transfer.bytesDone), Math.max(0, transfer.bytesTotal));
+    }, 0);
+    const percent = totalBytes > 0 ? `${Math.round(completedBytes / totalBytes * 100)}%` : "working";
+    const parts = [];
+    if (activeUploads.length > 0) {
+      parts.push(`${activeUploads.length} uploading`);
+    }
+    if (activeDownloads.length > 0) {
+      parts.push(`${activeDownloads.length} downloading`);
+    }
+    if (totalBytes > 0) {
+      return `${percent} (${formatByteCount(completedBytes)}/${formatByteCount(totalBytes)}, ${parts.join(", ")})`;
+    }
+    return parts.join(", ");
+  }
+  createBinarySyncToken(localPath) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    const existingToken = this.binarySyncTokens.get(normalizedLocalPath);
+    if (existingToken) {
+      this.binarySyncPathsByToken.delete(existingToken);
+    }
+    const token = typeof globalThis.crypto?.randomUUID === "function" ? globalThis.crypto.randomUUID() : `rolay-binary-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    this.binarySyncTokens.set(normalizedLocalPath, token);
+    this.binarySyncPathsByToken.set(token, normalizedLocalPath);
+    return token;
+  }
+  invalidateBinarySyncToken(localPath) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    const existingToken = this.binarySyncTokens.get(normalizedLocalPath);
+    if (existingToken) {
+      this.binarySyncPathsByToken.delete(existingToken);
+    }
+    this.binarySyncTokens.delete(normalizedLocalPath);
+  }
+  isBinarySyncTokenCurrent(localPath, token) {
+    return this.binarySyncTokens.get((0, import_obsidian9.normalizePath)(localPath)) === token;
+  }
+  moveBinarySyncToken(oldPath, newPath) {
+    const normalizedOldPath = (0, import_obsidian9.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian9.normalizePath)(newPath);
+    const existingToken = this.binarySyncTokens.get(normalizedOldPath);
+    if (!existingToken) {
+      return;
+    }
+    this.binarySyncTokens.delete(normalizedOldPath);
+    this.binarySyncTokens.set(normalizedNewPath, existingToken);
+    this.binarySyncPathsByToken.set(existingToken, normalizedNewPath);
+  }
+  getBinarySyncPathForToken(token) {
+    return this.binarySyncPathsByToken.get(token) ?? null;
+  }
+  updateBinaryTransferState(localPath, patch) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    const existing = this.binaryTransferState.get(normalizedLocalPath);
+    if (!existing) {
+      throw new Error(`Missing binary transfer state for ${normalizedLocalPath}.`);
+    }
+    const nextState = {
+      ...existing,
+      ...patch,
+      localPath: normalizedLocalPath
+    };
+    this.binaryTransferState.set(normalizedLocalPath, nextState);
+    this.scheduleExplorerLoadingDecorations();
+    this.updateStatusBar();
+    return nextState;
+  }
+  maybeUpdateBinaryTransferState(localPath, patch) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    const existing = this.binaryTransferState.get(normalizedLocalPath);
+    if (!existing) {
+      return null;
+    }
+    return this.updateBinaryTransferState(normalizedLocalPath, patch);
+  }
+  setBinaryTransferState(state) {
+    this.binaryTransferState.set((0, import_obsidian9.normalizePath)(state.localPath), {
+      ...state,
+      localPath: (0, import_obsidian9.normalizePath)(state.localPath)
+    });
+    this.scheduleExplorerLoadingDecorations();
+    this.updateStatusBar();
+  }
+  clearBinaryTransferState(localPath) {
+    if (!this.binaryTransferState.delete((0, import_obsidian9.normalizePath)(localPath))) {
+      return;
+    }
+    this.scheduleExplorerLoadingDecorations();
+    this.updateStatusBar();
+  }
+  async cancelBinaryTransferForLocalPath(localPath, reason) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    const transfer = this.binaryTransferState.get(normalizedLocalPath);
+    if (!transfer) {
+      return;
+    }
+    if (transfer.kind === "upload" && transfer.uploadId && transfer.entryId) {
+      this.updateBinaryTransferState(normalizedLocalPath, {
+        status: "canceling"
+      });
+    }
+    transfer.abortController?.abort();
+    if (transfer.kind === "upload" && transfer.uploadId && transfer.entryId) {
+      try {
+        await this.apiClient.cancelBlobUpload(transfer.entryId, transfer.uploadId);
+        this.recordLog(
+          "blob",
+          `[${transfer.workspaceId}] Canceled blob upload ${transfer.uploadId} for ${transfer.serverPath} (${reason}).`
+        );
+      } catch (error) {
+        this.recordLog(
+          "blob",
+          `[${transfer.workspaceId}] Failed to cancel blob upload ${transfer.uploadId} for ${transfer.serverPath}: ${error instanceof Error ? error.message : String(error)}`,
+          "error"
+        );
+      }
+    }
+    this.clearBinaryTransferState(normalizedLocalPath);
+  }
+  findDownloadingBinaryPathAtOrBelow(localPath) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    for (const transfer of this.binaryTransferState.values()) {
+      if (transfer.kind !== "download" || transfer.status !== "preparing" && transfer.status !== "downloading") {
+        continue;
+      }
+      const transferLocalPath = (0, import_obsidian9.normalizePath)(transfer.localPath);
+      if (normalizedLocalPath === transferLocalPath || transferLocalPath.startsWith(`${normalizedLocalPath}/`)) {
+        return {
+          workspaceId: transfer.workspaceId,
+          localPath: transferLocalPath
+        };
+      }
+    }
+    return null;
+  }
+  async revertDownloadingBinaryRename(file, oldPath) {
+    const blocked = this.findDownloadingBinaryPathAtOrBelow(oldPath);
+    if (!blocked) {
+      return false;
+    }
+    this.recordLog(
+      "blob",
+      `[${blocked.workspaceId}] Reverted local move/rename for ${oldPath} because ${blocked.localPath} is still downloading and protected.`
+    );
+    new import_obsidian9.Notice("Rolay is still downloading this file. Move and rename are blocked until download finishes.");
+    if (file.path === oldPath) {
+      this.scheduleExplorerLoadingDecorations();
+      return true;
+    }
+    const currentFile = this.app.vault.getAbstractFileByPath(file.path);
+    if (!currentFile) {
+      this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-downloading-binary-rename");
+      return true;
+    }
+    try {
+      await this.fileBridge.runWithSuppressedPaths([oldPath, file.path], async () => {
+        await this.app.fileManager.renameFile(currentFile, oldPath);
+      });
+    } catch (error) {
+      this.recordLog(
+        "blob",
+        `[${blocked.workspaceId}] Failed to revert downloading binary rename for ${oldPath}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+      this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-downloading-binary-rename");
+    }
+    this.scheduleExplorerLoadingDecorations();
+    return true;
+  }
+  async restoreDownloadingBinaryDelete(file) {
+    const blocked = this.findDownloadingBinaryPathAtOrBelow(file.path);
+    if (!blocked) {
+      return false;
+    }
+    this.recordLog(
+      "blob",
+      `[${blocked.workspaceId}] Ignored local delete for ${file.path} because ${blocked.localPath} is still downloading and protected.`
+    );
+    new import_obsidian9.Notice("Rolay is still downloading this file. Delete is blocked until download finishes.");
+    await this.refreshRoomSnapshot(blocked.workspaceId, "restore-downloading-binary-delete");
+    this.scheduleExplorerLoadingDecorations();
+    return true;
   }
   async revertLockedMarkdownRename(file, oldPath) {
     const blocked = this.findLockedMarkdownPathAtOrBelow(oldPath);
@@ -15727,6 +17509,7 @@ ${keptTail}`;
     }
     this.clearPendingLocalCreate(workspaceId, serverPath);
     this.clearPendingMarkdownCreate(localPath);
+    this.clearPendingBinaryWriteRecord(localPath);
   }
   wasPathRecentlyObservedAsRemote(workspaceId, localPath) {
     return this.recentRemoteObservedPaths.has(this.buildRemoteObservedPathKey(workspaceId, localPath));
@@ -15834,6 +17617,7 @@ ${keptTail}`;
     this.clearPendingRoomPathsForWorkspace(workspaceId);
     this.clearPendingMarkdownCreatesForWorkspace(workspaceId);
     this.clearPendingMarkdownMergesForWorkspace(workspaceId);
+    await this.clearPendingBinaryWritesForWorkspace(workspaceId);
     const binding = this.getStoredRoomBinding(workspaceId);
     if (binding?.downloaded) {
       await this.saveRoomBinding(workspaceId, {
@@ -16055,18 +17839,17 @@ ${keptTail}`;
   }
   async applySessionUser(user) {
     if (!this.data.session) {
-      this.data.session = {
-        accessToken: "",
-        refreshToken: "",
-        user,
-        authenticatedAt: (/* @__PURE__ */ new Date()).toISOString()
-      };
-    } else {
-      this.data.session = {
-        ...this.data.session,
-        user
-      };
+      this.recordLog(
+        "auth",
+        `Ignored session user update for ${user.username} because no authenticated session with tokens is available.`,
+        "error"
+      );
+      return;
     }
+    this.data.session = {
+      ...this.data.session,
+      user
+    };
     this.resetProfileDraft();
     await this.persistNow();
     this.updateStatusBar();
@@ -16155,6 +17938,9 @@ ${keptTail}`;
   getPendingMarkdownMergesForWorkspace(workspaceId) {
     return Object.values(this.data.pendingMarkdownMerges).filter((entry) => entry.workspaceId === workspaceId).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
+  getPendingBinaryWritesForWorkspace(workspaceId) {
+    return Object.values(this.data.pendingBinaryWrites).filter((entry) => entry.workspaceId === workspaceId).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  }
   handlePendingMarkdownCreateRename(oldPath, newPath) {
     const normalizedOldPath = (0, import_obsidian9.normalizePath)(oldPath);
     const normalizedNewPath = (0, import_obsidian9.normalizePath)(newPath);
@@ -16219,12 +18005,80 @@ ${keptTail}`;
       this.scheduleExplorerLoadingDecorations();
     }
   }
+  async handlePendingBinaryWriteRename(oldPath, newPath) {
+    const normalizedOldPath = (0, import_obsidian9.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian9.normalizePath)(newPath);
+    const pendingWrite = this.data.pendingBinaryWrites[normalizedOldPath];
+    if (!pendingWrite) {
+      return;
+    }
+    delete this.data.pendingBinaryWrites[normalizedOldPath];
+    this.moveBinarySyncToken(normalizedOldPath, normalizedNewPath);
+    await this.cancelBinaryTransferForLocalPath(normalizedOldPath, "rename");
+    const nextServerPath = this.resolvePendingMarkdownServerPath(
+      pendingWrite.workspaceId,
+      normalizedNewPath,
+      pendingWrite.serverPath
+    );
+    if (!nextServerPath) {
+      this.schedulePersist();
+      this.scheduleExplorerLoadingDecorations();
+      this.recordLog(
+        "blob",
+        `[${pendingWrite.workspaceId}] Cleared pending binary write for ${normalizedOldPath} because it moved outside the downloaded room.`
+      );
+      return;
+    }
+    this.data.pendingBinaryWrites[normalizedNewPath] = {
+      ...pendingWrite,
+      localPath: normalizedNewPath,
+      serverPath: nextServerPath
+    };
+    this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
+    const currentFile = this.app.vault.getAbstractFileByPath(normalizedNewPath);
+    const entry = pendingWrite.entryId ? this.getRoomStore(pendingWrite.workspaceId)?.getEntryById(pendingWrite.entryId) ?? null : this.getRoomStore(pendingWrite.workspaceId)?.getEntryByPath(nextServerPath) ?? null;
+    if (currentFile instanceof import_obsidian9.TFile && isBinaryPath(currentFile.path)) {
+      await this.queueBinaryWrite(
+        pendingWrite.workspaceId,
+        nextServerPath,
+        await this.app.vault.readBinary(currentFile),
+        entry
+      );
+    }
+  }
   clearPendingMarkdownCreate(localPath) {
     const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
     if (!(normalizedLocalPath in this.data.pendingMarkdownCreates)) {
       return;
     }
     delete this.data.pendingMarkdownCreates[normalizedLocalPath];
+    this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
+  }
+  clearPendingBinaryWriteRecord(localPath) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    if (!(normalizedLocalPath in this.data.pendingBinaryWrites)) {
+      return;
+    }
+    delete this.data.pendingBinaryWrites[normalizedLocalPath];
+    this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
+  }
+  async clearPendingBinaryWriteForLocalPath(localPath, cancelTransfer) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    if (!(normalizedLocalPath in this.data.pendingBinaryWrites)) {
+      if (cancelTransfer) {
+        this.invalidateBinarySyncToken(normalizedLocalPath);
+        await this.cancelBinaryTransferForLocalPath(normalizedLocalPath, "clear");
+      }
+      return;
+    }
+    if (cancelTransfer) {
+      this.invalidateBinarySyncToken(normalizedLocalPath);
+      await this.cancelBinaryTransferForLocalPath(normalizedLocalPath, "clear");
+    }
+    delete this.data.pendingBinaryWrites[normalizedLocalPath];
     this.schedulePersist();
     this.scheduleExplorerLoadingDecorations();
   }
@@ -16250,6 +18104,22 @@ ${keptTail}`;
         continue;
       }
       delete this.data.pendingMarkdownCreates[localPath];
+      changed = true;
+    }
+    if (changed) {
+      this.schedulePersist();
+      this.scheduleExplorerLoadingDecorations();
+    }
+  }
+  async clearPendingBinaryWritesForWorkspace(workspaceId) {
+    let changed = false;
+    for (const [localPath, pendingWrite] of Object.entries(this.data.pendingBinaryWrites)) {
+      if (pendingWrite.workspaceId !== workspaceId) {
+        continue;
+      }
+      this.invalidateBinarySyncToken(localPath);
+      await this.cancelBinaryTransferForLocalPath(localPath, "workspace-clear");
+      delete this.data.pendingBinaryWrites[localPath];
       changed = true;
     }
     if (changed) {
@@ -16306,6 +18176,36 @@ ${keptTail}`;
     this.schedulePersist();
     this.scheduleExplorerLoadingDecorations();
   }
+  rememberPendingBinaryWrite(workspaceId, localPath, serverPath, entryId, error = null) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    const existing = this.data.pendingBinaryWrites[normalizedLocalPath];
+    this.data.pendingBinaryWrites[normalizedLocalPath] = {
+      workspaceId,
+      localPath: normalizedLocalPath,
+      serverPath,
+      entryId,
+      createdAt: existing?.createdAt ?? (/* @__PURE__ */ new Date()).toISOString(),
+      lastAttemptAt: (/* @__PURE__ */ new Date()).toISOString(),
+      lastError: error ? error instanceof Error ? error.message : String(error) : null
+    };
+    this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
+  }
+  updatePendingBinaryWriteEntryId(localPath, entryId, serverPath) {
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+    const existing = this.data.pendingBinaryWrites[normalizedLocalPath];
+    if (!existing) {
+      return;
+    }
+    this.data.pendingBinaryWrites[normalizedLocalPath] = {
+      ...existing,
+      entryId,
+      serverPath: serverPath ?? existing.serverPath,
+      lastAttemptAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
+  }
   clearPendingMarkdownMerge(entryId) {
     if (!(entryId in this.data.pendingMarkdownMerges)) {
       return;
@@ -16328,6 +18228,23 @@ ${keptTail}`;
     }
     const pendingMerge = this.data.pendingMarkdownMerges[remoteEntry.id];
     if (pendingMerge && (0, import_obsidian9.normalizePath)(pendingMerge.localPath) === normalizedLocalPath) {
+      return true;
+    }
+    return false;
+  }
+  shouldDropPendingBinaryWriteAsRemoteEcho(workspaceId, pendingWrite, remoteEntry) {
+    if (remoteEntry.deleted || remoteEntry.kind !== "binary") {
+      return false;
+    }
+    const normalizedLocalPath = (0, import_obsidian9.normalizePath)(pendingWrite.localPath);
+    if (this.wasPathRecentlyObservedAsRemote(workspaceId, normalizedLocalPath)) {
+      return true;
+    }
+    const cachedEntry = this.findPersistedBinaryCacheEntry(remoteEntry.id);
+    if (cachedEntry && (0, import_obsidian9.normalizePath)(cachedEntry.filePath) === normalizedLocalPath) {
+      return true;
+    }
+    if (!pendingWrite.entryId && !remoteEntry.blob && (0, import_obsidian9.normalizePath)(pendingWrite.serverPath) === (0, import_obsidian9.normalizePath)(remoteEntry.path)) {
       return true;
     }
     return false;
@@ -16572,6 +18489,53 @@ ${keptTail}`;
     return true;
   }
   getCrdtCacheKey(entryId) {
+    const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl);
+    return normalizedServerUrl ? `${normalizedServerUrl}::${entryId}` : entryId;
+  }
+  findPersistedBinaryCacheEntry(entryId) {
+    const cacheKey = this.getBinaryCacheKey(entryId);
+    return this.data.binaryCache.entries[cacheKey] ?? this.data.binaryCache.entries[entryId] ?? null;
+  }
+  persistBinaryCacheEntry(entryId, filePath, hash, sizeBytes, mimeType) {
+    const normalizedHash = normalizeSha256Hash(hash);
+    if (!normalizedHash) {
+      return;
+    }
+    const cacheKey = this.getBinaryCacheKey(entryId);
+    this.data.binaryCache.entries[cacheKey] = {
+      hash: normalizedHash,
+      sizeBytes,
+      mimeType,
+      filePath,
+      updatedAt: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    delete this.data.binaryCache.entries[entryId];
+    this.prunePersistedBinaryCache();
+    this.schedulePersist();
+  }
+  clearPersistedBinaryCacheEntry(entryId) {
+    const cacheKey = this.getBinaryCacheKey(entryId);
+    if (!(cacheKey in this.data.binaryCache.entries) && !(entryId in this.data.binaryCache.entries)) {
+      return;
+    }
+    delete this.data.binaryCache.entries[cacheKey];
+    delete this.data.binaryCache.entries[entryId];
+    this.schedulePersist();
+  }
+  prunePersistedBinaryCache() {
+    const entries = Object.entries(this.data.binaryCache.entries).map(([entryId, entry]) => ({
+      entryId,
+      entry
+    }));
+    if (entries.length <= _RolayPlugin.MAX_PERSISTED_BINARY_ENTRIES) {
+      return;
+    }
+    const sortedEntries = [...entries].sort((left, right) => left.entry.updatedAt.localeCompare(right.entry.updatedAt));
+    for (const staleEntry of sortedEntries.slice(0, entries.length - _RolayPlugin.MAX_PERSISTED_BINARY_ENTRIES)) {
+      delete this.data.binaryCache.entries[staleEntry.entryId];
+    }
+  }
+  getBinaryCacheKey(entryId) {
     const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl);
     return normalizedServerUrl ? `${normalizedServerUrl}::${entryId}` : entryId;
   }
@@ -17140,6 +19104,648 @@ ${keptTail}`;
       }
     }
   }
+  async queueBinaryWrite(workspaceId, serverPath, localContent, existingEntry) {
+    const localPath = (0, import_obsidian9.normalizePath)(this.fileBridge.toLocalPath(workspaceId, serverPath) ?? serverPath);
+    if (this.binarySyncTokens.has(localPath)) {
+      this.pendingBinarySyncReruns.add(localPath);
+      this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
+      const existingTransfer = this.binaryTransferState.get(localPath);
+      if (existingTransfer?.kind === "upload") {
+        this.updateBinaryTransferState(localPath, {
+          rerunRequested: true
+        });
+      }
+      return;
+    }
+    const activeTransfer = this.binaryTransferState.get(localPath);
+    if (activeTransfer && activeTransfer.kind === "upload" && activeTransfer.status !== "done" && activeTransfer.status !== "failed") {
+      this.updateBinaryTransferState(localPath, {
+        rerunRequested: true
+      });
+      this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? activeTransfer.entryId);
+      return;
+    }
+    this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
+    const token = this.createBinarySyncToken(localPath);
+    void this.syncBinaryWrite(
+      workspaceId,
+      localPath,
+      serverPath,
+      existingEntry?.id ?? null,
+      token,
+      localContent
+    );
+  }
+  async syncBinaryWrite(workspaceId, initialLocalPath, fallbackServerPath, initialEntryId, token, initialContent) {
+    let finalLocalPath = (0, import_obsidian9.normalizePath)(initialLocalPath);
+    let finalServerPath = fallbackServerPath;
+    let finalEntryId = initialEntryId;
+    let createdPlaceholderEntry = null;
+    try {
+      const currentLocalPath = this.getBinarySyncPathForToken(token);
+      if (!currentLocalPath) {
+        return;
+      }
+      finalLocalPath = currentLocalPath;
+      const currentFile = this.app.vault.getAbstractFileByPath(currentLocalPath);
+      if (!(currentFile instanceof import_obsidian9.TFile) || !isBinaryPath(currentFile.path)) {
+        await this.clearPendingBinaryWriteForLocalPath(currentLocalPath, false);
+        return;
+      }
+      const currentServerPath = this.resolvePendingMarkdownServerPath(
+        workspaceId,
+        currentLocalPath,
+        fallbackServerPath
+      );
+      if (!currentServerPath) {
+        await this.clearPendingBinaryWriteForLocalPath(currentLocalPath, false);
+        return;
+      }
+      finalServerPath = currentServerPath;
+      const binaryContent = initialContent && (0, import_obsidian9.normalizePath)(initialLocalPath) === currentLocalPath ? initialContent : await this.readLocalBinaryContent(currentLocalPath);
+      const sizeBytes = binaryContent.byteLength;
+      const hash = await sha256Hash(binaryContent);
+      const mimeType = guessMimeTypeFromPath(currentLocalPath);
+      let entry = (initialEntryId ? this.getRoomStore(workspaceId)?.getEntryById(initialEntryId) : null) ?? this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
+      if (!entry || entry.deleted || entry.kind !== "binary") {
+        this.registerPendingLocalCreate(workspaceId, currentServerPath);
+        let confirmedServerCreate = false;
+        try {
+          const response = await this.operationsQueue.enqueue(
+            workspaceId,
+            {
+              type: "create_binary_placeholder",
+              path: currentServerPath,
+              sizeBytes,
+              mimeType
+            },
+            `local binary placeholder ${currentServerPath}`
+          );
+          const appliedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+          if (appliedEntry) {
+            this.optimisticUpsertRoomEntry(workspaceId, appliedEntry);
+          }
+          confirmedServerCreate = true;
+          createdPlaceholderEntry = appliedEntry;
+          entry = appliedEntry;
+          finalEntryId = appliedEntry?.id ?? finalEntryId;
+          this.updatePendingBinaryWriteEntryId(currentLocalPath, appliedEntry?.id ?? null, currentServerPath);
+        } catch (error) {
+          if (error instanceof RolayOperationError && error.result.status === "conflict" && error.result.reason === "path_already_exists") {
+            this.clearPendingLocalCreate(workspaceId, currentServerPath);
+            await this.resolveBinaryWritePathConflict(
+              workspaceId,
+              currentServerPath,
+              currentLocalPath,
+              error.result.suggestedPath,
+              token
+            );
+            return;
+          }
+          throw error;
+        } finally {
+          if (!confirmedServerCreate) {
+            this.clearPendingLocalCreate(workspaceId, currentServerPath);
+          }
+        }
+        if (!entry) {
+          await this.refreshRoomSnapshot(workspaceId, "binary-placeholder-create");
+          entry = this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
+          if (entry && entry.kind === "binary") {
+            createdPlaceholderEntry = entry;
+            finalEntryId = entry.id;
+            this.updatePendingBinaryWriteEntryId(currentLocalPath, entry.id, currentServerPath);
+          }
+        }
+      }
+      if (!entry || entry.deleted || entry.kind !== "binary") {
+        throw new Error(`Binary entry for ${currentServerPath} is unavailable after placeholder creation.`);
+      }
+      const desiredLocalPath = this.getBinarySyncPathForToken(token);
+      const desiredServerPath = desiredLocalPath ? this.resolvePendingMarkdownServerPath(workspaceId, desiredLocalPath, currentServerPath) : null;
+      if (!desiredLocalPath || !desiredServerPath) {
+        if (createdPlaceholderEntry) {
+          await this.deleteBinaryPlaceholderIfSafe(workspaceId, createdPlaceholderEntry);
+        }
+        return;
+      }
+      finalLocalPath = desiredLocalPath;
+      finalServerPath = desiredServerPath;
+      if (entry.path !== desiredServerPath) {
+        const renameType = getParentPath2(entry.path) === getParentPath2(desiredServerPath) ? "rename_entry" : "move_entry";
+        await this.queueRenameOrMove(workspaceId, entry, desiredServerPath, renameType);
+        entry = this.getRoomStore(workspaceId)?.getEntryById(entry.id) ?? {
+          ...entry,
+          path: desiredServerPath
+        };
+      }
+      finalEntryId = entry.id;
+      this.updatePendingBinaryWriteEntryId(desiredLocalPath, entry.id, desiredServerPath);
+      if (!this.isBinarySyncTokenCurrent(desiredLocalPath, token)) {
+        return;
+      }
+      this.setBinaryTransferState({
+        workspaceId,
+        entryId: entry.id,
+        localPath: desiredLocalPath,
+        serverPath: desiredServerPath,
+        kind: "upload",
+        status: "preparing",
+        bytesTotal: sizeBytes,
+        bytesDone: 0,
+        hash,
+        mimeType,
+        uploadId: null,
+        cancelUrl: null,
+        lastError: null,
+        rerunRequested: false,
+        abortController: null
+      });
+      const ticket = await this.apiClient.createBlobUploadTicket(entry.id, {
+        hash,
+        sizeBytes,
+        mimeType
+      });
+      const normalizedTicketHash = normalizeSha256Hash(ticket.hash);
+      if (!normalizedTicketHash) {
+        throw new Error(`Blob upload ticket for ${desiredServerPath} is missing a valid hash.`);
+      }
+      if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+        entryId: entry.id,
+        bytesTotal: ticket.sizeBytes > 0 ? ticket.sizeBytes : sizeBytes,
+        hash: normalizedTicketHash,
+        mimeType: ticket.mimeType,
+        uploadId: ticket.uploadId,
+        cancelUrl: ticket.cancel?.url ?? null
+      })) {
+        return;
+      }
+      if (!ticket.alreadyExists) {
+        const abortController = new AbortController();
+        if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+          status: "uploading",
+          abortController
+        })) {
+          return;
+        }
+        const uploadResponse = await this.apiClient.uploadBlobContent(
+          entry.id,
+          ticket.uploadId,
+          binaryContent,
+          normalizedTicketHash,
+          (progress) => {
+            this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+              status: "uploading",
+              bytesDone: progress.loadedBytes,
+              bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : ticket.sizeBytes
+            });
+          },
+          abortController.signal,
+          ticket.upload
+        );
+        const uploadedHash = normalizeSha256Hash(uploadResponse.hash) ?? normalizedTicketHash;
+        const uploadedSizeBytes = Number.isFinite(uploadResponse.sizeBytes) && uploadResponse.sizeBytes > 0 ? uploadResponse.sizeBytes : ticket.sizeBytes;
+        if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+          hash: uploadedHash,
+          bytesDone: uploadedSizeBytes,
+          bytesTotal: uploadedSizeBytes
+        })) {
+          return;
+        }
+        if (uploadedHash !== normalizedTicketHash) {
+          this.recordLog(
+            "blob",
+            `[${workspaceId}] Upload endpoint returned ${uploadedHash} for ${desiredServerPath} instead of ticket hash ${normalizedTicketHash}. Using server-confirmed hash.`,
+            "error"
+          );
+        }
+        ticket.hash = uploadedHash;
+        ticket.sizeBytes = uploadedSizeBytes;
+      } else {
+        if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+          status: "committing",
+          bytesDone: ticket.sizeBytes
+        })) {
+          return;
+        }
+      }
+      if (!this.isBinarySyncTokenCurrent(desiredLocalPath, token)) {
+        return;
+      }
+      if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+        status: "committing",
+        bytesDone: ticket.sizeBytes
+      })) {
+        return;
+      }
+      const commitResponse = await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type: "commit_blob_revision",
+          entryId: entry.id,
+          hash: normalizedTicketHash,
+          sizeBytes: ticket.sizeBytes,
+          mimeType: ticket.mimeType,
+          preconditions: {
+            entryVersion: entry.entryVersion,
+            path: entry.path
+          }
+        },
+        `commit blob revision ${desiredServerPath}`
+      );
+      const committedEntry = commitResponse.results.find((result) => result.status === "applied")?.entry ?? null;
+      if (committedEntry) {
+        this.optimisticUpsertRoomEntry(workspaceId, committedEntry);
+        entry = committedEntry;
+        finalEntryId = committedEntry.id;
+        finalServerPath = committedEntry.path;
+      }
+      this.persistBinaryCacheEntry(entry.id, desiredLocalPath, normalizedTicketHash, ticket.sizeBytes, ticket.mimeType);
+      await this.clearPendingBinaryWriteForLocalPath(desiredLocalPath, false);
+      this.clearBinaryTransferState(desiredLocalPath);
+      this.invalidateBinarySyncToken(desiredLocalPath);
+      this.recordLog(
+        "blob",
+        `[${workspaceId}] Uploaded ${desiredServerPath} (${formatByteCount(ticket.sizeBytes)}, ${normalizedTicketHash.slice(0, 19)}...).`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof Error && error.name === "AbortError") {
+        this.recordLog("blob", `[${workspaceId}] Binary transfer aborted for ${finalLocalPath}.`);
+      } else {
+        const mismatchDetails = formatBlobHashMismatchDetails(error);
+        if (mismatchDetails) {
+          this.recordLog(
+            "blob",
+            `[${workspaceId}] Blob hash mismatch for ${finalServerPath}: ${mismatchDetails}`,
+            "error"
+          );
+        }
+        this.recordLog("blob", `[${workspaceId}] Binary sync failed for ${finalLocalPath}: ${message}`, "error");
+        this.handleError(`Binary sync failed for ${finalLocalPath}`, error, false);
+      }
+      const transfer = this.binaryTransferState.get((0, import_obsidian9.normalizePath)(finalLocalPath));
+      if (transfer) {
+        this.updateBinaryTransferState(finalLocalPath, {
+          status: "failed",
+          lastError: message,
+          abortController: null
+        });
+      }
+      if (this.isBinarySyncTokenCurrent(finalLocalPath, token)) {
+        this.rememberPendingBinaryWrite(workspaceId, finalLocalPath, finalServerPath, finalEntryId, error);
+      }
+    } finally {
+      const transfer = this.binaryTransferState.get((0, import_obsidian9.normalizePath)(finalLocalPath));
+      const normalizedFinalLocalPath = (0, import_obsidian9.normalizePath)(finalLocalPath);
+      const shouldRerun = Boolean(transfer?.rerunRequested) || this.pendingBinarySyncReruns.has(normalizedFinalLocalPath);
+      this.pendingBinarySyncReruns.delete(normalizedFinalLocalPath);
+      if (!shouldRerun && transfer?.status !== "failed") {
+        this.clearBinaryTransferState(finalLocalPath);
+      }
+      if (shouldRerun) {
+        this.clearBinaryTransferState(finalLocalPath);
+        const currentFile = this.app.vault.getAbstractFileByPath(finalLocalPath);
+        const currentServerPath = this.resolvePendingMarkdownServerPath(workspaceId, finalLocalPath, fallbackServerPath);
+        const entry = this.data.pendingBinaryWrites[(0, import_obsidian9.normalizePath)(finalLocalPath)]?.entryId ? this.getRoomStore(workspaceId)?.getEntryById(
+          this.data.pendingBinaryWrites[(0, import_obsidian9.normalizePath)(finalLocalPath)]?.entryId ?? ""
+        ) ?? null : currentServerPath ? this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null : null;
+        if (currentFile instanceof import_obsidian9.TFile && isBinaryPath(currentFile.path) && currentServerPath) {
+          await this.queueBinaryWrite(
+            workspaceId,
+            currentServerPath,
+            await this.app.vault.readBinary(currentFile),
+            entry
+          );
+        }
+      }
+    }
+  }
+  async resolveBinaryWritePathConflict(workspaceId, originalServerPath, originalLocalPath, suggestedPath, token) {
+    const localFile = this.app.vault.getAbstractFileByPath(originalLocalPath);
+    if (!(localFile instanceof import_obsidian9.TFile) || !isBinaryPath(localFile.path)) {
+      await this.clearPendingBinaryWriteForLocalPath(originalLocalPath, false);
+      this.recordLog(
+        "blob",
+        `[${workspaceId}] Dropped conflicting local binary write for ${originalServerPath} because the local file is gone.`,
+        "error"
+      );
+      return;
+    }
+    const replacementServerPath = this.findAvailableBinaryConflictPath(
+      workspaceId,
+      suggestedPath?.trim() || originalServerPath
+    );
+    const replacementLocalPath = this.fileBridge.toLocalPath(workspaceId, replacementServerPath) ?? replacementServerPath;
+    if (replacementLocalPath === originalLocalPath) {
+      throw new Error(`No available fallback binary path for ${originalServerPath}.`);
+    }
+    await this.fileBridge.runWithSuppressedPaths([originalLocalPath, replacementLocalPath], async () => {
+      await this.app.fileManager.renameFile(localFile, replacementLocalPath);
+    });
+    this.moveBinarySyncToken(originalLocalPath, replacementLocalPath);
+    const conflictMessage = `[${workspaceId}] Local binary ${originalServerPath} conflicted with an existing server path. Renamed local file to ${replacementServerPath} so both copies survive.`;
+    this.recordLog("blob", conflictMessage, "error");
+    new import_obsidian9.Notice(`Rolay kept your local file as ${replacementServerPath}.`);
+    const currentFile = this.app.vault.getAbstractFileByPath(replacementLocalPath);
+    if (!(currentFile instanceof import_obsidian9.TFile)) {
+      return;
+    }
+    await this.queueBinaryWrite(
+      workspaceId,
+      replacementServerPath,
+      await this.app.vault.readBinary(currentFile),
+      null
+    );
+  }
+  async reconcilePendingBinaryWrites(workspaceId, reason) {
+    const pendingWrites = this.getPendingBinaryWritesForWorkspace(workspaceId);
+    if (pendingWrites.length === 0) {
+      return;
+    }
+    this.recordLog(
+      "blob",
+      `[${workspaceId}] Replaying ${pendingWrites.length} pending binary write(s) after ${reason}.`
+    );
+    for (const pendingWrite of pendingWrites) {
+      const currentFile = this.app.vault.getAbstractFileByPath(pendingWrite.localPath);
+      if (!(currentFile instanceof import_obsidian9.TFile) || !isBinaryPath(currentFile.path)) {
+        await this.clearPendingBinaryWriteForLocalPath(pendingWrite.localPath, false);
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Cleared pending binary write for ${pendingWrite.localPath} because the local file no longer exists.`
+        );
+        continue;
+      }
+      const currentServerPath = this.resolvePendingMarkdownServerPath(
+        workspaceId,
+        pendingWrite.localPath,
+        pendingWrite.serverPath
+      );
+      if (!currentServerPath) {
+        await this.clearPendingBinaryWriteForLocalPath(pendingWrite.localPath, false);
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Cleared pending binary write for ${pendingWrite.localPath} because it is no longer inside the room root.`
+        );
+        continue;
+      }
+      const entryById = pendingWrite.entryId ? this.getRoomStore(workspaceId)?.getEntryById(pendingWrite.entryId) ?? null : null;
+      const entry = entryById ?? this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
+      if (entry && this.shouldDropPendingBinaryWriteAsRemoteEcho(workspaceId, pendingWrite, entry)) {
+        this.clearPendingBinaryWriteRecord(pendingWrite.localPath);
+        this.clearPendingLocalCreate(workspaceId, currentServerPath);
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Cleared stale pending binary write for ${currentServerPath} because that path is already owned by remote entry ${entry.id}.`
+        );
+        continue;
+      }
+      try {
+        await this.queueBinaryWrite(
+          workspaceId,
+          currentServerPath,
+          await this.app.vault.readBinary(currentFile),
+          entry
+        );
+      } catch {
+      }
+    }
+  }
+  async syncBinaryEntriesFromSnapshot(workspaceId, entries, reason) {
+    for (const entry of entries) {
+      if (entry.kind === "binary" && entry.deleted) {
+        this.clearPersistedBinaryCacheEntry(entry.id);
+      }
+    }
+    const binaryEntries = entries.filter((entry) => !entry.deleted && entry.kind === "binary");
+    await this.cancelStaleBinaryDownloads(workspaceId, binaryEntries);
+    if (binaryEntries.length === 0) {
+      return;
+    }
+    const queue = [...binaryEntries];
+    const workers = Array.from(
+      { length: Math.min(_RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY, queue.length) },
+      async () => {
+        while (queue.length > 0) {
+          const entry = queue.shift();
+          if (!entry) {
+            return;
+          }
+          await this.ensureBinaryEntryDownloaded(workspaceId, entry, reason);
+        }
+      }
+    );
+    await Promise.all(workers);
+  }
+  async cancelStaleBinaryDownloads(workspaceId, entries) {
+    const activeEntries = new Map(entries.map((entry) => [entry.id, entry]));
+    const transfers = this.getBinaryTransfersForWorkspace(workspaceId).filter((transfer) => transfer.kind === "download");
+    for (const transfer of transfers) {
+      const entry = transfer.entryId ? activeEntries.get(transfer.entryId) ?? null : null;
+      const remoteHash = entry?.blob?.hash ?? null;
+      if (!entry || entry.deleted || entry.path !== transfer.serverPath || transfer.hash && remoteHash && transfer.hash !== remoteHash) {
+        await this.cancelBinaryTransferForLocalPath(transfer.localPath, "stale-download");
+      }
+    }
+  }
+  async ensureBinaryEntryDownloaded(workspaceId, entry, reason) {
+    if (entry.deleted || entry.kind !== "binary" || !entry.blob) {
+      return;
+    }
+    const localPath = (0, import_obsidian9.normalizePath)(this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path);
+    const pendingWrite = this.data.pendingBinaryWrites[localPath];
+    if (pendingWrite) {
+      if (this.shouldDropPendingBinaryWriteAsRemoteEcho(workspaceId, pendingWrite, entry)) {
+        this.clearPendingBinaryWriteRecord(localPath);
+      } else {
+        return;
+      }
+    }
+    const activeUpload = this.binaryTransferState.get(localPath);
+    if (activeUpload && activeUpload.kind === "upload") {
+      return;
+    }
+    const existingTransfer = this.binaryTransferState.get(localPath);
+    const remoteHash = normalizeSha256Hash(entry.blob.hash);
+    if (!remoteHash) {
+      throw new Error(`Binary entry ${entry.path} is missing a valid blob hash.`);
+    }
+    if (existingTransfer && existingTransfer.kind === "download" && existingTransfer.hash === remoteHash && (existingTransfer.status === "preparing" || existingTransfer.status === "downloading")) {
+      return;
+    }
+    const localFile = this.app.vault.getAbstractFileByPath(localPath);
+    const cached = this.findPersistedBinaryCacheEntry(entry.id);
+    const remoteSize = entry.blob.sizeBytes;
+    const remoteMimeType = entry.blob.mimeType || entry.mimeType || "application/octet-stream";
+    if (localFile instanceof import_obsidian9.TFile && cached?.hash === remoteHash) {
+      if ((0, import_obsidian9.normalizePath)(cached.filePath) !== localPath) {
+        this.persistBinaryCacheEntry(entry.id, localPath, remoteHash, remoteSize, remoteMimeType);
+      }
+      return;
+    }
+    if (localFile instanceof import_obsidian9.TFile) {
+      const localBytes = await this.app.vault.readBinary(localFile);
+      const localHash = await sha256Hash(localBytes);
+      if (localHash === remoteHash) {
+        this.persistBinaryCacheEntry(entry.id, localPath, remoteHash, remoteSize, remoteMimeType);
+        return;
+      }
+      const safeToOverwrite = localBytes.byteLength === 0 || (cached ? cached.hash === localHash : false);
+      if (!safeToOverwrite) {
+        await this.resolveBinaryDownloadConflict(workspaceId, entry, localPath);
+      }
+    }
+    this.setBinaryTransferState({
+      workspaceId,
+      entryId: entry.id,
+      localPath,
+      serverPath: entry.path,
+      kind: "download",
+      status: "preparing",
+      bytesTotal: remoteSize,
+      bytesDone: 0,
+      hash: remoteHash,
+      mimeType: remoteMimeType,
+      uploadId: null,
+      cancelUrl: null,
+      lastError: null,
+      rerunRequested: false,
+      abortController: new AbortController()
+    });
+    try {
+      const ticket = await this.apiClient.createBlobDownloadTicket(entry.id);
+      const transfer = this.maybeUpdateBinaryTransferState(localPath, {
+        status: "downloading",
+        bytesTotal: ticket.sizeBytes > 0 ? ticket.sizeBytes : remoteSize
+      });
+      if (!transfer) {
+        return;
+      }
+      const download = await this.apiClient.downloadBlobFromUrl(
+        ticket.url,
+        (progress) => {
+          this.maybeUpdateBinaryTransferState(localPath, {
+            status: "downloading",
+            bytesDone: progress.loadedBytes,
+            bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : transfer.bytesTotal
+          });
+        },
+        transfer.abortController?.signal
+      );
+      await this.applyDownloadedBinary(workspaceId, entry, localPath, ticket, download, reason);
+      this.clearBinaryTransferState(localPath);
+    } catch (error) {
+      if (!(error instanceof Error && error.name === "AbortError")) {
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Binary download failed for ${entry.path}: ${error instanceof Error ? error.message : String(error)}`,
+          "error"
+        );
+      }
+      this.clearBinaryTransferState(localPath);
+    }
+  }
+  async applyDownloadedBinary(workspaceId, entry, localPath, ticket, download, reason) {
+    const effectiveHash = normalizeSha256Hash(download.hash ?? ticket.hash);
+    const effectiveSize = download.contentLength ?? ticket.sizeBytes ?? download.data.byteLength;
+    const effectiveMimeType = download.contentType ?? ticket.mimeType;
+    const computedHash = await sha256Hash(download.data);
+    if (effectiveHash && computedHash !== effectiveHash) {
+      throw new Error(`Downloaded blob hash mismatch for ${entry.path}.`);
+    }
+    const existingLocalFile = this.app.vault.getAbstractFileByPath(localPath);
+    const cached = this.findPersistedBinaryCacheEntry(entry.id);
+    if (existingLocalFile instanceof import_obsidian9.TFile) {
+      const currentLocalBytes = await this.app.vault.readBinary(existingLocalFile);
+      const currentLocalHash = await sha256Hash(currentLocalBytes);
+      if (currentLocalHash === computedHash) {
+        this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType ?? ticket.mimeType);
+        return;
+      }
+      const safeToOverwrite = currentLocalBytes.byteLength === 0 || (cached ? cached.hash === currentLocalHash : false);
+      if (!safeToOverwrite) {
+        await this.resolveBinaryDownloadConflict(workspaceId, entry, localPath);
+      }
+    }
+    await this.fileBridge.writeBinaryContent(workspaceId, entry.path, download.data);
+    this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType ?? ticket.mimeType);
+    this.recordLog(
+      "blob",
+      `[${workspaceId}] Downloaded ${entry.path} (${formatByteCount(download.data.byteLength)}) from ${reason}.`
+    );
+  }
+  async resolveBinaryDownloadConflict(workspaceId, entry, originalLocalPath) {
+    const localFile = this.app.vault.getAbstractFileByPath(originalLocalPath);
+    if (!(localFile instanceof import_obsidian9.TFile) || !isBinaryPath(localFile.path)) {
+      return;
+    }
+    const replacementServerPath = this.findAvailableBinaryConflictPath(workspaceId, entry.path);
+    const replacementLocalPath = this.fileBridge.toLocalPath(workspaceId, replacementServerPath) ?? replacementServerPath;
+    if (replacementLocalPath === originalLocalPath) {
+      return;
+    }
+    await this.fileBridge.runWithSuppressedPaths([originalLocalPath, replacementLocalPath], async () => {
+      await this.app.fileManager.renameFile(localFile, replacementLocalPath);
+    });
+    const conflictMessage = `[${workspaceId}] Local binary ${entry.path} diverged from the incoming remote blob. Renamed local file to ${replacementServerPath} so both copies survive.`;
+    this.recordLog("blob", conflictMessage, "error");
+    new import_obsidian9.Notice(`Rolay kept your local file as ${replacementServerPath}.`);
+    const replacementFile = this.app.vault.getAbstractFileByPath(replacementLocalPath);
+    if (replacementFile instanceof import_obsidian9.TFile) {
+      await this.queueBinaryWrite(
+        workspaceId,
+        replacementServerPath,
+        await this.app.vault.readBinary(replacementFile),
+        null
+      );
+    }
+  }
+  async deleteBinaryPlaceholderIfSafe(workspaceId, entry) {
+    try {
+      await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type: "delete_entry",
+          entryId: entry.id,
+          preconditions: {
+            entryVersion: entry.entryVersion,
+            path: entry.path
+          }
+        },
+        `abandon binary placeholder ${entry.path}`
+      );
+      this.optimisticDeleteRoomEntry(workspaceId, entry.id);
+    } catch (error) {
+      this.recordLog(
+        "blob",
+        `[${workspaceId}] Failed to delete abandoned binary placeholder ${entry.path}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+    }
+  }
+  findAvailableBinaryConflictPath(workspaceId, desiredServerPath) {
+    const normalizedDesiredPath = desiredServerPath.replace(/\\/g, "/");
+    const directoryPath = getParentPath2(normalizedDesiredPath);
+    const fileName = getFileName(normalizedDesiredPath);
+    const extension = getFileExtension(fileName);
+    const rawStem = extension ? fileName.slice(0, -(extension.length + 1)) : fileName;
+    const { baseStem, nextIndex } = parseCopySuffix(rawStem);
+    const candidates = [normalizedDesiredPath];
+    for (let index = nextIndex; index <= nextIndex + 999; index += 1) {
+      const candidateFileName = extension ? `${baseStem}(${index}).${extension}` : `${baseStem}(${index})`;
+      candidates.push(directoryPath ? `${directoryPath}/${candidateFileName}` : candidateFileName);
+    }
+    for (const candidatePath of candidates) {
+      const remoteExists = Boolean(this.getRoomStore(workspaceId)?.getEntryByPath(candidatePath));
+      const localPath = this.fileBridge.toLocalPath(workspaceId, candidatePath) ?? candidatePath;
+      const localExists = Boolean(this.app.vault.getAbstractFileByPath(localPath));
+      if (!remoteExists && !localExists) {
+        return candidatePath;
+      }
+    }
+    throw new Error(`No free conflict-safe binary path is available for ${desiredServerPath}.`);
+  }
   async queueRenameOrMove(workspaceId, entry, newPath, type) {
     this.optimisticUpsertRoomEntry(workspaceId, {
       ...entry,
@@ -17188,9 +19794,15 @@ ${keptTail}`;
       const deletedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
       if (deletedEntry) {
         this.optimisticUpsertRoomEntry(workspaceId, deletedEntry);
+        if (entry.kind === "binary") {
+          this.clearPersistedBinaryCacheEntry(entry.id);
+        }
         return;
       }
       this.optimisticDeleteRoomEntry(workspaceId, entry.id);
+      if (entry.kind === "binary") {
+        this.clearPersistedBinaryCacheEntry(entry.id);
+      }
     } catch (error) {
       this.scheduleSnapshotRefresh(workspaceId, "delete-recovery");
       throw error;
@@ -17243,8 +19855,25 @@ ${keptTail}`;
       return fallback;
     }
   }
+  async readLocalBinaryContent(localPath, fallback = new ArrayBuffer(0)) {
+    const localFile = this.app.vault.getAbstractFileByPath(localPath);
+    if (!(localFile instanceof import_obsidian9.TFile) || !isBinaryPath(localFile.path)) {
+      return fallback;
+    }
+    try {
+      return await this.app.vault.readBinary(localFile);
+    } catch (error) {
+      this.recordLog(
+        "blob",
+        `Failed to read local binary content for ${localPath}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+      return fallback;
+    }
+  }
 };
 _RolayPlugin.MAX_PERSISTED_CRDT_DOCS = 64;
+_RolayPlugin.MAX_PERSISTED_BINARY_ENTRIES = 128;
 _RolayPlugin.MAX_LOG_FILE_BYTES = 512 * 1024;
 _RolayPlugin.LOG_FILE_NAME = "rolay-sync.log";
 _RolayPlugin.PENDING_CREATE_CONFIRMATION_TTL_MS = 6e4;
@@ -17254,6 +19883,7 @@ _RolayPlugin.ROOM_MARKDOWN_REFRESH_INTERVAL_MS = 5e3;
 _RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS = 1200;
 _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = 8;
 _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = 512 * 1024;
+_RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY = 2;
 var RolayPlugin = _RolayPlugin;
 function normalizeSettingsEventEnvelope(event) {
   const rawData = isRecord2(event.data) ? event.data : {};
@@ -17493,6 +20123,36 @@ function formatByteCount(bytes) {
   }
   const digits = value >= 100 || unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
   return `${value.toFixed(digits)} ${units[unitIndex]}`;
+}
+function formatBlobHashMismatchDetails(error) {
+  if (!(error instanceof RolayApiError) || error.code !== "blob_hash_mismatch") {
+    return null;
+  }
+  const details = error.details ?? {};
+  const expectedHash = typeof details.expectedHash === "string" ? details.expectedHash : null;
+  const actualHash = typeof details.actualHash === "string" ? details.actualHash : null;
+  const receivedSizeBytes = typeof details.receivedSizeBytes === "number" && Number.isFinite(details.receivedSizeBytes) ? details.receivedSizeBytes : null;
+  const parts = [];
+  if (expectedHash) {
+    parts.push(`expected ${expectedHash}`);
+  }
+  if (actualHash) {
+    parts.push(`actual ${actualHash}`);
+  }
+  if (receivedSizeBytes !== null) {
+    parts.push(`received ${formatByteCount(receivedSizeBytes)}`);
+  }
+  if (expectedHash && actualHash) {
+    const normalizedExpected = normalizeSha256Hash(expectedHash);
+    const normalizedActual = normalizeSha256Hash(actualHash);
+    if (normalizedExpected && normalizedActual && normalizedExpected === normalizedActual) {
+      parts.push("same digest, different hash encoding");
+    }
+  }
+  if (parts.length === 0) {
+    return error.message;
+  }
+  return parts.join(", ");
 }
 function areUint8ArraysEqual(left, right) {
   if (left.byteLength !== right.byteLength) {

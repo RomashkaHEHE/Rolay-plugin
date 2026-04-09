@@ -1,10 +1,11 @@
 import { MarkdownView, Notice, Plugin, TFile, normalizePath, type TAbstractFile } from "obsidian";
 import * as Y from "yjs";
-import { RolayApiClient, RolayApiError } from "./api/client";
+import { RolayApiClient, RolayApiError, type BlobDownloadResult, type BlobTransferProgress } from "./api/client";
 import { FileBridge } from "./obsidian/file-bridge";
 import { createMarkdownTextState, CrdtSessionManager } from "./realtime/crdt-session";
 import { createSharedPresenceExtension, getMarkdownViewsForFile } from "./realtime/shared-presence";
 import {
+  type RolayBinaryCacheEntry,
   getRoomBindingSettings,
   ROLAY_AUTO_CONNECT,
   ROLAY_DEVICE_NAME,
@@ -14,6 +15,7 @@ import {
   mergePluginData,
   normalizeServerUrl,
   type RolayLogEntry,
+  type RolayPendingBinaryWriteEntry,
   type RolayPendingMarkdownCreateEntry,
   type RolayPendingMarkdownMergeEntry,
   type RolayPluginData,
@@ -47,13 +49,19 @@ import type {
   User
 } from "./types/protocol";
 import { openTextInputModal } from "./ui/text-input-modal";
+import { isBinaryPath, isMarkdownPath, guessMimeTypeFromPath } from "./utils/file-kind";
 import { decodeBase64, encodeBase64 } from "./utils/base64";
+import { normalizeSha256Hash, sha256Hash } from "./utils/sha256";
 
 interface RoomRuntimeState {
   treeStore: TreeStore;
   eventStream: WorkspaceEventStream | null;
+  eventStreamGeneration: number;
   streamStatus: WorkspaceEventStreamStatus;
+  lastHandledEventId: number | null;
   snapshotRefreshHandle: number | null;
+  snapshotRefreshInFlight: boolean;
+  snapshotRefreshQueuedReason: string | null;
   backgroundMarkdownRefreshHandle: number | null;
   backgroundMarkdownRefreshInFlight: boolean;
   lockedBootstrapRetryHandle: number | null;
@@ -80,6 +88,34 @@ interface DownloadedRoomDescriptor {
   folderName: string;
 }
 
+type BinaryTransferKind = "upload" | "download";
+type BinaryTransferStatus =
+  | "preparing"
+  | "uploading"
+  | "canceling"
+  | "downloading"
+  | "committing"
+  | "done"
+  | "failed";
+
+interface BinaryTransferState {
+  workspaceId: string;
+  entryId: string | null;
+  localPath: string;
+  serverPath: string;
+  kind: BinaryTransferKind;
+  status: BinaryTransferStatus;
+  bytesTotal: number;
+  bytesDone: number;
+  hash: string | null;
+  mimeType: string | null;
+  uploadId: string | null;
+  cancelUrl: string | null;
+  lastError: string | null;
+  rerunRequested: boolean;
+  abortController: AbortController | null;
+}
+
 export interface RoomCardState {
   room: RoomListItem;
   folderName: string;
@@ -93,6 +129,7 @@ export interface RoomCardState {
   markdownEntryCount: number;
   cachedMarkdownCount: number;
   crdtCacheLabel: string;
+  binaryTransferLabel: string;
   invite: InviteState | null;
 }
 
@@ -115,6 +152,7 @@ interface PasswordChangeDraft {
 
 export default class RolayPlugin extends Plugin {
   private static readonly MAX_PERSISTED_CRDT_DOCS = 64;
+  private static readonly MAX_PERSISTED_BINARY_ENTRIES = 128;
   private static readonly MAX_LOG_FILE_BYTES = 512 * 1024;
   private static readonly LOG_FILE_NAME = "rolay-sync.log";
   private static readonly PENDING_CREATE_CONFIRMATION_TTL_MS = 60_000;
@@ -124,6 +162,7 @@ export default class RolayPlugin extends Plugin {
   private static readonly ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS = 1_200;
   private static readonly MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = 8;
   private static readonly MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = 512 * 1024;
+  private static readonly BINARY_DOWNLOAD_CONCURRENCY = 2;
   private data!: RolayPluginData;
   private apiClient!: RolayApiClient;
   private crdtManager!: CrdtSessionManager;
@@ -133,6 +172,10 @@ export default class RolayPlugin extends Plugin {
   private readonly roomInvites = new Map<string, InviteState>();
   private readonly pendingLocalCreates = new Map<string, number>();
   private readonly pendingLocalDeletes = new Set<string>();
+  private readonly binaryTransferState = new Map<string, BinaryTransferState>();
+  private readonly binarySyncTokens = new Map<string, string>();
+  private readonly binarySyncPathsByToken = new Map<string, string>();
+  private readonly pendingBinarySyncReruns = new Set<string>();
   private readonly recentRemoteObservedPaths = new Map<string, number>();
   private readonly pendingRemoteMarkdownSettles = new Map<string, number>();
   private persistHandle: number | null = null;
@@ -148,6 +191,7 @@ export default class RolayPlugin extends Plugin {
   private readonly pendingLogLines: string[] = [];
   private settingsTab!: RolaySettingTab;
   private settingsEventStream: SettingsEventStream | null = null;
+  private settingsEventStreamGeneration = 0;
   private settingsEventCursor: number | null = null;
   private settingsEventStreamStatus: WorkspaceEventStreamStatus = "stopped";
   private settingsStreamRecoveryInFlight = false;
@@ -220,14 +264,19 @@ export default class RolayPlugin extends Plugin {
       getEntryByPath: (workspaceId, path) => this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null,
       hasPendingCreate: (workspaceId, path) => this.hasPendingLocalCreate(workspaceId, path),
       hasPendingDelete: (workspaceId, path) => this.hasPendingLocalDelete(workspaceId, path),
+      hasPendingBinaryWrite: (localPath) => normalizePath(localPath) in this.data.pendingBinaryWrites,
       log: (message) => this.recordLog("bridge", message),
       onCreateFolder: (workspaceId, path) => this.queueCreateFolder(workspaceId, path),
       onCreateMarkdown: (workspaceId, path, localContent) => this.queueCreateMarkdown(workspaceId, path, localContent),
+      onCreateBinary: (workspaceId, path, localContent) => this.queueBinaryWrite(workspaceId, path, localContent, null),
+      onUpdateBinary: (workspaceId, entry, localContent) => this.queueBinaryWrite(workspaceId, entry.path, localContent, entry),
       onRenameOrMove: (workspaceId, entry, newPath, type) => this.queueRenameOrMove(workspaceId, entry, newPath, type),
       onDeleteEntry: (workspaceId, entry) => this.queueDeleteEntry(workspaceId, entry),
       onRemotePathObserved: (workspaceId, localPath, serverPath) => {
         this.noteRemoteObservedPath(workspaceId, localPath, serverPath);
-      }
+      },
+      wasPathRecentlyObservedAsRemote: (workspaceId, localPath) =>
+        this.wasPathRecentlyObservedAsRemote(workspaceId, localPath)
     });
 
     this.statusBarEl = this.addStatusBarItem();
@@ -262,6 +311,11 @@ export default class RolayPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
         void this.handleVaultRename(file, oldPath);
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        void this.handleVaultModify(file);
       })
     );
     this.registerEvent(
@@ -300,6 +354,13 @@ export default class RolayPlugin extends Plugin {
         window.clearTimeout(handle);
       }
       this.pendingRemoteMarkdownSettles.clear();
+
+      for (const transfer of this.binaryTransferState.values()) {
+        transfer.abortController?.abort();
+      }
+      this.binaryTransferState.clear();
+      this.binarySyncTokens.clear();
+      this.binarySyncPathsByToken.clear();
     });
 
     this.recordLog("plugin", "Rolay plugin loaded.");
@@ -337,6 +398,7 @@ export default class RolayPlugin extends Plugin {
       const treeStore = runtime?.treeStore ?? null;
       const markdownEntries = treeStore?.getEntries().filter((entry) => !entry.deleted && entry.kind === "markdown") ?? [];
       const cachedMarkdownCount = markdownEntries.filter((entry) => this.hasPersistedCrdtCache(entry.id)).length;
+      const binaryTransferLabel = this.formatRoomBinaryTransferLabel(room.workspace.id);
 
       return {
         room,
@@ -351,6 +413,7 @@ export default class RolayPlugin extends Plugin {
         markdownEntryCount: markdownEntries.length,
         cachedMarkdownCount,
         crdtCacheLabel: this.formatRoomCrdtCacheLabel(runtime?.markdownBootstrap, markdownEntries.length, cachedMarkdownCount),
+        binaryTransferLabel,
         invite: this.roomInvites.get(room.workspace.id) ?? null
       };
     });
@@ -601,6 +664,15 @@ export default class RolayPlugin extends Plugin {
     this.stopSettingsEventStream();
     this.stopAllRoomEventStreams();
     await this.crdtManager.disconnect();
+    for (const localPath of [...this.binaryTransferState.keys()]) {
+      this.invalidateBinarySyncToken(localPath);
+    }
+    for (const localPath of [...this.binaryTransferState.keys()]) {
+      await this.cancelBinaryTransferForLocalPath(localPath, "logout");
+    }
+    this.binaryTransferState.clear();
+    this.binarySyncTokens.clear();
+    this.binarySyncPathsByToken.clear();
     this.roomRuntime.clear();
     this.roomInvites.clear();
     this.roomList = [];
@@ -1144,45 +1216,100 @@ export default class RolayPlugin extends Plugin {
   }
 
   async refreshRoomSnapshot(workspaceId: string, reason = "manual"): Promise<void> {
-    const room = this.requireDownloadedRoom(workspaceId);
-    const runtime = this.ensureRoomRuntime(room.workspace.id);
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    if (runtime.snapshotRefreshInFlight) {
+      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
+      return;
+    }
 
+    runtime.snapshotRefreshInFlight = true;
     try {
-      const previousEntries = runtime.treeStore.getEntries();
-      const snapshot = await this.apiClient.getWorkspaceTree(room.workspace.id);
-      runtime.treeStore.applySnapshot(snapshot);
-      this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
-      await this.fileBridge.applySnapshot(snapshot, previousEntries);
-      this.setRoomSyncState(room.workspace.id, {
-        lastCursor: snapshot.cursor,
-        lastSnapshotAt: new Date().toISOString()
-      });
-      this.recordLog(
-        "tree",
-        `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
-      );
-      await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
-      this.scheduleBackgroundMarkdownRefresh(
-        room.workspace.id,
-        "post-snapshot-background-refresh",
-        RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS,
-        true
-      );
-      await this.reconcilePendingMarkdownCreates(room.workspace.id, reason);
-      await this.reconcilePendingMarkdownMerges(room.workspace.id, reason);
-      await this.persistNow();
-      this.updateStatusBar();
-      await this.bindActiveMarkdownToCrdt();
+      await this.performRoomSnapshotRefresh(workspaceId, reason);
     } catch (error) {
+      if (this.shouldRetrySnapshotAfterAuthRecovery(error)) {
+        try {
+          await this.ensureAuthenticated(true);
+          await this.performRoomSnapshotRefresh(workspaceId, `${reason}-auth-retry`);
+          return;
+        } catch (retryError) {
+          this.handleError("Tree snapshot failed", retryError);
+          throw retryError;
+        }
+      }
+
       this.handleError("Tree snapshot failed", error);
       throw error;
+    } finally {
+      runtime.snapshotRefreshInFlight = false;
+      const queuedReason = runtime.snapshotRefreshQueuedReason;
+      runtime.snapshotRefreshQueuedReason = null;
+      if (queuedReason) {
+        this.scheduleSnapshotRefresh(workspaceId, queuedReason);
+      }
     }
+  }
+
+  private async performRoomSnapshotRefresh(workspaceId: string, reason: string): Promise<void> {
+    if (!this.hasUsableSessionTokens() && this.canAttemptAuth()) {
+      await this.ensureAuthenticated(true);
+    }
+
+    const room = this.requireDownloadedRoom(workspaceId);
+    const runtime = this.ensureRoomRuntime(room.workspace.id);
+    const previousEntries = runtime.treeStore.getEntries();
+    const snapshot = await this.apiClient.getWorkspaceTree(room.workspace.id);
+    runtime.treeStore.applySnapshot(snapshot);
+    this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
+    await this.fileBridge.applySnapshot(snapshot, previousEntries);
+    this.setRoomSyncState(room.workspace.id, {
+      lastCursor: snapshot.cursor,
+      lastSnapshotAt: new Date().toISOString()
+    });
+    this.recordLog(
+      "tree",
+      `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
+    );
+    await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
+    await this.syncBinaryEntriesFromSnapshot(room.workspace.id, snapshot.entries, reason);
+    this.scheduleBackgroundMarkdownRefresh(
+      room.workspace.id,
+      "post-snapshot-background-refresh",
+      RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS,
+      true
+    );
+    await this.reconcilePendingMarkdownCreates(room.workspace.id, reason);
+    await this.reconcilePendingMarkdownMerges(room.workspace.id, reason);
+    await this.reconcilePendingBinaryWrites(room.workspace.id, reason);
+    await this.persistNow();
+    this.updateStatusBar();
+    await this.bindActiveMarkdownToCrdt();
+  }
+
+  private shouldRetrySnapshotAfterAuthRecovery(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    const normalizedMessage = error.message.toLowerCase();
+    return (
+      normalizedMessage.includes("you are not authenticated yet") ||
+      normalizedMessage.includes("no refresh token is stored yet.")
+    ) && this.canAttemptAuth();
+  }
+
+  private hasUsableSessionTokens(): boolean {
+    return Boolean(
+      this.data.session?.accessToken?.trim() ||
+      this.data.session?.refreshToken?.trim()
+    );
   }
 
   async startRoomEventStream(workspaceId: string): Promise<void> {
     const room = this.requireDownloadedRoom(workspaceId);
     const runtime = this.ensureRoomRuntime(room.workspace.id);
     this.stopRoomEventStream(room.workspace.id);
+    const generation = runtime.eventStreamGeneration + 1;
+    runtime.eventStreamGeneration = generation;
 
     const roomSync = getRoomSyncState(this.data.sync, room.workspace.id);
     const treeCursor = runtime.treeStore.getCursor();
@@ -1198,9 +1325,21 @@ export default class RolayPlugin extends Plugin {
 
     stream.start(room.workspace.id, cursor, {
       onOpen: () => {
+        if (runtime.eventStreamGeneration !== generation) {
+          return;
+        }
         this.recordLog("sse", `Subscribed to room ${room.workspace.id} events.`);
       },
       onEvent: async (event) => {
+        if (runtime.eventStreamGeneration !== generation) {
+          return;
+        }
+        const lastHandledEventId = runtime.lastHandledEventId ?? runtime.treeStore.getCursor();
+        if (lastHandledEventId !== null && event.id <= lastHandledEventId) {
+          return;
+        }
+
+        runtime.lastHandledEventId = event.id;
         runtime.treeStore.recordCursor(event.id);
         this.updateRoomSyncCursor(room.workspace.id, event.id);
         this.schedulePersist();
@@ -1210,11 +1349,17 @@ export default class RolayPlugin extends Plugin {
         }
       },
       onStatusChange: (status) => {
+        if (runtime.eventStreamGeneration !== generation) {
+          return;
+        }
         runtime.streamStatus = status;
         this.updateStatusBar();
         this.scheduleExplorerLoadingDecorations();
       },
       onError: (error) => {
+        if (runtime.eventStreamGeneration !== generation) {
+          return;
+        }
         this.handleError(`Workspace event stream error (${room.workspace.id})`, error, false);
       }
     });
@@ -1226,12 +1371,19 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
+    if (runtime.snapshotRefreshHandle !== null) {
+      window.clearTimeout(runtime.snapshotRefreshHandle);
+      runtime.snapshotRefreshHandle = null;
+    }
+    runtime.snapshotRefreshQueuedReason = null;
     this.clearBackgroundMarkdownRefresh(workspaceId);
     this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
     this.cancelRoomMarkdownBootstrap(workspaceId);
+    runtime.eventStreamGeneration += 1;
     runtime.eventStream?.stop();
     runtime.eventStream = null;
     runtime.streamStatus = "stopped";
+    runtime.lastHandledEventId = runtime.treeStore.getCursor();
     this.updateStatusBar();
     this.scheduleExplorerLoadingDecorations();
   }
@@ -1249,6 +1401,8 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
+    const generation = this.settingsEventStreamGeneration + 1;
+    this.settingsEventStreamGeneration = generation;
     this.settingsEventCursor = cursor;
     const stream = new SettingsEventStream(this.apiClient, (message) => {
       this.recordLog("settings-sse", message);
@@ -1257,16 +1411,28 @@ export default class RolayPlugin extends Plugin {
 
     stream.start(cursor, {
       onOpen: () => {
+        if (this.settingsEventStreamGeneration !== generation) {
+          return;
+        }
         this.recordLog("settings-sse", "Subscribed to settings events.");
       },
       onEvent: async (event) => {
+        if (this.settingsEventStreamGeneration !== generation) {
+          return;
+        }
         await this.handleSettingsEventStreamEvent(event);
       },
       onStatusChange: (status) => {
+        if (this.settingsEventStreamGeneration !== generation) {
+          return;
+        }
         this.settingsEventStreamStatus = status;
         this.updateStatusBar();
       },
       onError: (error) => {
+        if (this.settingsEventStreamGeneration !== generation) {
+          return;
+        }
         this.handleError("Settings event stream error", error, false);
         if (this.shouldRecoverSettingsStream(error)) {
           void this.recoverSettingsEventStream();
@@ -1276,6 +1442,7 @@ export default class RolayPlugin extends Plugin {
   }
 
   private stopSettingsEventStream(): void {
+    this.settingsEventStreamGeneration += 1;
     this.settingsEventStream?.stop();
     this.settingsEventStream = null;
     this.settingsEventStreamStatus = "stopped";
@@ -1480,10 +1647,21 @@ export default class RolayPlugin extends Plugin {
 
   private async handleVaultCreate(file: TAbstractFile): Promise<void> {
     try {
-      this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       await this.fileBridge.handleVaultCreate(file);
     } catch (error) {
       this.handleError(`Local create sync failed for ${file.path}`, error, false);
+    }
+  }
+
+  private async handleVaultModify(file: TAbstractFile): Promise<void> {
+    try {
+      if (!(file instanceof TFile) || isMarkdownPath(file.path)) {
+        return;
+      }
+
+      await this.fileBridge.handleVaultModify(file);
+    } catch (error) {
+      this.handleError(`Local binary modify sync failed for ${file.path}`, error, false);
     }
   }
 
@@ -1494,11 +1672,17 @@ export default class RolayPlugin extends Plugin {
         return;
       }
 
+      if (await this.revertDownloadingBinaryRename(file, oldPath)) {
+        await this.bindActiveMarkdownToCrdt();
+        return;
+      }
+
       await this.refreshMarkdownContentBeforeRoomExit(file, oldPath);
       this.forgetRecentRemoteHintsForLocalPath(oldPath, true);
       this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       this.handlePendingMarkdownCreateRename(oldPath, file.path);
       this.handlePendingMarkdownMergeRename(oldPath, file.path);
+      await this.handlePendingBinaryWriteRename(oldPath, file.path);
       await this.fileBridge.handleVaultRename(file, oldPath);
       await this.bindActiveMarkdownToCrdt();
     } catch (error) {
@@ -1513,9 +1697,15 @@ export default class RolayPlugin extends Plugin {
         return;
       }
 
+      if (await this.restoreDownloadingBinaryDelete(file)) {
+        await this.bindActiveMarkdownToCrdt();
+        return;
+      }
+
       this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       this.clearPendingMarkdownCreate(file.path);
       this.clearPendingMarkdownMergesForLocalPath(file.path);
+      await this.clearPendingBinaryWriteForLocalPath(file.path, true);
       if (await this.handlePotentialRoomRootRemoval(file.path, "delete")) {
         return;
       }
@@ -1593,7 +1783,13 @@ export default class RolayPlugin extends Plugin {
 
   private scheduleSnapshotRefresh(workspaceId: string, reason = "event-stream"): void {
     const runtime = this.ensureRoomRuntime(workspaceId);
+    if (runtime.snapshotRefreshInFlight) {
+      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
+      return;
+    }
+
     if (runtime.snapshotRefreshHandle !== null) {
+      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
       return;
     }
 
@@ -1883,8 +2079,12 @@ export default class RolayPlugin extends Plugin {
     const runtime: RoomRuntimeState = {
       treeStore: new TreeStore(),
       eventStream: null,
+      eventStreamGeneration: 0,
       streamStatus: "stopped",
+      lastHandledEventId: null,
       snapshotRefreshHandle: null,
+      snapshotRefreshInFlight: false,
+      snapshotRefreshQueuedReason: null,
       backgroundMarkdownRefreshHandle: null,
       backgroundMarkdownRefreshInFlight: false,
       lockedBootstrapRetryHandle: null,
@@ -2098,14 +2298,8 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
-    const lockedPaths = new Set<string>();
-    for (const runtime of this.roomRuntime.values()) {
-      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
-        lockedPaths.add(lockedPath);
-      }
-    }
-
-    const uploadingPaths = this.getUploadingMarkdownExplorerPaths();
+    const loadingPaths = this.getLoadingExplorerPaths();
+    const uploadingPaths = this.getUploadingExplorerPaths();
     const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
 
     const pathElements = container.querySelectorAll<HTMLElement>("[data-path]");
@@ -2127,9 +2321,9 @@ export default class RolayPlugin extends Plugin {
       }
 
       const normalizedPath = normalizePath(dataPath);
-      const exactMatch = lockedPaths.has(normalizedPath);
-      const descendantMatch = !exactMatch && [...lockedPaths].some((lockedPath) => {
-        return lockedPath.startsWith(`${normalizedPath}/`);
+      const exactMatch = loadingPaths.has(normalizedPath);
+      const descendantMatch = !exactMatch && [...loadingPaths].some((loadingPath) => {
+        return loadingPath.startsWith(`${normalizedPath}/`);
       });
       const exactUploadingMatch = uploadingPaths.has(normalizedPath);
       const descendantUploadingMatch = !exactUploadingMatch && [...uploadingPaths].some((uploadingPath) => {
@@ -2166,7 +2360,29 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
-  private getUploadingMarkdownExplorerPaths(): Set<string> {
+  private getLoadingExplorerPaths(): Set<string> {
+    const loadingPaths = new Set<string>();
+
+    for (const runtime of this.roomRuntime.values()) {
+      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
+        loadingPaths.add(lockedPath);
+      }
+    }
+
+    for (const transfer of this.binaryTransferState.values()) {
+      if (transfer.kind !== "download") {
+        continue;
+      }
+
+      if (transfer.status === "preparing" || transfer.status === "downloading") {
+        loadingPaths.add(normalizePath(transfer.localPath));
+      }
+    }
+
+    return loadingPaths;
+  }
+
+  private getUploadingExplorerPaths(): Set<string> {
     const uploadingPaths = new Set<string>();
 
     for (const pendingCreate of Object.values(this.data.pendingMarkdownCreates)) {
@@ -2175,6 +2391,25 @@ export default class RolayPlugin extends Plugin {
 
     for (const pendingMerge of Object.values(this.data.pendingMarkdownMerges)) {
       uploadingPaths.add(normalizePath(pendingMerge.localPath));
+    }
+
+    for (const pendingWrite of Object.values(this.data.pendingBinaryWrites)) {
+      uploadingPaths.add(normalizePath(pendingWrite.localPath));
+    }
+
+    for (const transfer of this.binaryTransferState.values()) {
+      if (transfer.kind !== "upload") {
+        continue;
+      }
+
+      if (
+        transfer.status === "preparing" ||
+        transfer.status === "uploading" ||
+        transfer.status === "canceling" ||
+        transfer.status === "committing"
+      ) {
+        uploadingPaths.add(normalizePath(transfer.localPath));
+      }
     }
 
     return uploadingPaths;
@@ -2196,6 +2431,250 @@ export default class RolayPlugin extends Plugin {
     }
 
     return statuses;
+  }
+
+  private getBinaryTransfersForWorkspace(workspaceId: string): BinaryTransferState[] {
+    return [...this.binaryTransferState.values()].filter((transfer) => transfer.workspaceId === workspaceId);
+  }
+
+  private formatRoomBinaryTransferLabel(workspaceId: string): string {
+    const transfers = this.getBinaryTransfersForWorkspace(workspaceId).filter((transfer) => {
+      return transfer.status !== "done";
+    });
+    if (transfers.length === 0) {
+      return "idle";
+    }
+
+    const activeUploads = transfers.filter((transfer) => transfer.kind === "upload");
+    const activeDownloads = transfers.filter((transfer) => transfer.kind === "download");
+    const totalBytes = transfers.reduce((sum, transfer) => sum + Math.max(0, transfer.bytesTotal), 0);
+    const completedBytes = transfers.reduce((sum, transfer) => {
+      return sum + Math.min(Math.max(0, transfer.bytesDone), Math.max(0, transfer.bytesTotal));
+    }, 0);
+
+    const percent = totalBytes > 0 ? `${Math.round((completedBytes / totalBytes) * 100)}%` : "working";
+    const parts: string[] = [];
+    if (activeUploads.length > 0) {
+      parts.push(`${activeUploads.length} uploading`);
+    }
+    if (activeDownloads.length > 0) {
+      parts.push(`${activeDownloads.length} downloading`);
+    }
+
+    if (totalBytes > 0) {
+      return `${percent} (${formatByteCount(completedBytes)}/${formatByteCount(totalBytes)}, ${parts.join(", ")})`;
+    }
+
+    return parts.join(", ");
+  }
+
+  private createBinarySyncToken(localPath: string): string {
+    const normalizedLocalPath = normalizePath(localPath);
+    const existingToken = this.binarySyncTokens.get(normalizedLocalPath);
+    if (existingToken) {
+      this.binarySyncPathsByToken.delete(existingToken);
+    }
+
+    const token = typeof globalThis.crypto?.randomUUID === "function"
+      ? globalThis.crypto.randomUUID()
+      : `rolay-binary-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    this.binarySyncTokens.set(normalizedLocalPath, token);
+    this.binarySyncPathsByToken.set(token, normalizedLocalPath);
+    return token;
+  }
+
+  private invalidateBinarySyncToken(localPath: string): void {
+    const normalizedLocalPath = normalizePath(localPath);
+    const existingToken = this.binarySyncTokens.get(normalizedLocalPath);
+    if (existingToken) {
+      this.binarySyncPathsByToken.delete(existingToken);
+    }
+    this.binarySyncTokens.delete(normalizedLocalPath);
+  }
+
+  private isBinarySyncTokenCurrent(localPath: string, token: string): boolean {
+    return this.binarySyncTokens.get(normalizePath(localPath)) === token;
+  }
+
+  private moveBinarySyncToken(oldPath: string, newPath: string): void {
+    const normalizedOldPath = normalizePath(oldPath);
+    const normalizedNewPath = normalizePath(newPath);
+    const existingToken = this.binarySyncTokens.get(normalizedOldPath);
+    if (!existingToken) {
+      return;
+    }
+
+    this.binarySyncTokens.delete(normalizedOldPath);
+    this.binarySyncTokens.set(normalizedNewPath, existingToken);
+    this.binarySyncPathsByToken.set(existingToken, normalizedNewPath);
+  }
+
+  private getBinarySyncPathForToken(token: string): string | null {
+    return this.binarySyncPathsByToken.get(token) ?? null;
+  }
+
+  private updateBinaryTransferState(localPath: string, patch: Partial<BinaryTransferState>): BinaryTransferState {
+    const normalizedLocalPath = normalizePath(localPath);
+    const existing = this.binaryTransferState.get(normalizedLocalPath);
+    if (!existing) {
+      throw new Error(`Missing binary transfer state for ${normalizedLocalPath}.`);
+    }
+
+    const nextState: BinaryTransferState = {
+      ...existing,
+      ...patch,
+      localPath: normalizedLocalPath
+    };
+    this.binaryTransferState.set(normalizedLocalPath, nextState);
+    this.scheduleExplorerLoadingDecorations();
+    this.updateStatusBar();
+    return nextState;
+  }
+
+  private maybeUpdateBinaryTransferState(
+    localPath: string,
+    patch: Partial<BinaryTransferState>
+  ): BinaryTransferState | null {
+    const normalizedLocalPath = normalizePath(localPath);
+    const existing = this.binaryTransferState.get(normalizedLocalPath);
+    if (!existing) {
+      return null;
+    }
+
+    return this.updateBinaryTransferState(normalizedLocalPath, patch);
+  }
+
+  private setBinaryTransferState(state: BinaryTransferState): void {
+    this.binaryTransferState.set(normalizePath(state.localPath), {
+      ...state,
+      localPath: normalizePath(state.localPath)
+    });
+    this.scheduleExplorerLoadingDecorations();
+    this.updateStatusBar();
+  }
+
+  private clearBinaryTransferState(localPath: string): void {
+    if (!this.binaryTransferState.delete(normalizePath(localPath))) {
+      return;
+    }
+
+    this.scheduleExplorerLoadingDecorations();
+    this.updateStatusBar();
+  }
+
+  private async cancelBinaryTransferForLocalPath(localPath: string, reason: string): Promise<void> {
+    const normalizedLocalPath = normalizePath(localPath);
+    const transfer = this.binaryTransferState.get(normalizedLocalPath);
+    if (!transfer) {
+      return;
+    }
+
+    if (transfer.kind === "upload" && transfer.uploadId && transfer.entryId) {
+      this.updateBinaryTransferState(normalizedLocalPath, {
+        status: "canceling"
+      });
+    }
+
+    transfer.abortController?.abort();
+
+    if (transfer.kind === "upload" && transfer.uploadId && transfer.entryId) {
+      try {
+        await this.apiClient.cancelBlobUpload(transfer.entryId, transfer.uploadId);
+        this.recordLog(
+          "blob",
+          `[${transfer.workspaceId}] Canceled blob upload ${transfer.uploadId} for ${transfer.serverPath} (${reason}).`
+        );
+      } catch (error) {
+        this.recordLog(
+          "blob",
+          `[${transfer.workspaceId}] Failed to cancel blob upload ${transfer.uploadId} for ${transfer.serverPath}: ${error instanceof Error ? error.message : String(error)}`,
+          "error"
+        );
+      }
+    }
+
+    this.clearBinaryTransferState(normalizedLocalPath);
+  }
+
+  private findDownloadingBinaryPathAtOrBelow(localPath: string): { workspaceId: string; localPath: string } | null {
+    const normalizedLocalPath = normalizePath(localPath);
+    for (const transfer of this.binaryTransferState.values()) {
+      if (
+        transfer.kind !== "download" ||
+        (transfer.status !== "preparing" && transfer.status !== "downloading")
+      ) {
+        continue;
+      }
+
+      const transferLocalPath = normalizePath(transfer.localPath);
+      if (
+        normalizedLocalPath === transferLocalPath ||
+        transferLocalPath.startsWith(`${normalizedLocalPath}/`)
+      ) {
+        return {
+          workspaceId: transfer.workspaceId,
+          localPath: transferLocalPath
+        };
+      }
+    }
+
+    return null;
+  }
+
+  private async revertDownloadingBinaryRename(file: TAbstractFile, oldPath: string): Promise<boolean> {
+    const blocked = this.findDownloadingBinaryPathAtOrBelow(oldPath);
+    if (!blocked) {
+      return false;
+    }
+
+    this.recordLog(
+      "blob",
+      `[${blocked.workspaceId}] Reverted local move/rename for ${oldPath} because ${blocked.localPath} is still downloading and protected.`
+    );
+    new Notice("Rolay is still downloading this file. Move and rename are blocked until download finishes.");
+
+    if (file.path === oldPath) {
+      this.scheduleExplorerLoadingDecorations();
+      return true;
+    }
+
+    const currentFile = this.app.vault.getAbstractFileByPath(file.path);
+    if (!currentFile) {
+      this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-downloading-binary-rename");
+      return true;
+    }
+
+    try {
+      await this.fileBridge.runWithSuppressedPaths([oldPath, file.path], async () => {
+        await this.app.fileManager.renameFile(currentFile, oldPath);
+      });
+    } catch (error) {
+      this.recordLog(
+        "blob",
+        `[${blocked.workspaceId}] Failed to revert downloading binary rename for ${oldPath}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+      this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-downloading-binary-rename");
+    }
+
+    this.scheduleExplorerLoadingDecorations();
+    return true;
+  }
+
+  private async restoreDownloadingBinaryDelete(file: TAbstractFile): Promise<boolean> {
+    const blocked = this.findDownloadingBinaryPathAtOrBelow(file.path);
+    if (!blocked) {
+      return false;
+    }
+
+    this.recordLog(
+      "blob",
+      `[${blocked.workspaceId}] Ignored local delete for ${file.path} because ${blocked.localPath} is still downloading and protected.`
+    );
+    new Notice("Rolay is still downloading this file. Delete is blocked until download finishes.");
+    await this.refreshRoomSnapshot(blocked.workspaceId, "restore-downloading-binary-delete");
+    this.scheduleExplorerLoadingDecorations();
+    return true;
   }
 
   private async revertLockedMarkdownRename(file: TAbstractFile, oldPath: string): Promise<boolean> {
@@ -2433,6 +2912,7 @@ export default class RolayPlugin extends Plugin {
     }
     this.clearPendingLocalCreate(workspaceId, serverPath);
     this.clearPendingMarkdownCreate(localPath);
+    this.clearPendingBinaryWriteRecord(localPath);
   }
 
   private wasPathRecentlyObservedAsRemote(workspaceId: string, localPath: string): boolean {
@@ -2570,6 +3050,7 @@ export default class RolayPlugin extends Plugin {
     this.clearPendingRoomPathsForWorkspace(workspaceId);
     this.clearPendingMarkdownCreatesForWorkspace(workspaceId);
     this.clearPendingMarkdownMergesForWorkspace(workspaceId);
+    await this.clearPendingBinaryWritesForWorkspace(workspaceId);
 
     const binding = this.getStoredRoomBinding(workspaceId);
     if (binding?.downloaded) {
@@ -2838,18 +3319,18 @@ export default class RolayPlugin extends Plugin {
 
   private async applySessionUser(user: User): Promise<void> {
     if (!this.data.session) {
-      this.data.session = {
-        accessToken: "",
-        refreshToken: "",
-        user,
-        authenticatedAt: new Date().toISOString()
-      };
-    } else {
-      this.data.session = {
-        ...this.data.session,
-        user
-      };
+      this.recordLog(
+        "auth",
+        `Ignored session user update for ${user.username} because no authenticated session with tokens is available.`,
+        "error"
+      );
+      return;
     }
+
+    this.data.session = {
+      ...this.data.session,
+      user
+    };
 
     this.resetProfileDraft();
     await this.persistNow();
@@ -2972,6 +3453,12 @@ export default class RolayPlugin extends Plugin {
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
 
+  private getPendingBinaryWritesForWorkspace(workspaceId: string): RolayPendingBinaryWriteEntry[] {
+    return Object.values(this.data.pendingBinaryWrites)
+      .filter((entry) => entry.workspaceId === workspaceId)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+  }
+
   private handlePendingMarkdownCreateRename(oldPath: string, newPath: string): void {
     const normalizedOldPath = normalizePath(oldPath);
     const normalizedNewPath = normalizePath(newPath);
@@ -3045,6 +3532,57 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
+  private async handlePendingBinaryWriteRename(oldPath: string, newPath: string): Promise<void> {
+    const normalizedOldPath = normalizePath(oldPath);
+    const normalizedNewPath = normalizePath(newPath);
+    const pendingWrite = this.data.pendingBinaryWrites[normalizedOldPath];
+    if (!pendingWrite) {
+      return;
+    }
+
+    delete this.data.pendingBinaryWrites[normalizedOldPath];
+    this.moveBinarySyncToken(normalizedOldPath, normalizedNewPath);
+    await this.cancelBinaryTransferForLocalPath(normalizedOldPath, "rename");
+
+    const nextServerPath = this.resolvePendingMarkdownServerPath(
+      pendingWrite.workspaceId,
+      normalizedNewPath,
+      pendingWrite.serverPath
+    );
+
+    if (!nextServerPath) {
+      this.schedulePersist();
+      this.scheduleExplorerLoadingDecorations();
+      this.recordLog(
+        "blob",
+        `[${pendingWrite.workspaceId}] Cleared pending binary write for ${normalizedOldPath} because it moved outside the downloaded room.`
+      );
+      return;
+    }
+
+    this.data.pendingBinaryWrites[normalizedNewPath] = {
+      ...pendingWrite,
+      localPath: normalizedNewPath,
+      serverPath: nextServerPath
+    };
+    this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
+
+    const currentFile = this.app.vault.getAbstractFileByPath(normalizedNewPath);
+    const entry = pendingWrite.entryId
+      ? this.getRoomStore(pendingWrite.workspaceId)?.getEntryById(pendingWrite.entryId) ?? null
+      : this.getRoomStore(pendingWrite.workspaceId)?.getEntryByPath(nextServerPath) ?? null;
+
+    if (currentFile instanceof TFile && isBinaryPath(currentFile.path)) {
+      await this.queueBinaryWrite(
+        pendingWrite.workspaceId,
+        nextServerPath,
+        await this.app.vault.readBinary(currentFile),
+        entry
+      );
+    }
+  }
+
   private clearPendingMarkdownCreate(localPath: string): void {
     const normalizedLocalPath = normalizePath(localPath);
     if (!(normalizedLocalPath in this.data.pendingMarkdownCreates)) {
@@ -3052,6 +3590,37 @@ export default class RolayPlugin extends Plugin {
     }
 
     delete this.data.pendingMarkdownCreates[normalizedLocalPath];
+    this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
+  }
+
+  private clearPendingBinaryWriteRecord(localPath: string): void {
+    const normalizedLocalPath = normalizePath(localPath);
+    if (!(normalizedLocalPath in this.data.pendingBinaryWrites)) {
+      return;
+    }
+
+    delete this.data.pendingBinaryWrites[normalizedLocalPath];
+    this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
+  }
+
+  private async clearPendingBinaryWriteForLocalPath(localPath: string, cancelTransfer: boolean): Promise<void> {
+    const normalizedLocalPath = normalizePath(localPath);
+    if (!(normalizedLocalPath in this.data.pendingBinaryWrites)) {
+      if (cancelTransfer) {
+        this.invalidateBinarySyncToken(normalizedLocalPath);
+        await this.cancelBinaryTransferForLocalPath(normalizedLocalPath, "clear");
+      }
+      return;
+    }
+
+    if (cancelTransfer) {
+      this.invalidateBinarySyncToken(normalizedLocalPath);
+      await this.cancelBinaryTransferForLocalPath(normalizedLocalPath, "clear");
+    }
+
+    delete this.data.pendingBinaryWrites[normalizedLocalPath];
     this.schedulePersist();
     this.scheduleExplorerLoadingDecorations();
   }
@@ -3082,6 +3651,25 @@ export default class RolayPlugin extends Plugin {
       }
 
       delete this.data.pendingMarkdownCreates[localPath];
+      changed = true;
+    }
+
+    if (changed) {
+      this.schedulePersist();
+      this.scheduleExplorerLoadingDecorations();
+    }
+  }
+
+  private async clearPendingBinaryWritesForWorkspace(workspaceId: string): Promise<void> {
+    let changed = false;
+    for (const [localPath, pendingWrite] of Object.entries(this.data.pendingBinaryWrites)) {
+      if (pendingWrite.workspaceId !== workspaceId) {
+        continue;
+      }
+
+      this.invalidateBinarySyncToken(localPath);
+      await this.cancelBinaryTransferForLocalPath(localPath, "workspace-clear");
+      delete this.data.pendingBinaryWrites[localPath];
       changed = true;
     }
 
@@ -3157,6 +3745,45 @@ export default class RolayPlugin extends Plugin {
     this.scheduleExplorerLoadingDecorations();
   }
 
+  private rememberPendingBinaryWrite(
+    workspaceId: string,
+    localPath: string,
+    serverPath: string,
+    entryId: string | null,
+    error: unknown = null
+  ): void {
+    const normalizedLocalPath = normalizePath(localPath);
+    const existing = this.data.pendingBinaryWrites[normalizedLocalPath];
+    this.data.pendingBinaryWrites[normalizedLocalPath] = {
+      workspaceId,
+      localPath: normalizedLocalPath,
+      serverPath,
+      entryId,
+      createdAt: existing?.createdAt ?? new Date().toISOString(),
+      lastAttemptAt: new Date().toISOString(),
+      lastError: error ? (error instanceof Error ? error.message : String(error)) : null
+    };
+    this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
+  }
+
+  private updatePendingBinaryWriteEntryId(localPath: string, entryId: string | null, serverPath?: string): void {
+    const normalizedLocalPath = normalizePath(localPath);
+    const existing = this.data.pendingBinaryWrites[normalizedLocalPath];
+    if (!existing) {
+      return;
+    }
+
+    this.data.pendingBinaryWrites[normalizedLocalPath] = {
+      ...existing,
+      entryId,
+      serverPath: serverPath ?? existing.serverPath,
+      lastAttemptAt: new Date().toISOString()
+    };
+    this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
+  }
+
   private clearPendingMarkdownMerge(entryId: string): void {
     if (!(entryId in this.data.pendingMarkdownMerges)) {
       return;
@@ -3188,6 +3815,36 @@ export default class RolayPlugin extends Plugin {
 
     const pendingMerge = this.data.pendingMarkdownMerges[remoteEntry.id];
     if (pendingMerge && normalizePath(pendingMerge.localPath) === normalizedLocalPath) {
+      return true;
+    }
+
+    return false;
+  }
+
+  private shouldDropPendingBinaryWriteAsRemoteEcho(
+    workspaceId: string,
+    pendingWrite: RolayPendingBinaryWriteEntry,
+    remoteEntry: FileEntry
+  ): boolean {
+    if (remoteEntry.deleted || remoteEntry.kind !== "binary") {
+      return false;
+    }
+
+    const normalizedLocalPath = normalizePath(pendingWrite.localPath);
+    if (this.wasPathRecentlyObservedAsRemote(workspaceId, normalizedLocalPath)) {
+      return true;
+    }
+
+    const cachedEntry = this.findPersistedBinaryCacheEntry(remoteEntry.id);
+    if (cachedEntry && normalizePath(cachedEntry.filePath) === normalizedLocalPath) {
+      return true;
+    }
+
+    if (
+      !pendingWrite.entryId &&
+      !remoteEntry.blob &&
+      normalizePath(pendingWrite.serverPath) === normalizePath(remoteEntry.path)
+    ) {
       return true;
     }
 
@@ -3529,6 +4186,67 @@ export default class RolayPlugin extends Plugin {
   }
 
   private getCrdtCacheKey(entryId: string): string {
+    const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl);
+    return normalizedServerUrl ? `${normalizedServerUrl}::${entryId}` : entryId;
+  }
+
+  private findPersistedBinaryCacheEntry(entryId: string): RolayBinaryCacheEntry | null {
+    const cacheKey = this.getBinaryCacheKey(entryId);
+    return this.data.binaryCache.entries[cacheKey] ?? this.data.binaryCache.entries[entryId] ?? null;
+  }
+
+  private persistBinaryCacheEntry(
+    entryId: string,
+    filePath: string,
+    hash: string,
+    sizeBytes: number,
+    mimeType: string
+  ): void {
+    const normalizedHash = normalizeSha256Hash(hash);
+    if (!normalizedHash) {
+      return;
+    }
+
+    const cacheKey = this.getBinaryCacheKey(entryId);
+    this.data.binaryCache.entries[cacheKey] = {
+      hash: normalizedHash,
+      sizeBytes,
+      mimeType,
+      filePath,
+      updatedAt: new Date().toISOString()
+    };
+    delete this.data.binaryCache.entries[entryId];
+    this.prunePersistedBinaryCache();
+    this.schedulePersist();
+  }
+
+  private clearPersistedBinaryCacheEntry(entryId: string): void {
+    const cacheKey = this.getBinaryCacheKey(entryId);
+    if (!(cacheKey in this.data.binaryCache.entries) && !(entryId in this.data.binaryCache.entries)) {
+      return;
+    }
+
+    delete this.data.binaryCache.entries[cacheKey];
+    delete this.data.binaryCache.entries[entryId];
+    this.schedulePersist();
+  }
+
+  private prunePersistedBinaryCache(): void {
+    const entries = Object.entries(this.data.binaryCache.entries).map(([entryId, entry]) => ({
+      entryId,
+      entry
+    }));
+    if (entries.length <= RolayPlugin.MAX_PERSISTED_BINARY_ENTRIES) {
+      return;
+    }
+
+    const sortedEntries = [...entries].sort((left, right) => left.entry.updatedAt.localeCompare(right.entry.updatedAt));
+    for (const staleEntry of sortedEntries.slice(0, entries.length - RolayPlugin.MAX_PERSISTED_BINARY_ENTRIES)) {
+      delete this.data.binaryCache.entries[staleEntry.entryId];
+    }
+  }
+
+  private getBinaryCacheKey(entryId: string): string {
     const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl);
     return normalizedServerUrl ? `${normalizedServerUrl}::${entryId}` : entryId;
   }
@@ -4248,6 +4966,817 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
+  private async queueBinaryWrite(
+    workspaceId: string,
+    serverPath: string,
+    localContent: ArrayBuffer | null,
+    existingEntry: FileEntry | null
+  ): Promise<void> {
+    const localPath = normalizePath(this.fileBridge.toLocalPath(workspaceId, serverPath) ?? serverPath);
+    if (this.binarySyncTokens.has(localPath)) {
+      this.pendingBinarySyncReruns.add(localPath);
+      this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
+      const existingTransfer = this.binaryTransferState.get(localPath);
+      if (existingTransfer?.kind === "upload") {
+        this.updateBinaryTransferState(localPath, {
+          rerunRequested: true
+        });
+      }
+      return;
+    }
+
+    const activeTransfer = this.binaryTransferState.get(localPath);
+    if (
+      activeTransfer &&
+      activeTransfer.kind === "upload" &&
+      activeTransfer.status !== "done" &&
+      activeTransfer.status !== "failed"
+    ) {
+      this.updateBinaryTransferState(localPath, {
+        rerunRequested: true
+      });
+      this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? activeTransfer.entryId);
+      return;
+    }
+
+    this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
+    const token = this.createBinarySyncToken(localPath);
+    void this.syncBinaryWrite(
+      workspaceId,
+      localPath,
+      serverPath,
+      existingEntry?.id ?? null,
+      token,
+      localContent
+    );
+  }
+
+  private async syncBinaryWrite(
+    workspaceId: string,
+    initialLocalPath: string,
+    fallbackServerPath: string,
+    initialEntryId: string | null,
+    token: string,
+    initialContent: ArrayBuffer | null
+  ): Promise<void> {
+    let finalLocalPath = normalizePath(initialLocalPath);
+    let finalServerPath = fallbackServerPath;
+    let finalEntryId = initialEntryId;
+    let createdPlaceholderEntry: FileEntry | null = null;
+
+    try {
+      const currentLocalPath = this.getBinarySyncPathForToken(token);
+      if (!currentLocalPath) {
+        return;
+      }
+
+      finalLocalPath = currentLocalPath;
+      const currentFile = this.app.vault.getAbstractFileByPath(currentLocalPath);
+      if (!(currentFile instanceof TFile) || !isBinaryPath(currentFile.path)) {
+        await this.clearPendingBinaryWriteForLocalPath(currentLocalPath, false);
+        return;
+      }
+
+      const currentServerPath = this.resolvePendingMarkdownServerPath(
+        workspaceId,
+        currentLocalPath,
+        fallbackServerPath
+      );
+      if (!currentServerPath) {
+        await this.clearPendingBinaryWriteForLocalPath(currentLocalPath, false);
+        return;
+      }
+      finalServerPath = currentServerPath;
+
+      const binaryContent =
+        initialContent && normalizePath(initialLocalPath) === currentLocalPath
+          ? initialContent
+          : await this.readLocalBinaryContent(currentLocalPath);
+      const sizeBytes = binaryContent.byteLength;
+      const hash = await sha256Hash(binaryContent);
+      const mimeType = guessMimeTypeFromPath(currentLocalPath);
+
+      let entry =
+        (initialEntryId ? this.getRoomStore(workspaceId)?.getEntryById(initialEntryId) : null) ??
+        this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ??
+        null;
+
+      if (!entry || entry.deleted || entry.kind !== "binary") {
+        this.registerPendingLocalCreate(workspaceId, currentServerPath);
+        let confirmedServerCreate = false;
+
+        try {
+          const response = await this.operationsQueue.enqueue(
+            workspaceId,
+            {
+              type: "create_binary_placeholder",
+              path: currentServerPath,
+              sizeBytes,
+              mimeType
+            },
+            `local binary placeholder ${currentServerPath}`
+          );
+          const appliedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
+          if (appliedEntry) {
+            this.optimisticUpsertRoomEntry(workspaceId, appliedEntry);
+          }
+          confirmedServerCreate = true;
+          createdPlaceholderEntry = appliedEntry;
+          entry = appliedEntry;
+          finalEntryId = appliedEntry?.id ?? finalEntryId;
+          this.updatePendingBinaryWriteEntryId(currentLocalPath, appliedEntry?.id ?? null, currentServerPath);
+        } catch (error) {
+          if (
+            error instanceof RolayOperationError &&
+            error.result.status === "conflict" &&
+            error.result.reason === "path_already_exists"
+          ) {
+            this.clearPendingLocalCreate(workspaceId, currentServerPath);
+            await this.resolveBinaryWritePathConflict(
+              workspaceId,
+              currentServerPath,
+              currentLocalPath,
+              error.result.suggestedPath,
+              token
+            );
+            return;
+          }
+
+          throw error;
+        } finally {
+          if (!confirmedServerCreate) {
+            this.clearPendingLocalCreate(workspaceId, currentServerPath);
+          }
+        }
+
+        if (!entry) {
+          await this.refreshRoomSnapshot(workspaceId, "binary-placeholder-create");
+          entry = this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
+          if (entry && entry.kind === "binary") {
+            createdPlaceholderEntry = entry;
+            finalEntryId = entry.id;
+            this.updatePendingBinaryWriteEntryId(currentLocalPath, entry.id, currentServerPath);
+          }
+        }
+      }
+
+      if (!entry || entry.deleted || entry.kind !== "binary") {
+        throw new Error(`Binary entry for ${currentServerPath} is unavailable after placeholder creation.`);
+      }
+
+      const desiredLocalPath = this.getBinarySyncPathForToken(token);
+      const desiredServerPath = desiredLocalPath
+        ? this.resolvePendingMarkdownServerPath(workspaceId, desiredLocalPath, currentServerPath)
+        : null;
+
+      if (!desiredLocalPath || !desiredServerPath) {
+        if (createdPlaceholderEntry) {
+          await this.deleteBinaryPlaceholderIfSafe(workspaceId, createdPlaceholderEntry);
+        }
+        return;
+      }
+
+      finalLocalPath = desiredLocalPath;
+      finalServerPath = desiredServerPath;
+
+      if (entry.path !== desiredServerPath) {
+        const renameType = getParentPath(entry.path) === getParentPath(desiredServerPath)
+          ? "rename_entry"
+          : "move_entry";
+        await this.queueRenameOrMove(workspaceId, entry, desiredServerPath, renameType);
+        entry = this.getRoomStore(workspaceId)?.getEntryById(entry.id) ?? {
+          ...entry,
+          path: desiredServerPath
+        };
+      }
+
+      finalEntryId = entry.id;
+      this.updatePendingBinaryWriteEntryId(desiredLocalPath, entry.id, desiredServerPath);
+      if (!this.isBinarySyncTokenCurrent(desiredLocalPath, token)) {
+        return;
+      }
+
+      this.setBinaryTransferState({
+        workspaceId,
+        entryId: entry.id,
+        localPath: desiredLocalPath,
+        serverPath: desiredServerPath,
+        kind: "upload",
+        status: "preparing",
+        bytesTotal: sizeBytes,
+        bytesDone: 0,
+        hash,
+        mimeType,
+        uploadId: null,
+        cancelUrl: null,
+        lastError: null,
+        rerunRequested: false,
+        abortController: null
+      });
+
+      const ticket = await this.apiClient.createBlobUploadTicket(entry.id, {
+        hash,
+        sizeBytes,
+        mimeType
+      });
+      const normalizedTicketHash = normalizeSha256Hash(ticket.hash);
+      if (!normalizedTicketHash) {
+        throw new Error(`Blob upload ticket for ${desiredServerPath} is missing a valid hash.`);
+      }
+
+      if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+        entryId: entry.id,
+        bytesTotal: ticket.sizeBytes > 0 ? ticket.sizeBytes : sizeBytes,
+        hash: normalizedTicketHash,
+        mimeType: ticket.mimeType,
+        uploadId: ticket.uploadId,
+        cancelUrl: ticket.cancel?.url ?? null
+      })) {
+        return;
+      }
+
+      if (!ticket.alreadyExists) {
+        const abortController = new AbortController();
+        if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+          status: "uploading",
+          abortController
+        })) {
+          return;
+        }
+
+        const uploadResponse = await this.apiClient.uploadBlobContent(
+          entry.id,
+          ticket.uploadId,
+          binaryContent,
+          normalizedTicketHash,
+          (progress) => {
+            this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+              status: "uploading",
+              bytesDone: progress.loadedBytes,
+              bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : ticket.sizeBytes
+            });
+          },
+          abortController.signal,
+          ticket.upload
+        );
+
+        const uploadedHash = normalizeSha256Hash(uploadResponse.hash) ?? normalizedTicketHash;
+        const uploadedSizeBytes =
+          Number.isFinite(uploadResponse.sizeBytes) && uploadResponse.sizeBytes > 0
+            ? uploadResponse.sizeBytes
+            : ticket.sizeBytes;
+
+        if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+          hash: uploadedHash,
+          bytesDone: uploadedSizeBytes,
+          bytesTotal: uploadedSizeBytes
+        })) {
+          return;
+        }
+
+        if (uploadedHash !== normalizedTicketHash) {
+          this.recordLog(
+            "blob",
+            `[${workspaceId}] Upload endpoint returned ${uploadedHash} for ${desiredServerPath} instead of ticket hash ${normalizedTicketHash}. Using server-confirmed hash.`,
+            "error"
+          );
+        }
+
+        ticket.hash = uploadedHash;
+        ticket.sizeBytes = uploadedSizeBytes;
+      } else {
+        if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+          status: "committing",
+          bytesDone: ticket.sizeBytes
+        })) {
+          return;
+        }
+      }
+
+      if (!this.isBinarySyncTokenCurrent(desiredLocalPath, token)) {
+        return;
+      }
+
+      if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+        status: "committing",
+        bytesDone: ticket.sizeBytes
+      })) {
+        return;
+      }
+
+      const commitResponse = await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type: "commit_blob_revision",
+          entryId: entry.id,
+          hash: normalizedTicketHash,
+          sizeBytes: ticket.sizeBytes,
+          mimeType: ticket.mimeType,
+          preconditions: {
+            entryVersion: entry.entryVersion,
+            path: entry.path
+          }
+        },
+        `commit blob revision ${desiredServerPath}`
+      );
+
+      const committedEntry = commitResponse.results.find((result) => result.status === "applied")?.entry ?? null;
+      if (committedEntry) {
+        this.optimisticUpsertRoomEntry(workspaceId, committedEntry);
+        entry = committedEntry;
+        finalEntryId = committedEntry.id;
+        finalServerPath = committedEntry.path;
+      }
+
+      this.persistBinaryCacheEntry(entry.id, desiredLocalPath, normalizedTicketHash, ticket.sizeBytes, ticket.mimeType);
+      await this.clearPendingBinaryWriteForLocalPath(desiredLocalPath, false);
+      this.clearBinaryTransferState(desiredLocalPath);
+      this.invalidateBinarySyncToken(desiredLocalPath);
+      this.recordLog(
+        "blob",
+        `[${workspaceId}] Uploaded ${desiredServerPath} (${formatByteCount(ticket.sizeBytes)}, ${normalizedTicketHash.slice(0, 19)}...).`
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (error instanceof Error && error.name === "AbortError") {
+        this.recordLog("blob", `[${workspaceId}] Binary transfer aborted for ${finalLocalPath}.`);
+      } else {
+        const mismatchDetails = formatBlobHashMismatchDetails(error);
+        if (mismatchDetails) {
+          this.recordLog(
+            "blob",
+            `[${workspaceId}] Blob hash mismatch for ${finalServerPath}: ${mismatchDetails}`,
+            "error"
+          );
+        }
+        this.recordLog("blob", `[${workspaceId}] Binary sync failed for ${finalLocalPath}: ${message}`, "error");
+        this.handleError(`Binary sync failed for ${finalLocalPath}`, error, false);
+      }
+
+      const transfer = this.binaryTransferState.get(normalizePath(finalLocalPath));
+      if (transfer) {
+        this.updateBinaryTransferState(finalLocalPath, {
+          status: "failed",
+          lastError: message,
+          abortController: null
+        });
+      }
+
+      if (this.isBinarySyncTokenCurrent(finalLocalPath, token)) {
+        this.rememberPendingBinaryWrite(workspaceId, finalLocalPath, finalServerPath, finalEntryId, error);
+      }
+    } finally {
+      const transfer = this.binaryTransferState.get(normalizePath(finalLocalPath));
+      const normalizedFinalLocalPath = normalizePath(finalLocalPath);
+      const shouldRerun = Boolean(transfer?.rerunRequested) || this.pendingBinarySyncReruns.has(normalizedFinalLocalPath);
+      this.pendingBinarySyncReruns.delete(normalizedFinalLocalPath);
+      if (!shouldRerun && transfer?.status !== "failed") {
+        this.clearBinaryTransferState(finalLocalPath);
+      }
+
+      if (shouldRerun) {
+        this.clearBinaryTransferState(finalLocalPath);
+        const currentFile = this.app.vault.getAbstractFileByPath(finalLocalPath);
+        const currentServerPath = this.resolvePendingMarkdownServerPath(workspaceId, finalLocalPath, fallbackServerPath);
+        const entry =
+          this.data.pendingBinaryWrites[normalizePath(finalLocalPath)]?.entryId
+            ? this.getRoomStore(workspaceId)?.getEntryById(
+                this.data.pendingBinaryWrites[normalizePath(finalLocalPath)]?.entryId ?? ""
+              ) ?? null
+            : currentServerPath
+              ? this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null
+              : null;
+        if (currentFile instanceof TFile && isBinaryPath(currentFile.path) && currentServerPath) {
+          await this.queueBinaryWrite(
+            workspaceId,
+            currentServerPath,
+            await this.app.vault.readBinary(currentFile),
+            entry
+          );
+        }
+      }
+    }
+  }
+
+  private async resolveBinaryWritePathConflict(
+    workspaceId: string,
+    originalServerPath: string,
+    originalLocalPath: string,
+    suggestedPath: string | undefined,
+    token: string
+  ): Promise<void> {
+    const localFile = this.app.vault.getAbstractFileByPath(originalLocalPath);
+    if (!(localFile instanceof TFile) || !isBinaryPath(localFile.path)) {
+      await this.clearPendingBinaryWriteForLocalPath(originalLocalPath, false);
+      this.recordLog(
+        "blob",
+        `[${workspaceId}] Dropped conflicting local binary write for ${originalServerPath} because the local file is gone.`,
+        "error"
+      );
+      return;
+    }
+
+    const replacementServerPath = this.findAvailableBinaryConflictPath(
+      workspaceId,
+      suggestedPath?.trim() || originalServerPath
+    );
+    const replacementLocalPath = this.fileBridge.toLocalPath(workspaceId, replacementServerPath) ?? replacementServerPath;
+    if (replacementLocalPath === originalLocalPath) {
+      throw new Error(`No available fallback binary path for ${originalServerPath}.`);
+    }
+
+    await this.fileBridge.runWithSuppressedPaths([originalLocalPath, replacementLocalPath], async () => {
+      await this.app.fileManager.renameFile(localFile, replacementLocalPath);
+    });
+
+    this.moveBinarySyncToken(originalLocalPath, replacementLocalPath);
+    const conflictMessage =
+      `[${workspaceId}] Local binary ${originalServerPath} conflicted with an existing server path. ` +
+      `Renamed local file to ${replacementServerPath} so both copies survive.`;
+    this.recordLog("blob", conflictMessage, "error");
+    new Notice(`Rolay kept your local file as ${replacementServerPath}.`);
+
+    const currentFile = this.app.vault.getAbstractFileByPath(replacementLocalPath);
+    if (!(currentFile instanceof TFile)) {
+      return;
+    }
+
+    await this.queueBinaryWrite(
+      workspaceId,
+      replacementServerPath,
+      await this.app.vault.readBinary(currentFile),
+      null
+    );
+  }
+
+  private async reconcilePendingBinaryWrites(
+    workspaceId: string,
+    reason: string
+  ): Promise<void> {
+    const pendingWrites = this.getPendingBinaryWritesForWorkspace(workspaceId);
+    if (pendingWrites.length === 0) {
+      return;
+    }
+
+    this.recordLog(
+      "blob",
+      `[${workspaceId}] Replaying ${pendingWrites.length} pending binary write(s) after ${reason}.`
+    );
+
+    for (const pendingWrite of pendingWrites) {
+      const currentFile = this.app.vault.getAbstractFileByPath(pendingWrite.localPath);
+      if (!(currentFile instanceof TFile) || !isBinaryPath(currentFile.path)) {
+        await this.clearPendingBinaryWriteForLocalPath(pendingWrite.localPath, false);
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Cleared pending binary write for ${pendingWrite.localPath} because the local file no longer exists.`
+        );
+        continue;
+      }
+
+      const currentServerPath = this.resolvePendingMarkdownServerPath(
+        workspaceId,
+        pendingWrite.localPath,
+        pendingWrite.serverPath
+      );
+      if (!currentServerPath) {
+        await this.clearPendingBinaryWriteForLocalPath(pendingWrite.localPath, false);
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Cleared pending binary write for ${pendingWrite.localPath} because it is no longer inside the room root.`
+        );
+        continue;
+      }
+
+      const entryById = pendingWrite.entryId
+        ? this.getRoomStore(workspaceId)?.getEntryById(pendingWrite.entryId) ?? null
+        : null;
+      const entry = entryById ?? this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
+      if (entry && this.shouldDropPendingBinaryWriteAsRemoteEcho(workspaceId, pendingWrite, entry)) {
+        this.clearPendingBinaryWriteRecord(pendingWrite.localPath);
+        this.clearPendingLocalCreate(workspaceId, currentServerPath);
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Cleared stale pending binary write for ${currentServerPath} because that path is already owned by remote entry ${entry.id}.`
+        );
+        continue;
+      }
+
+      try {
+        await this.queueBinaryWrite(
+          workspaceId,
+          currentServerPath,
+          await this.app.vault.readBinary(currentFile),
+          entry
+        );
+      } catch {
+        // Keep the pending binary write registered for the next room refresh/connect.
+      }
+    }
+  }
+
+  private async syncBinaryEntriesFromSnapshot(
+    workspaceId: string,
+    entries: FileEntry[],
+    reason: string
+  ): Promise<void> {
+    for (const entry of entries) {
+      if (entry.kind === "binary" && entry.deleted) {
+        this.clearPersistedBinaryCacheEntry(entry.id);
+      }
+    }
+
+    const binaryEntries = entries.filter((entry) => !entry.deleted && entry.kind === "binary");
+    await this.cancelStaleBinaryDownloads(workspaceId, binaryEntries);
+    if (binaryEntries.length === 0) {
+      return;
+    }
+
+    const queue = [...binaryEntries];
+    const workers = Array.from(
+      { length: Math.min(RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY, queue.length) },
+      async () => {
+        while (queue.length > 0) {
+          const entry = queue.shift();
+          if (!entry) {
+            return;
+          }
+
+          await this.ensureBinaryEntryDownloaded(workspaceId, entry, reason);
+        }
+      }
+    );
+
+    await Promise.all(workers);
+  }
+
+  private async cancelStaleBinaryDownloads(workspaceId: string, entries: FileEntry[]): Promise<void> {
+    const activeEntries = new Map(entries.map((entry) => [entry.id, entry]));
+    const transfers = this.getBinaryTransfersForWorkspace(workspaceId).filter((transfer) => transfer.kind === "download");
+    for (const transfer of transfers) {
+      const entry = transfer.entryId ? activeEntries.get(transfer.entryId) ?? null : null;
+      const remoteHash = entry?.blob?.hash ?? null;
+      if (!entry || entry.deleted || entry.path !== transfer.serverPath || (transfer.hash && remoteHash && transfer.hash !== remoteHash)) {
+        await this.cancelBinaryTransferForLocalPath(transfer.localPath, "stale-download");
+      }
+    }
+  }
+
+  private async ensureBinaryEntryDownloaded(
+    workspaceId: string,
+    entry: FileEntry,
+    reason: string
+  ): Promise<void> {
+    if (entry.deleted || entry.kind !== "binary" || !entry.blob) {
+      return;
+    }
+
+    const localPath = normalizePath(this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path);
+    const pendingWrite = this.data.pendingBinaryWrites[localPath];
+    if (pendingWrite) {
+      if (this.shouldDropPendingBinaryWriteAsRemoteEcho(workspaceId, pendingWrite, entry)) {
+        this.clearPendingBinaryWriteRecord(localPath);
+      } else {
+        return;
+      }
+    }
+
+    const activeUpload = this.binaryTransferState.get(localPath);
+    if (activeUpload && activeUpload.kind === "upload") {
+      return;
+    }
+
+    const existingTransfer = this.binaryTransferState.get(localPath);
+    const remoteHash = normalizeSha256Hash(entry.blob.hash);
+    if (!remoteHash) {
+      throw new Error(`Binary entry ${entry.path} is missing a valid blob hash.`);
+    }
+
+    if (
+      existingTransfer &&
+      existingTransfer.kind === "download" &&
+      existingTransfer.hash === remoteHash &&
+      (existingTransfer.status === "preparing" || existingTransfer.status === "downloading")
+    ) {
+      return;
+    }
+
+    const localFile = this.app.vault.getAbstractFileByPath(localPath);
+    const cached = this.findPersistedBinaryCacheEntry(entry.id);
+    const remoteSize = entry.blob.sizeBytes;
+    const remoteMimeType = entry.blob.mimeType || entry.mimeType || "application/octet-stream";
+
+    if (localFile instanceof TFile && cached?.hash === remoteHash) {
+      if (normalizePath(cached.filePath) !== localPath) {
+        this.persistBinaryCacheEntry(entry.id, localPath, remoteHash, remoteSize, remoteMimeType);
+      }
+      return;
+    }
+
+    if (localFile instanceof TFile) {
+      const localBytes = await this.app.vault.readBinary(localFile);
+      const localHash = await sha256Hash(localBytes);
+      if (localHash === remoteHash) {
+        this.persistBinaryCacheEntry(entry.id, localPath, remoteHash, remoteSize, remoteMimeType);
+        return;
+      }
+
+      const safeToOverwrite =
+        localBytes.byteLength === 0 ||
+        (cached ? cached.hash === localHash : false);
+
+      if (!safeToOverwrite) {
+        await this.resolveBinaryDownloadConflict(workspaceId, entry, localPath);
+      }
+    }
+
+    this.setBinaryTransferState({
+      workspaceId,
+      entryId: entry.id,
+      localPath,
+      serverPath: entry.path,
+      kind: "download",
+      status: "preparing",
+      bytesTotal: remoteSize,
+      bytesDone: 0,
+      hash: remoteHash,
+      mimeType: remoteMimeType,
+      uploadId: null,
+      cancelUrl: null,
+      lastError: null,
+      rerunRequested: false,
+      abortController: new AbortController()
+    });
+
+    try {
+      const ticket = await this.apiClient.createBlobDownloadTicket(entry.id);
+      const transfer = this.maybeUpdateBinaryTransferState(localPath, {
+        status: "downloading",
+        bytesTotal: ticket.sizeBytes > 0 ? ticket.sizeBytes : remoteSize
+      });
+      if (!transfer) {
+        return;
+      }
+
+      const download = await this.apiClient.downloadBlobFromUrl(
+        ticket.url,
+        (progress) => {
+          this.maybeUpdateBinaryTransferState(localPath, {
+            status: "downloading",
+            bytesDone: progress.loadedBytes,
+            bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : transfer.bytesTotal
+          });
+        },
+        transfer.abortController?.signal
+      );
+
+      await this.applyDownloadedBinary(workspaceId, entry, localPath, ticket, download, reason);
+      this.clearBinaryTransferState(localPath);
+    } catch (error) {
+      if (!(error instanceof Error && error.name === "AbortError")) {
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Binary download failed for ${entry.path}: ${error instanceof Error ? error.message : String(error)}`,
+          "error"
+        );
+      }
+      this.clearBinaryTransferState(localPath);
+    }
+  }
+
+  private async applyDownloadedBinary(
+    workspaceId: string,
+    entry: FileEntry,
+    localPath: string,
+    ticket: { hash: string; sizeBytes: number; mimeType: string },
+    download: BlobDownloadResult,
+    reason: string
+  ): Promise<void> {
+    const effectiveHash = normalizeSha256Hash(download.hash ?? ticket.hash);
+    const effectiveSize = download.contentLength ?? ticket.sizeBytes ?? download.data.byteLength;
+    const effectiveMimeType = download.contentType ?? ticket.mimeType;
+    const computedHash = await sha256Hash(download.data);
+    if (effectiveHash && computedHash !== effectiveHash) {
+      throw new Error(`Downloaded blob hash mismatch for ${entry.path}.`);
+    }
+
+    const existingLocalFile = this.app.vault.getAbstractFileByPath(localPath);
+    const cached = this.findPersistedBinaryCacheEntry(entry.id);
+    if (existingLocalFile instanceof TFile) {
+      const currentLocalBytes = await this.app.vault.readBinary(existingLocalFile);
+      const currentLocalHash = await sha256Hash(currentLocalBytes);
+
+      if (currentLocalHash === computedHash) {
+        this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType ?? ticket.mimeType);
+        return;
+      }
+
+      const safeToOverwrite =
+        currentLocalBytes.byteLength === 0 ||
+        (cached ? cached.hash === currentLocalHash : false);
+
+      if (!safeToOverwrite) {
+        await this.resolveBinaryDownloadConflict(workspaceId, entry, localPath);
+      }
+    }
+
+    await this.fileBridge.writeBinaryContent(workspaceId, entry.path, download.data);
+    this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType ?? ticket.mimeType);
+    this.recordLog(
+      "blob",
+      `[${workspaceId}] Downloaded ${entry.path} (${formatByteCount(download.data.byteLength)}) from ${reason}.`
+    );
+  }
+
+  private async resolveBinaryDownloadConflict(
+    workspaceId: string,
+    entry: FileEntry,
+    originalLocalPath: string
+  ): Promise<void> {
+    const localFile = this.app.vault.getAbstractFileByPath(originalLocalPath);
+    if (!(localFile instanceof TFile) || !isBinaryPath(localFile.path)) {
+      return;
+    }
+
+    const replacementServerPath = this.findAvailableBinaryConflictPath(workspaceId, entry.path);
+    const replacementLocalPath = this.fileBridge.toLocalPath(workspaceId, replacementServerPath) ?? replacementServerPath;
+    if (replacementLocalPath === originalLocalPath) {
+      return;
+    }
+
+    await this.fileBridge.runWithSuppressedPaths([originalLocalPath, replacementLocalPath], async () => {
+      await this.app.fileManager.renameFile(localFile, replacementLocalPath);
+    });
+
+    const conflictMessage =
+      `[${workspaceId}] Local binary ${entry.path} diverged from the incoming remote blob. ` +
+      `Renamed local file to ${replacementServerPath} so both copies survive.`;
+    this.recordLog("blob", conflictMessage, "error");
+    new Notice(`Rolay kept your local file as ${replacementServerPath}.`);
+
+    const replacementFile = this.app.vault.getAbstractFileByPath(replacementLocalPath);
+    if (replacementFile instanceof TFile) {
+      await this.queueBinaryWrite(
+        workspaceId,
+        replacementServerPath,
+        await this.app.vault.readBinary(replacementFile),
+        null
+      );
+    }
+  }
+
+  private async deleteBinaryPlaceholderIfSafe(workspaceId: string, entry: FileEntry): Promise<void> {
+    try {
+      await this.operationsQueue.enqueue(
+        workspaceId,
+        {
+          type: "delete_entry",
+          entryId: entry.id,
+          preconditions: {
+            entryVersion: entry.entryVersion,
+            path: entry.path
+          }
+        },
+        `abandon binary placeholder ${entry.path}`
+      );
+      this.optimisticDeleteRoomEntry(workspaceId, entry.id);
+    } catch (error) {
+      this.recordLog(
+        "blob",
+        `[${workspaceId}] Failed to delete abandoned binary placeholder ${entry.path}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+    }
+  }
+
+  private findAvailableBinaryConflictPath(workspaceId: string, desiredServerPath: string): string {
+    const normalizedDesiredPath = desiredServerPath.replace(/\\/g, "/");
+    const directoryPath = getParentPath(normalizedDesiredPath);
+    const fileName = getFileName(normalizedDesiredPath);
+    const extension = getFileExtension(fileName);
+    const rawStem = extension ? fileName.slice(0, -(extension.length + 1)) : fileName;
+    const { baseStem, nextIndex } = parseCopySuffix(rawStem);
+
+    const candidates = [normalizedDesiredPath];
+    for (let index = nextIndex; index <= nextIndex + 999; index += 1) {
+      const candidateFileName = extension
+        ? `${baseStem}(${index}).${extension}`
+        : `${baseStem}(${index})`;
+      candidates.push(directoryPath ? `${directoryPath}/${candidateFileName}` : candidateFileName);
+    }
+
+    for (const candidatePath of candidates) {
+      const remoteExists = Boolean(this.getRoomStore(workspaceId)?.getEntryByPath(candidatePath));
+      const localPath = this.fileBridge.toLocalPath(workspaceId, candidatePath) ?? candidatePath;
+      const localExists = Boolean(this.app.vault.getAbstractFileByPath(localPath));
+      if (!remoteExists && !localExists) {
+        return candidatePath;
+      }
+    }
+
+    throw new Error(`No free conflict-safe binary path is available for ${desiredServerPath}.`);
+  }
+
   private async queueRenameOrMove(
     workspaceId: string,
     entry: FileEntry,
@@ -4308,10 +5837,16 @@ export default class RolayPlugin extends Plugin {
       const deletedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
       if (deletedEntry) {
         this.optimisticUpsertRoomEntry(workspaceId, deletedEntry);
+        if (entry.kind === "binary") {
+          this.clearPersistedBinaryCacheEntry(entry.id);
+        }
         return;
       }
 
       this.optimisticDeleteRoomEntry(workspaceId, entry.id);
+      if (entry.kind === "binary") {
+        this.clearPersistedBinaryCacheEntry(entry.id);
+      }
     } catch (error) {
       this.scheduleSnapshotRefresh(workspaceId, "delete-recovery");
       throw error;
@@ -4370,6 +5905,24 @@ export default class RolayPlugin extends Plugin {
       this.recordLog(
         "bridge",
         `Failed to read local markdown content for ${localPath}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+      return fallback;
+    }
+  }
+
+  private async readLocalBinaryContent(localPath: string, fallback = new ArrayBuffer(0)): Promise<ArrayBuffer> {
+    const localFile = this.app.vault.getAbstractFileByPath(localPath);
+    if (!(localFile instanceof TFile) || !isBinaryPath(localFile.path)) {
+      return fallback;
+    }
+
+    try {
+      return await this.app.vault.readBinary(localFile);
+    } catch (error) {
+      this.recordLog(
+        "blob",
+        `Failed to read local binary content for ${localPath}: ${error instanceof Error ? error.message : String(error)}`,
         "error"
       );
       return fallback;
@@ -4702,6 +6255,44 @@ function formatByteCount(bytes: number): string {
 
   const digits = value >= 100 || unitIndex === 0 ? 0 : value >= 10 ? 1 : 2;
   return `${value.toFixed(digits)} ${units[unitIndex]}`;
+}
+
+function formatBlobHashMismatchDetails(error: unknown): string | null {
+  if (!(error instanceof RolayApiError) || error.code !== "blob_hash_mismatch") {
+    return null;
+  }
+
+  const details = error.details ?? {};
+  const expectedHash = typeof details.expectedHash === "string" ? details.expectedHash : null;
+  const actualHash = typeof details.actualHash === "string" ? details.actualHash : null;
+  const receivedSizeBytes =
+    typeof details.receivedSizeBytes === "number" && Number.isFinite(details.receivedSizeBytes)
+      ? details.receivedSizeBytes
+      : null;
+
+  const parts: string[] = [];
+  if (expectedHash) {
+    parts.push(`expected ${expectedHash}`);
+  }
+  if (actualHash) {
+    parts.push(`actual ${actualHash}`);
+  }
+  if (receivedSizeBytes !== null) {
+    parts.push(`received ${formatByteCount(receivedSizeBytes)}`);
+  }
+  if (expectedHash && actualHash) {
+    const normalizedExpected = normalizeSha256Hash(expectedHash);
+    const normalizedActual = normalizeSha256Hash(actualHash);
+    if (normalizedExpected && normalizedActual && normalizedExpected === normalizedActual) {
+      parts.push("same digest, different hash encoding");
+    }
+  }
+
+  if (parts.length === 0) {
+    return error.message;
+  }
+
+  return parts.join(", ");
 }
 
 function areUint8ArraysEqual(left: Uint8Array, right: Uint8Array): boolean {

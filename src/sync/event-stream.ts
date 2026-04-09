@@ -153,6 +153,9 @@ export class WorkspaceEventStream {
 
     const eventId = Number(message.id);
     if (Number.isFinite(eventId)) {
+      if (this.currentCursor !== null && eventId <= this.currentCursor) {
+        return;
+      }
       this.currentCursor = eventId;
     }
 
