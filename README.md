@@ -85,11 +85,20 @@ The easiest path for your academic group is `BRAT` plus GitHub Releases.
 
 ### For End Users
 
-1. Install the `BRAT` plugin in Obsidian.
-2. Open BRAT settings and add this repository as a beta plugin.
-3. Turn on BRAT auto-updates if you want new releases to arrive automatically.
+1. In Obsidian, open `Settings -> Community plugins`.
+2. Install the `BRAT` plugin.
+3. Open `Settings -> BRAT`.
+4. Use `Add Beta plugin`.
+5. Paste the URL of this repository.
+6. Confirm installation.
+7. Turn on BRAT auto-updates if you want new releases to arrive automatically.
 
 After that, users usually only need BRAT to pull the next GitHub release. They do not need to manually copy `main.js`, `manifest.json`, or `styles.css`.
+
+Notes:
+
+- If the repository is public, users usually only need the repository URL.
+- If the repository is private, BRAT distribution becomes less convenient because every user needs access to that repository. For a small group, the simplest setup is usually a public repository that is just not advertised widely.
 
 ### For Maintainers
 
