@@ -51,7 +51,7 @@ Important product rules reflected in the plugin:
 - markdown note content is still the only CRDT-managed content in `v1`
 - every non-`.md` file, including `.txt`, is treated as binary/blob content
 
-More detailed notes live in [docs/server-contract.md](docs/server-contract.md), [docs/room-model.md](docs/room-model.md), [docs/auth-user-management.md](docs/auth-user-management.md), and [docs/conflict-handling.md](docs/conflict-handling.md).
+More detailed notes live in [docs/server-contract.md](docs/server-contract.md), [docs/room-model.md](docs/room-model.md), [docs/auth-user-management.md](docs/auth-user-management.md), [docs/conflict-handling.md](docs/conflict-handling.md), and [docs/repo-map.md](docs/repo-map.md).
 
 ## Development
 
@@ -131,6 +131,7 @@ BRAT can consume the release assets directly, so this is enough for one-click up
 - Install is rejected if the target room folder already exists in the vault.
 - Downloaded rooms sync in parallel: each downloaded room maintains its own snapshot cursor and SSE stream.
 - Local room folders are projected under `syncRoot/<room-folder-name>/...`.
+- The default `syncRoot` is the vault root (`/` in the settings UI), so newly installed rooms appear directly in the vault unless the user chooses a subfolder.
 - After each authoritative room snapshot, the plugin first fetches byte metadata for room markdown bootstrap and then downloads Yjs state in HTTP batches. This keeps offline-safe cache bootstrap separate from live websocket sync and gives the UI a more honest byte-based preload progress.
 - After each room connect/snapshot, the plugin preloads markdown content for the whole downloaded room in the background instead of waiting for each note to be opened one by one.
 - Non-markdown files now follow a separate blob flow: initial room snapshot materializes their paths, then the plugin downloads actual bytes through blob download tickets and keeps them updated from authoritative room snapshots/events.

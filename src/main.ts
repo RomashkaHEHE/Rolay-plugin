@@ -2,7 +2,7 @@ import { MarkdownView, Notice, Plugin, TFile, normalizePath, type TAbstractFile 
 import * as Y from "yjs";
 import { RolayApiClient, RolayApiError, type BlobDownloadResult, type BlobTransferProgress } from "./api/client";
 import { FileBridge } from "./obsidian/file-bridge";
-import { createMarkdownTextState, CrdtSessionManager } from "./realtime/crdt-session";
+import { buildPresenceColor, createMarkdownTextState, CrdtSessionManager } from "./realtime/crdt-session";
 import { createSharedPresenceExtension, getMarkdownViewsForFile } from "./realtime/shared-presence";
 import {
   type RolayBinaryCacheEntry,
@@ -53,6 +53,8 @@ import { isBinaryPath, isMarkdownPath, guessMimeTypeFromPath } from "./utils/fil
 import { decodeBase64, encodeBase64 } from "./utils/base64";
 import { normalizeSha256Hash, sha256Hash } from "./utils/sha256";
 
+// Main orchestration state for one downloaded room. This is keyed strictly by
+// workspace.id so repeated room names cannot collide in memory or local sync.
 interface RoomRuntimeState {
   treeStore: TreeStore;
   eventStream: WorkspaceEventStream | null;
@@ -237,6 +239,7 @@ export default class RolayPlugin extends Plugin {
       app: this.app,
       apiClient: this.apiClient,
       getCurrentUser: () => this.getCurrentUser(),
+      getPresenceColor: () => this.getPresenceColor(),
       isLiveSyncEnabledForLocalPath: (localPath) => this.isLiveSyncEnabledForLocalPath(localPath),
       getPersistedCrdtState: (entryId) => this.getPersistedCrdtState(entryId),
       persistCrdtState: (entryId, filePath, state) => this.persistCrdtState(entryId, filePath, state),
@@ -443,6 +446,25 @@ export default class RolayPlugin extends Plugin {
 
   getProfileDraftDisplayName(): string {
     return this.profileDraftDisplayName || this.data.session?.user?.displayName || "";
+  }
+
+  getPresenceColor(): string | null {
+    const configured = this.data.settings.presenceColor.trim();
+    if (configured) {
+      return configured;
+    }
+
+    const currentUser = this.getCurrentUser();
+    return currentUser ? buildPresenceColor(currentUser.id) : null;
+  }
+
+  async updatePresenceColor(color: string): Promise<void> {
+    const normalizedColor = /^#[0-9a-fA-F]{6}$/.test(color.trim()) ? color.trim().toLowerCase() : "";
+    await this.updateSettings({
+      presenceColor: normalizedColor
+    });
+    await this.crdtManager.refreshPresencePreferences();
+    this.requestSettingsRender();
   }
 
   setProfileDraftDisplayName(displayName: string): void {
@@ -711,9 +733,10 @@ export default class RolayPlugin extends Plugin {
     }
 
     try {
-      const response = await this.apiClient.updateCurrentUserProfile({ displayName });
-      await this.applySessionUser(response.user);
-      this.recordLog("auth", `Updated display name to ${response.user.displayName}.`);
+    const response = await this.apiClient.updateCurrentUserProfile({ displayName });
+    await this.applySessionUser(response.user);
+    await this.crdtManager.refreshPresencePreferences();
+    this.recordLog("auth", `Updated display name to ${response.user.displayName}.`);
       new Notice(`Rolay display name updated to ${response.user.displayName}.`);
     } catch (error) {
       this.handleError("Display name update failed", error);
@@ -1323,6 +1346,8 @@ export default class RolayPlugin extends Plugin {
     });
     runtime.eventStream = stream;
 
+    // Every stream start gets a fresh generation token so stale callbacks from
+    // a just-stopped SSE connection cannot mutate current room state.
     stream.start(room.workspace.id, cursor, {
       onOpen: () => {
         if (runtime.eventStreamGeneration !== generation) {
@@ -3069,17 +3094,8 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
-    const currentUser = this.data.session?.user ?? null;
-    const downloadedRoomCount = this.getDownloadedRooms().length;
-    const activeStreamCount = [...this.roomRuntime.values()].filter((runtime) => runtime.streamStatus === "open").length;
-    const crdt = this.crdtManager?.getState();
-    const authLabel = currentUser
-      ? `${currentUser.username} (${currentUser.globalRole}${currentUser.isAdmin ? ", admin" : ""})`
-      : "signed-out";
-    const crdtLabel = crdt ? crdt.status : "idle";
-    this.statusBarEl.setText(
-      `Rolay: ${authLabel} | rooms ${downloadedRoomCount} downloaded | SSE ${activeStreamCount} open | CRDT ${crdtLabel}`
-    );
+    this.statusBarEl.empty();
+    this.statusBarEl.hide();
     this.requestSettingsRender();
   }
 
@@ -5061,6 +5077,8 @@ export default class RolayPlugin extends Plugin {
         this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ??
         null;
 
+      // Binary writes are a two-phase flow: ensure the tree entry exists first,
+      // then publish the actual bytes through the blob lifecycle.
       if (!entry || entry.deleted || entry.kind !== "binary") {
         this.registerPendingLocalCreate(workspaceId, currentServerPath);
         let confirmedServerCreate = false;
@@ -5527,6 +5545,9 @@ export default class RolayPlugin extends Plugin {
     entry: FileEntry,
     reason: string
   ): Promise<void> {
+    // Only entries with a committed blob revision are downloadable. A
+    // placeholder without entry.blob exists in the tree but should not yet
+    // overwrite local bytes or flip the UI to "finished".
     if (entry.deleted || entry.kind !== "binary" || !entry.blob) {
       return;
     }

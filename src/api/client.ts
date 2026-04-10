@@ -473,6 +473,9 @@ export class RolayApiClient {
     onProgress?: (progress: BlobTransferProgress) => void,
     signal?: AbortSignal
   ): Promise<BlobDownloadResult> {
+    // Signed blob download URLs have been flaky in desktop Obsidian depending
+    // on the transport layer, so try Electron/Node first and keep browser
+    // transports only as a fallback.
     const transportErrors: string[] = [];
 
     const electronDownload = tryElectronBinaryDownload(url, onProgress, signal);

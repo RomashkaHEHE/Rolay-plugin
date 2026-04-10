@@ -265,6 +265,16 @@ export class RolaySettingTab extends PluginSettingTab {
       this.requestRender();
     });
 
+    const presenceCard = this.createCard(grid, "Cursor Color", "Used for your shared cursor and selection in markdown collaboration.");
+    this.createInputField(presenceCard.body, {
+      label: "Cursor color",
+      type: "color",
+      value: this.rolay.getPresenceColor() ?? "#4f8cff",
+      onChange: async (value) => {
+        await this.rolay.updatePresenceColor(value);
+      }
+    });
+
     const passwordDraft = this.rolay.getPasswordChangeDraft();
     const securityCard = this.createCard(grid, "Change Password");
     this.createInputField(securityCard.body, {
@@ -317,10 +327,10 @@ export class RolaySettingTab extends PluginSettingTab {
     const rootCard = this.createCard(grid, "Root Folder", "Base vault folder under which installed room folders are created.");
     this.createInputField(rootCard.body, {
       value: settings.syncRoot,
-      placeholder: "Rolay",
+      placeholder: "/",
       onChange: async (value) => {
         await this.rolay.updateSettings({
-          syncRoot: value.trim()
+          syncRoot: value.trim() === "/" ? "" : value.trim()
         });
       }
     });

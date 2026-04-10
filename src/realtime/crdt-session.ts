@@ -25,6 +25,7 @@ interface CrdtSessionManagerConfig {
   app: App;
   apiClient: RolayApiClient;
   getCurrentUser: () => User | null;
+  getPresenceColor: () => string | null;
   isLiveSyncEnabledForLocalPath: (localPath: string) => boolean;
   getPersistedCrdtState: (entryId: string) => Uint8Array | null;
   persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void;
@@ -36,6 +37,7 @@ export class CrdtSessionManager {
   private readonly app: App;
   private readonly apiClient: RolayApiClient;
   private readonly getCurrentUser: () => User | null;
+  private readonly getPresenceColor: () => string | null;
   private readonly isLiveSyncEnabledForLocalPath: (localPath: string) => boolean;
   private readonly getPersistedCrdtState: (entryId: string) => Uint8Array | null;
   private readonly persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void;
@@ -49,6 +51,7 @@ export class CrdtSessionManager {
     this.app = config.app;
     this.apiClient = config.apiClient;
     this.getCurrentUser = config.getCurrentUser;
+    this.getPresenceColor = config.getPresenceColor;
     this.isLiveSyncEnabledForLocalPath = config.isLiveSyncEnabledForLocalPath;
     this.getPersistedCrdtState = config.getPersistedCrdtState;
     this.persistCrdtState = config.persistCrdtState;
@@ -70,6 +73,22 @@ export class CrdtSessionManager {
 
       const { file } = this.activeSession;
       await this.bindToFileNow(file);
+    });
+  }
+
+  async refreshPresencePreferences(): Promise<void> {
+    return this.runSessionOperation(async () => {
+      if (!this.activeSession) {
+        return;
+      }
+
+      const currentUser = this.getCurrentUser();
+      if (!currentUser) {
+        this.activeSession.clearPresenceOnly();
+        return;
+      }
+
+      this.activeSession.updateAwarenessUser(currentUser, this.getPresenceColor());
     });
   }
 
@@ -231,6 +250,7 @@ export class CrdtSessionManager {
       file,
       entry,
       currentUser,
+      this.getPresenceColor(),
       bootstrap.docId,
       bootstrap.wsUrl,
       createCrdtTokenSupplier(this.apiClient, entry.id, bootstrap.token),
@@ -255,6 +275,7 @@ export class CrdtSessionManager {
       file,
       entry,
       currentUser,
+      this.getPresenceColor(),
       entry.id,
       null,
       null,
@@ -313,7 +334,7 @@ class BoundCrdtSession {
   private readonly docId: string;
   private readonly wsUrl: string | null;
   private readonly token: string | (() => Promise<string>) | null;
-  private readonly awarenessUser: AwarenessUserPayload;
+  private awarenessUser: AwarenessUserPayload;
   private readonly yDocument = new Y.Doc();
   private readonly yText: Y.Text;
   private provider: HocuspocusProvider | null = null;
@@ -329,6 +350,7 @@ class BoundCrdtSession {
     file: TFile,
     entry: FileEntry,
     currentUser: User,
+    presenceColor: string | null,
     docId: string,
     wsUrl: string | null,
     token: string | (() => Promise<string>) | null,
@@ -345,7 +367,7 @@ class BoundCrdtSession {
     this.token = token;
     this.log = log;
     this.persistCrdtState = persistCrdtState;
-    this.awarenessUser = buildAwarenessUserPayload(currentUser);
+    this.awarenessUser = buildAwarenessUserPayload(currentUser, presenceColor);
     this.yText = this.yDocument.getText("content");
     if (initialState && initialState.byteLength > 0) {
       Y.applyUpdate(this.yDocument, initialState, "rolay-local-bootstrap");
@@ -418,6 +440,17 @@ class BoundCrdtSession {
 
   isOffline(): boolean {
     return this.status === "offline";
+  }
+
+  clearPresenceOnly(): void {
+    this.clearLocalPresence();
+    this.clearRemotePresence();
+  }
+
+  updateAwarenessUser(user: User, presenceColor: string | null): void {
+    this.awarenessUser = buildAwarenessUserPayload(user, presenceColor);
+    this.publishLocalUserPresence();
+    this.renderRemotePresence();
   }
 
   syncEditorContext(): void {
@@ -670,22 +703,62 @@ class BoundCrdtSession {
   }
 }
 
-function buildAwarenessUserPayload(user: User): AwarenessUserPayload {
+function buildAwarenessUserPayload(user: User, presenceColor: string | null): AwarenessUserPayload {
   return {
     userId: user.id,
     displayName: user.displayName || user.username,
-    color: buildPresenceColor(user.id)
+    color: presenceColor || buildPresenceColor(user.id)
   };
 }
 
-function buildPresenceColor(seed: string): string {
+export function buildPresenceColor(seed: string): string {
   let hash = 0;
   for (let index = 0; index < seed.length; index += 1) {
     hash = ((hash << 5) - hash + seed.charCodeAt(index)) | 0;
   }
 
   const hue = Math.abs(hash) % 360;
-  return `hsl(${hue} 72% 56%)`;
+  return hslToHex(hue, 72, 56);
+}
+
+function hslToHex(hue: number, saturationPercent: number, lightnessPercent: number): string {
+  const saturation = saturationPercent / 100;
+  const lightness = lightnessPercent / 100;
+  const chroma = (1 - Math.abs(2 * lightness - 1)) * saturation;
+  const scaledHue = hue / 60;
+  const x = chroma * (1 - Math.abs((scaledHue % 2) - 1));
+
+  let red = 0;
+  let green = 0;
+  let blue = 0;
+
+  if (scaledHue >= 0 && scaledHue < 1) {
+    red = chroma;
+    green = x;
+  } else if (scaledHue < 2) {
+    red = x;
+    green = chroma;
+  } else if (scaledHue < 3) {
+    green = chroma;
+    blue = x;
+  } else if (scaledHue < 4) {
+    green = x;
+    blue = chroma;
+  } else if (scaledHue < 5) {
+    red = x;
+    blue = chroma;
+  } else {
+    red = chroma;
+    blue = x;
+  }
+
+  const match = lightness - chroma / 2;
+  const toHex = (value: number): string => {
+    const normalized = Math.max(0, Math.min(255, Math.round((value + match) * 255)));
+    return normalized.toString(16).padStart(2, "0");
+  };
+
+  return `#${toHex(red)}${toHex(green)}${toHex(blue)}`;
 }
 
 function getPrimaryEditorSelection(editor: Editor): AwarenessSelectionPayload {

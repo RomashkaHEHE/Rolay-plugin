@@ -15,6 +15,7 @@ export interface RolayPluginSettings {
   serverUrl: string;
   username: string;
   password: string;
+  presenceColor: string;
   syncRoot: string;
   deviceName: string;
   autoConnect: boolean;
@@ -116,6 +117,7 @@ interface LegacyRolayPluginSettings {
   serverUrl?: string;
   username?: string;
   password?: string;
+  presenceColor?: string;
   syncRoot?: string;
   deviceName?: string;
   autoConnect?: boolean;
@@ -128,7 +130,8 @@ export const DEFAULT_SETTINGS: RolayPluginSettings = {
   serverUrl: ROLAY_SERVER_URL,
   username: "",
   password: "",
-  syncRoot: "Rolay",
+  presenceColor: "",
+  syncRoot: "",
   deviceName: ROLAY_DEVICE_NAME,
   autoConnect: ROLAY_AUTO_CONNECT,
   roomBindings: {}
@@ -176,7 +179,8 @@ export function mergePluginData(rawData: Partial<RolayPluginData> | null | undef
     ...defaults.settings,
     ...rawSettings,
     serverUrl: ROLAY_SERVER_URL,
-    syncRoot: (rawSettings.syncRoot ?? defaults.settings.syncRoot).trim(),
+    presenceColor: normalizePresenceColor(rawSettings.presenceColor),
+    syncRoot: normalizeSyncRootSetting(rawSettings.syncRoot ?? defaults.settings.syncRoot),
     deviceName: ROLAY_DEVICE_NAME,
     autoConnect: ROLAY_AUTO_CONNECT,
     roomBindings: normalizeRoomBindings(rawSettings)
@@ -503,4 +507,26 @@ function createDeviceId(): string {
 
 function normalizeStoredPath(path: string): string {
   return path.trim().replace(/\\/g, "/");
+}
+
+function normalizePresenceColor(color: unknown): string {
+  if (typeof color !== "string") {
+    return "";
+  }
+
+  const normalized = color.trim();
+  return /^#[0-9a-fA-F]{6}$/.test(normalized) ? normalized.toLowerCase() : "";
+}
+
+function normalizeSyncRootSetting(syncRoot: unknown): string {
+  if (typeof syncRoot !== "string") {
+    return "";
+  }
+
+  const normalized = syncRoot.trim().replace(/\\/g, "/");
+  if (!normalized || normalized === "/") {
+    return "";
+  }
+
+  return normalized.replace(/^\/+|\/+$/g, "");
 }

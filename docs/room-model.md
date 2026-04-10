@@ -48,6 +48,8 @@ The resulting local projection path is:
 
 `syncRoot/<room-folder-name>/...`
 
+In the current plugin, the default `syncRoot` is the vault root. In the settings UI this is represented as `/`, but internally it is stored as an empty root prefix.
+
 This keeps local file paths stable even if:
 
 - two rooms share the same human-readable name
