@@ -118,7 +118,7 @@ function buildRemotePresenceDecorations(
           decoration: Decoration.mark({
           class: "rolay-shared-selection",
           attributes: {
-            style: `background-color: ${withAlphaChannel(presence.color, 0.05)};`
+            style: `background-color: ${withAlphaChannel(presence.color, 0.2)};`
           }
         })
       });
@@ -157,11 +157,29 @@ function clampOffset(offset: number, documentLength: number): number {
 }
 
 function withAlphaChannel(color: string, alpha: number): string {
+  const normalizedColor = color.trim();
+
+  const hexMatch = normalizedColor.match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i);
+  if (hexMatch) {
+    const hex = hexMatch[1];
+    const expandedHex = hex.length === 3
+      ? hex.split("").map((char) => `${char}${char}`).join("")
+      : hex;
+    const red = Number.parseInt(expandedHex.slice(0, 2), 16);
+    const green = Number.parseInt(expandedHex.slice(2, 4), 16);
+    const blue = Number.parseInt(expandedHex.slice(4, 6), 16);
+    return `rgba(${red}, ${green}, ${blue}, ${alpha})`;
+  }
+
   if (color.startsWith("hsl(") && color.endsWith(")")) {
     return `${color.slice(0, -1)} / ${alpha})`;
   }
 
-  return color;
+  if (normalizedColor.startsWith("rgb(") && normalizedColor.endsWith(")")) {
+    return normalizedColor.replace(/^rgb\(/, "rgba(").replace(/\)$/, `, ${alpha})`);
+  }
+
+  return normalizedColor;
 }
 
 function isEditorView(value: unknown): value is EditorView {
