@@ -10099,7 +10099,7 @@ var _FileBridge = class _FileBridge {
   }
   async ensureLocalEntry(workspaceId, folderName, entry) {
     const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, entry.path);
-    const existing = this.app.vault.getAbstractFileByPath(localPath);
+    const existing = await this.getExistingPath(localPath);
     if (entry.kind === "folder") {
       await this.ensureFolderExists(localPath);
       return;
@@ -10145,8 +10145,8 @@ var _FileBridge = class _FileBridge {
     let currentPath = "";
     for (const segment of segments) {
       currentPath = currentPath ? `${currentPath}/${segment}` : segment;
-      const existing = this.app.vault.getAbstractFileByPath(currentPath);
-      if (existing instanceof import_obsidian3.TFolder) {
+      const existing = await this.getExistingPath(currentPath);
+      if (existing instanceof import_obsidian3.TFolder || existing === "exists-on-disk") {
         continue;
       }
       if (existing) {
@@ -10156,6 +10156,17 @@ var _FileBridge = class _FileBridge {
       await this.withSuppressedPaths([currentPath], async () => {
         await this.app.vault.createFolder(currentPath);
       });
+    }
+  }
+  async getExistingPath(path) {
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing) {
+      return existing;
+    }
+    try {
+      return await this.app.vault.adapter.exists((0, import_obsidian3.normalizePath)(path)) ? "exists-on-disk" : null;
+    } catch {
+      return null;
     }
   }
   getRoomRoot(folderName) {
@@ -14368,11 +14379,18 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
         this.requestRender();
       }
     );
-    if (room.downloaded && room.streamStatus !== "stopped") {
-      this.createActionButton(folderActions, "Disconnect", "", async () => {
-        await this.rolay.disconnectRoom(room.room.workspace.id);
-        this.requestRender();
-      });
+    if (room.downloaded) {
+      if (room.streamStatus === "stopped") {
+        this.createActionButton(folderActions, "Connect", "mod-cta", async () => {
+          await this.rolay.connectRoom(room.room.workspace.id);
+          this.requestRender();
+        });
+      } else {
+        this.createActionButton(folderActions, "Disconnect", "", async () => {
+          await this.rolay.disconnectRoom(room.room.workspace.id);
+          this.requestRender();
+        });
+      }
     }
     if (room.room.membershipRole === "owner") {
       const inviteCard = this.createCard(grid, "Invites", "Owner-only controls for the current invite key.");
@@ -15986,7 +16004,22 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     return [...this.roomList];
   }
   getRoomCardStates() {
-    return this.roomList.map((room) => {
+    const roomsById = new Map(this.roomList.map((room) => [room.workspace.id, room]));
+    const orderedRoomIds = [
+      ...this.roomList.map((room) => room.workspace.id),
+      ...Object.entries(this.data.settings.roomBindings).filter(([roomId, binding]) => binding.downloaded && !roomsById.has(roomId)).map(([roomId]) => roomId)
+    ];
+    return orderedRoomIds.map((roomId) => {
+      const room = roomsById.get(roomId) ?? {
+        workspace: {
+          id: roomId,
+          name: this.getStoredRoomBinding(roomId)?.folderName || roomId
+        },
+        membershipRole: "member",
+        createdAt: "",
+        memberCount: 0,
+        inviteEnabled: false
+      };
       const folderName = this.getResolvedRoomFolderName(room.workspace.id, room.workspace.name);
       const binding = this.getStoredRoomBinding(room.workspace.id);
       const localRoot = getRoomRoot(this.data.settings.syncRoot, folderName);
@@ -16338,7 +16371,6 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   async refreshRooms(showNotice = false, logActivity = true) {
     const response = await this.apiClient.listRooms();
     this.roomList = [...response.workspaces].sort(compareRoomsByName);
-    await this.reconcileDownloadedRooms();
     await this.reconcileLocalRoomFolders();
     this.reconcileInviteCache();
     if (logActivity) {
@@ -16442,6 +16474,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     const room = this.requireDownloadedRoom(workspaceId);
     await this.refreshRoomSnapshot(room.workspace.id, reason);
     await this.startRoomEventStream(room.workspace.id);
+    this.scheduleSnapshotRefresh(room.workspace.id, "post-connect-binary-followup");
     this.scheduleBackgroundMarkdownRefresh(
       room.workspace.id,
       "post-connect-background-refresh",
@@ -17203,8 +17236,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       if (!binding.downloaded || availableRoomIds.has(roomId)) {
         continue;
       }
-      await this.deactivateRoomDownload(roomId);
-      this.recordLog("rooms", `Room ${roomId} is no longer available to the current user. Sync was stopped and the download flag was cleared.`);
+      this.stopRoomEventStream(roomId);
+      this.recordLog(
+        "rooms",
+        `Room ${roomId} is not present in the current room list. Keeping the local folder binding and downloaded flag intact.`
+      );
     }
   }
   reconcileInviteCache() {
@@ -17433,21 +17469,21 @@ ${keptTail}`;
     return normalizeRoomFolderName(binding?.folderName || fallbackRoomName);
   }
   getDownloadedFolderName(workspaceId) {
-    const room = this.roomList.find((item) => item.workspace.id === workspaceId);
-    if (!room) {
-      return null;
-    }
     const binding = this.getStoredRoomBinding(workspaceId);
     if (!binding?.downloaded) {
       return null;
     }
-    return this.getResolvedRoomFolderName(workspaceId, room.workspace.name);
+    const room = this.roomList.find((item) => item.workspace.id === workspaceId);
+    return normalizeRoomFolderName(binding.folderName || room?.workspace.name || workspaceId);
   }
   getDownloadedRooms() {
-    return this.roomList.filter((room) => Boolean(this.getStoredRoomBinding(room.workspace.id)?.downloaded)).map((room) => ({
-      workspaceId: room.workspace.id,
-      folderName: this.getResolvedRoomFolderName(room.workspace.id, room.workspace.name)
-    }));
+    return Object.entries(this.data.settings.roomBindings).filter(([, binding]) => Boolean(binding.downloaded)).map(([workspaceId, binding]) => {
+      const room = this.roomList.find((item) => item.workspace.id === workspaceId);
+      return {
+        workspaceId,
+        folderName: normalizeRoomFolderName(binding.folderName || room?.workspace.name || workspaceId)
+      };
+    });
   }
   ensureRoomRuntime(workspaceId) {
     const existing = this.roomRuntime.get(workspaceId);
@@ -19402,7 +19438,7 @@ ${keptTail}`;
   async reconcileLocalRoomFolders() {
     for (const room of this.getDownloadedRooms()) {
       const roomRoot = getRoomRoot(this.data.settings.syncRoot, room.folderName);
-      if (this.app.vault.getAbstractFileByPath(roomRoot)) {
+      if (await this.localPathExists(roomRoot)) {
         continue;
       }
       await this.deactivateRoomDownload(room.workspaceId, false);
@@ -19410,6 +19446,16 @@ ${keptTail}`;
         "rooms",
         `Detached room ${room.workspaceId} because the local folder ${roomRoot} is missing. Remote room content was left untouched.`
       );
+    }
+  }
+  async localPathExists(path) {
+    if (this.app.vault.getAbstractFileByPath(path)) {
+      return true;
+    }
+    try {
+      return await this.app.vault.adapter.exists((0, import_obsidian9.normalizePath)(path));
+    } catch {
+      return false;
     }
   }
   patchInviteEnabled(workspaceId, enabled) {

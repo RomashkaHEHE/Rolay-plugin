@@ -394,7 +394,25 @@ export default class RolayPlugin extends Plugin {
   }
 
   getRoomCardStates(): RoomCardState[] {
-    return this.roomList.map((room) => {
+    const roomsById = new Map(this.roomList.map((room) => [room.workspace.id, room]));
+    const orderedRoomIds = [
+      ...this.roomList.map((room) => room.workspace.id),
+      ...Object.entries(this.data.settings.roomBindings)
+        .filter(([roomId, binding]) => binding.downloaded && !roomsById.has(roomId))
+        .map(([roomId]) => roomId)
+    ];
+
+    return orderedRoomIds.map((roomId) => {
+      const room = roomsById.get(roomId) ?? {
+        workspace: {
+          id: roomId,
+          name: this.getStoredRoomBinding(roomId)?.folderName || roomId
+        },
+        membershipRole: "member" as const,
+        createdAt: "",
+        memberCount: 0,
+        inviteEnabled: false
+      };
       const folderName = this.getResolvedRoomFolderName(room.workspace.id, room.workspace.name);
       const binding = this.getStoredRoomBinding(room.workspace.id);
       const localRoot = getRoomRoot(this.data.settings.syncRoot, folderName);
@@ -808,7 +826,6 @@ export default class RolayPlugin extends Plugin {
   async refreshRooms(showNotice = false, logActivity = true): Promise<RoomListItem[]> {
     const response = await this.apiClient.listRooms();
     this.roomList = [...response.workspaces].sort(compareRoomsByName);
-    await this.reconcileDownloadedRooms();
     await this.reconcileLocalRoomFolders();
     this.reconcileInviteCache();
     if (logActivity) {
@@ -933,6 +950,7 @@ export default class RolayPlugin extends Plugin {
     const room = this.requireDownloadedRoom(workspaceId);
     await this.refreshRoomSnapshot(room.workspace.id, reason);
     await this.startRoomEventStream(room.workspace.id);
+    this.scheduleSnapshotRefresh(room.workspace.id, "post-connect-binary-followup");
     this.scheduleBackgroundMarkdownRefresh(
       room.workspace.id,
       "post-connect-background-refresh",
@@ -1818,8 +1836,11 @@ export default class RolayPlugin extends Plugin {
         continue;
       }
 
-      await this.deactivateRoomDownload(roomId);
-      this.recordLog("rooms", `Room ${roomId} is no longer available to the current user. Sync was stopped and the download flag was cleared.`);
+      this.stopRoomEventStream(roomId);
+      this.recordLog(
+        "rooms",
+        `Room ${roomId} is not present in the current room list. Keeping the local folder binding and downloaded flag intact.`
+      );
     }
   }
 
@@ -2104,26 +2125,25 @@ export default class RolayPlugin extends Plugin {
   }
 
   private getDownloadedFolderName(workspaceId: string): string | null {
-    const room = this.roomList.find((item) => item.workspace.id === workspaceId);
-    if (!room) {
-      return null;
-    }
-
     const binding = this.getStoredRoomBinding(workspaceId);
     if (!binding?.downloaded) {
       return null;
     }
 
-    return this.getResolvedRoomFolderName(workspaceId, room.workspace.name);
+    const room = this.roomList.find((item) => item.workspace.id === workspaceId);
+    return normalizeRoomFolderName(binding.folderName || room?.workspace.name || workspaceId);
   }
 
   private getDownloadedRooms(): DownloadedRoomDescriptor[] {
-    return this.roomList
-      .filter((room) => Boolean(this.getStoredRoomBinding(room.workspace.id)?.downloaded))
-      .map((room) => ({
-        workspaceId: room.workspace.id,
-        folderName: this.getResolvedRoomFolderName(room.workspace.id, room.workspace.name)
-      }));
+    return Object.entries(this.data.settings.roomBindings)
+      .filter(([, binding]) => Boolean(binding.downloaded))
+      .map(([workspaceId, binding]) => {
+        const room = this.roomList.find((item) => item.workspace.id === workspaceId);
+        return {
+          workspaceId,
+          folderName: normalizeRoomFolderName(binding.folderName || room?.workspace.name || workspaceId)
+        };
+      });
   }
 
   private ensureRoomRuntime(workspaceId: string): RoomRuntimeState {
@@ -4641,7 +4661,7 @@ export default class RolayPlugin extends Plugin {
   private async reconcileLocalRoomFolders(): Promise<void> {
     for (const room of this.getDownloadedRooms()) {
       const roomRoot = getRoomRoot(this.data.settings.syncRoot, room.folderName);
-      if (this.app.vault.getAbstractFileByPath(roomRoot)) {
+      if (await this.localPathExists(roomRoot)) {
         continue;
       }
 
@@ -4650,6 +4670,18 @@ export default class RolayPlugin extends Plugin {
         "rooms",
         `Detached room ${room.workspaceId} because the local folder ${roomRoot} is missing. Remote room content was left untouched.`
       );
+    }
+  }
+
+  private async localPathExists(path: string): Promise<boolean> {
+    if (this.app.vault.getAbstractFileByPath(path)) {
+      return true;
+    }
+
+    try {
+      return await this.app.vault.adapter.exists(normalizePath(path));
+    } catch {
+      return false;
     }
   }
 

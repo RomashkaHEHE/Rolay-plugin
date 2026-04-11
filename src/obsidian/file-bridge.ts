@@ -436,7 +436,7 @@ export class FileBridge {
 
   private async ensureLocalEntry(workspaceId: string, folderName: string, entry: FileEntry): Promise<void> {
     const localPath = toLocalPathForRoom(this.getSyncRoot(), folderName, entry.path);
-    const existing = this.app.vault.getAbstractFileByPath(localPath);
+    const existing = await this.getExistingPath(localPath);
 
     if (entry.kind === "folder") {
       await this.ensureFolderExists(localPath);
@@ -492,9 +492,9 @@ export class FileBridge {
 
     for (const segment of segments) {
       currentPath = currentPath ? `${currentPath}/${segment}` : segment;
-      const existing = this.app.vault.getAbstractFileByPath(currentPath);
+      const existing = await this.getExistingPath(currentPath);
 
-      if (existing instanceof TFolder) {
+      if (existing instanceof TFolder || existing === "exists-on-disk") {
         continue;
       }
 
@@ -506,6 +506,19 @@ export class FileBridge {
       await this.withSuppressedPaths([currentPath], async () => {
         await this.app.vault.createFolder(currentPath);
       });
+    }
+  }
+
+  private async getExistingPath(path: string): Promise<TAbstractFile | "exists-on-disk" | null> {
+    const existing = this.app.vault.getAbstractFileByPath(path);
+    if (existing) {
+      return existing;
+    }
+
+    try {
+      return (await this.app.vault.adapter.exists(normalizePath(path))) ? "exists-on-disk" : null;
+    } catch {
+      return null;
     }
   }
 

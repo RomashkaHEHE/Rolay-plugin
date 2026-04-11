@@ -596,11 +596,18 @@ export class RolaySettingTab extends PluginSettingTab {
         this.requestRender();
       }
     );
-    if (room.downloaded && room.streamStatus !== "stopped") {
-      this.createActionButton(folderActions, "Disconnect", "", async () => {
-        await this.rolay.disconnectRoom(room.room.workspace.id);
-        this.requestRender();
-      });
+    if (room.downloaded) {
+      if (room.streamStatus === "stopped") {
+        this.createActionButton(folderActions, "Connect", "mod-cta", async () => {
+          await this.rolay.connectRoom(room.room.workspace.id);
+          this.requestRender();
+        });
+      } else {
+        this.createActionButton(folderActions, "Disconnect", "", async () => {
+          await this.rolay.disconnectRoom(room.room.workspace.id);
+          this.requestRender();
+        });
+      }
     }
 
     if (room.room.membershipRole === "owner") {
