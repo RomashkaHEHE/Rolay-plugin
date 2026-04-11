@@ -250,6 +250,13 @@ export class RolayApiClient {
     );
   }
 
+  async listRoomMembers(workspaceId: string): Promise<RoomMemberListResponse> {
+    return this.requestJson<RoomMemberListResponse>(
+      "GET",
+      `/v1/rooms/${encodeURIComponent(workspaceId)}/members`
+    );
+  }
+
   async addRoomMemberAsAdmin(
     workspaceId: string,
     body: AddRoomMemberRequest

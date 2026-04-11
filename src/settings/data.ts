@@ -509,13 +509,48 @@ function normalizeStoredPath(path: string): string {
   return path.trim().replace(/\\/g, "/");
 }
 
-function normalizePresenceColor(color: unknown): string {
+export function normalizePresenceColor(color: unknown): string {
   if (typeof color !== "string") {
     return "";
   }
 
   const normalized = color.trim();
-  return /^#[0-9a-fA-F]{6}$/.test(normalized) ? normalized.toLowerCase() : "";
+  const hexMatch = normalized.match(/^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$/);
+  if (hexMatch) {
+    const hex = hexMatch[1];
+    if (hex.length === 3) {
+      return `#${hex
+        .split("")
+        .map((part) => `${part}${part}`)
+        .join("")
+        .toLowerCase()}`;
+    }
+    return normalized.toLowerCase();
+  }
+
+  const rgbMatch = normalized.match(
+    /^rgb\(\s*(\d{1,3})\s*,\s*(\d{1,3})\s*,\s*(\d{1,3})\s*\)$/i
+  );
+  if (rgbMatch) {
+    const channels = rgbMatch.slice(1).map((value) => Number.parseInt(value, 10));
+    if (channels.every((channel) => channel >= 0 && channel <= 255)) {
+      return `#${channels.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
+    }
+  }
+
+  const hslMatch = normalized.match(
+    /^hsl\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(\d{1,3})%\s*,\s*(\d{1,3})%\s*\)$/i
+  );
+  if (hslMatch) {
+    const hue = Number.parseFloat(hslMatch[1]);
+    const saturation = Number.parseInt(hslMatch[2], 10);
+    const lightness = Number.parseInt(hslMatch[3], 10);
+    if (saturation >= 0 && saturation <= 100 && lightness >= 0 && lightness <= 100) {
+      return hslToHex(hue, saturation, lightness);
+    }
+  }
+
+  return "";
 }
 
 function normalizeSyncRootSetting(syncRoot: unknown): string {
@@ -529,4 +564,44 @@ function normalizeSyncRootSetting(syncRoot: unknown): string {
   }
 
   return normalized.replace(/^\/+|\/+$/g, "");
+}
+
+function hslToHex(hue: number, saturationPercent: number, lightnessPercent: number): string {
+  const h = ((hue % 360) + 360) % 360;
+  const s = saturationPercent / 100;
+  const l = lightnessPercent / 100;
+  const c = (1 - Math.abs(2 * l - 1)) * s;
+  const x = c * (1 - Math.abs(((h / 60) % 2) - 1));
+  const m = l - c / 2;
+
+  let r = 0;
+  let g = 0;
+  let b = 0;
+
+  if (h < 60) {
+    r = c;
+    g = x;
+  } else if (h < 120) {
+    r = x;
+    g = c;
+  } else if (h < 180) {
+    g = c;
+    b = x;
+  } else if (h < 240) {
+    g = x;
+    b = c;
+  } else if (h < 300) {
+    r = x;
+    b = c;
+  } else {
+    r = c;
+    b = x;
+  }
+
+  const toHex = (channel: number): string =>
+    Math.round((channel + m) * 255)
+      .toString(16)
+      .padStart(2, "0");
+
+  return `#${toHex(r)}${toHex(g)}${toHex(b)}`;
 }

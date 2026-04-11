@@ -27,7 +27,7 @@ interface SharedCursorUiState {
 }
 
 const setRemotePresenceEffect = StateEffect.define<SharedCursorPresence[]>();
-const END_OF_LINE_LABEL_DELAY_MS = 1000;
+const END_OF_LINE_LABEL_DELAY_MS = 700;
 const sharedCursorUiState = new Map<string, SharedCursorUiState>();
 
 const remotePresenceField = StateField.define<DecorationSet>({

@@ -13,6 +13,7 @@ import {
   type RolayCrdtCacheEntry,
   getRoomSyncState,
   mergePluginData,
+  normalizePresenceColor,
   normalizeServerUrl,
   type RolayLogEntry,
   type RolayPendingBinaryWriteEntry,
@@ -188,6 +189,7 @@ export default class RolayPlugin extends Plugin {
   private managedUsers: ManagedUser[] = [];
   private adminSelectedRoomId = "";
   private adminRoomMembers: RoomMember[] = [];
+  private readonly roomMembersCache = new Map<string, RoomMember[]>();
   private logFlushHandle: number | null = null;
   private logFileWrite = Promise.resolve();
   private readonly pendingLogLines: string[] = [];
@@ -444,6 +446,10 @@ export default class RolayPlugin extends Plugin {
     return [...this.adminRoomMembers];
   }
 
+  getRoomMembers(workspaceId: string): RoomMember[] {
+    return [...(this.roomMembersCache.get(workspaceId) ?? [])];
+  }
+
   getProfileDraftDisplayName(): string {
     return this.profileDraftDisplayName || this.data.session?.user?.displayName || "";
   }
@@ -459,7 +465,7 @@ export default class RolayPlugin extends Plugin {
   }
 
   async updatePresenceColor(color: string): Promise<void> {
-    const normalizedColor = /^#[0-9a-fA-F]{6}$/.test(color.trim()) ? color.trim().toLowerCase() : "";
+    const normalizedColor = normalizePresenceColor(color);
     await this.updateSettings({
       presenceColor: normalizedColor
     });
@@ -1163,9 +1169,9 @@ export default class RolayPlugin extends Plugin {
       throw this.notifyError("Select an admin room first.");
     }
 
-    const response = await this.apiClient.listRoomMembersAsAdmin(targetRoomId);
+    const members = await this.loadRoomMembersForUi(targetRoomId, logActivity);
     this.adminSelectedRoomId = targetRoomId;
-    this.adminRoomMembers = [...response.members].sort(compareRoomMembers);
+    this.adminRoomMembers = [...members];
     if (logActivity) {
       this.recordLog("admin", `Loaded ${this.adminRoomMembers.length} member(s) for room ${targetRoomId}.`);
     }
@@ -1173,6 +1179,31 @@ export default class RolayPlugin extends Plugin {
       new Notice(`Loaded ${this.adminRoomMembers.length} room member(s).`);
     }
     return this.getAdminRoomMembers();
+  }
+
+  async loadRoomMembersForUi(workspaceId: string, logActivity = false): Promise<RoomMember[]> {
+    try {
+      const response = this.data.session?.user?.isAdmin
+        ? await this.apiClient.listRoomMembersAsAdmin(workspaceId)
+        : await this.apiClient.listRoomMembers(workspaceId);
+      const members = [...response.members].sort(compareRoomMembers);
+      this.roomMembersCache.set(workspaceId, members);
+      if (this.adminSelectedRoomId === workspaceId) {
+        this.adminRoomMembers = [...members];
+      }
+      if (logActivity) {
+        this.recordLog("rooms", `Loaded ${members.length} member(s) for room ${workspaceId}.`);
+      }
+      this.requestSettingsRender();
+      return [...members];
+    } catch (error) {
+      this.recordLog(
+        "rooms",
+        `Failed to load members for room ${workspaceId}: ${error instanceof Error ? error.message : String(error)}`,
+        "error"
+      );
+      return this.getRoomMembers(workspaceId);
+    }
   }
 
   async addUserToSelectedAdminRoom(): Promise<void> {
