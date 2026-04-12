@@ -510,6 +510,10 @@ export class FileBridge {
   }
 
   private async getExistingPath(path: string): Promise<TAbstractFile | "exists-on-disk" | null> {
+    // During startup the vault metadata index can be briefly behind the real
+    // filesystem. The adapter fallback prevents false "Folder already exists"
+    // races while restoring authoritative room snapshots into already
+    // installed local folders.
     const existing = this.app.vault.getAbstractFileByPath(path);
     if (existing) {
       return existing;

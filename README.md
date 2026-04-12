@@ -51,7 +51,22 @@ Important product rules reflected in the plugin:
 - markdown note content is still the only CRDT-managed content in `v1`
 - every non-`.md` file, including `.txt`, is treated as binary/blob content
 
-More detailed notes live in [docs/server-contract.md](docs/server-contract.md), [docs/room-model.md](docs/room-model.md), [docs/auth-user-management.md](docs/auth-user-management.md), [docs/conflict-handling.md](docs/conflict-handling.md), and [docs/repo-map.md](docs/repo-map.md).
+## Documentation Map
+
+Start here when entering the project without chat history:
+
+- [docs/repo-map.md](docs/repo-map.md)
+  Repository map, code ownership by file, and "where to look first" guidance.
+- [docs/server-contract.md](docs/server-contract.md)
+  The server/API contract the plugin currently targets.
+- [docs/room-model.md](docs/room-model.md)
+  Room identity, local folder binding rules, and role model.
+- [docs/auth-user-management.md](docs/auth-user-management.md)
+  Login, session refresh, password change, profile, and admin-managed accounts.
+- [docs/conflict-handling.md](docs/conflict-handling.md)
+  Expected conflict behavior for markdown, tree operations, and binary blobs.
+- [docs/debug-playbook.md](docs/debug-playbook.md)
+  Fast triage guide for the most common sync failures and where to inspect them in code.
 
 ## Development
 

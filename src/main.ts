@@ -2135,6 +2135,10 @@ export default class RolayPlugin extends Plugin {
   }
 
   private getDownloadedRooms(): DownloadedRoomDescriptor[] {
+    // Persisted room bindings are the source of truth for "this room was
+    // installed into the vault before". The live room list may briefly be
+    // unavailable during startup/auth refresh and should not erase that local
+    // fact.
     return Object.entries(this.data.settings.roomBindings)
       .filter(([, binding]) => Boolean(binding.downloaded))
       .map(([workspaceId, binding]) => {
@@ -4674,6 +4678,9 @@ export default class RolayPlugin extends Plugin {
   }
 
   private async localPathExists(path: string): Promise<boolean> {
+    // On startup Obsidian metadata can lag behind the actual filesystem for a
+    // moment, so rely on the adapter as a fallback before concluding that a
+    // previously installed room folder is gone.
     if (this.app.vault.getAbstractFileByPath(path)) {
       return true;
     }

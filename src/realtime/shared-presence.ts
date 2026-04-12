@@ -29,6 +29,11 @@ interface SharedCursorUiState {
 const setRemotePresenceEffect = StateEffect.define<SharedCursorPresence[]>();
 const END_OF_LINE_LABEL_DELAY_MS = 700;
 const sharedCursorUiState = new Map<string, SharedCursorUiState>();
+// CodeMirror already remaps remote cursor decorations through local document
+// transactions. We keep the last remote-awareness signature per view so a
+// local awareness update does not immediately re-render the cursor back to a
+// stale absolute offset and cause visible jitter.
+const lastPresenceSignatureByView = new WeakMap<EditorView, string>();
 
 const remotePresenceField = StateField.define<DecorationSet>({
   create() {
@@ -92,9 +97,31 @@ export function getMarkdownViewsForFile(app: App, filePath: string): MarkdownVie
 }
 
 export function setRemotePresenceDecorations(view: EditorView, presences: SharedCursorPresence[]): void {
+  const nextSignature = getPresenceSignature(presences);
+  if (lastPresenceSignatureByView.get(view) === nextSignature) {
+    return;
+  }
+
+  lastPresenceSignatureByView.set(view, nextSignature);
   view.dispatch({
     effects: setRemotePresenceEffect.of(presences)
   });
+}
+
+function getPresenceSignature(presences: SharedCursorPresence[]): string {
+  return presences
+    .map((presence) => {
+      return [
+        presence.clientId,
+        presence.userId,
+        presence.displayName,
+        presence.color,
+        presence.selection.anchor,
+        presence.selection.head
+      ].join(":");
+    })
+    .sort()
+    .join("|");
 }
 
 function buildRemotePresenceDecorations(
