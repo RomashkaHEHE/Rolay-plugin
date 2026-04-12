@@ -125,7 +125,7 @@ Release steps:
 2. Keep `package.json` version in sync with `manifest.json`.
 3. Add the same version to `versions.json`.
 4. Commit the changes.
-5. Create and push a tag like `v0.1.0`.
+5. Create and push a tag like `1.2.2`.
 
 The workflow then:
 
@@ -136,6 +136,11 @@ The workflow then:
 - uploads a release zip for convenience
 
 BRAT can consume the release assets directly, so this is enough for one-click updates inside the group.
+
+Tag note:
+
+- The preferred release tag format is the plain plugin version, for example `1.2.2`.
+- Legacy tags with a `v` prefix, such as `v1.2.1`, are still accepted by the workflow so older release history keeps working.
 
 ## MVP Notes
 

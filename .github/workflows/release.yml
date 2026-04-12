@@ -3,11 +3,12 @@ name: Release Obsidian Plugin
 on:
   push:
     tags:
+      - "*.*.*"
       - "v*.*.*"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.1.0"
+        description: "Release tag, for example 1.2.2"
         required: true
         type: string
 
@@ -45,7 +46,7 @@ jobs:
           MANIFEST_VERSION=$(node -p "require('./manifest.json').version")
           PACKAGE_VERSION=$(node -p "require('./package.json').version")
 
-          if [ "v${MANIFEST_VERSION}" != "${TAG}" ]; then
+          if [ "${MANIFEST_VERSION}" != "${TAG}" ] && [ "v${MANIFEST_VERSION}" != "${TAG}" ]; then
             echo "manifest.json version ${MANIFEST_VERSION} does not match tag ${TAG}"
             exit 1
           fi
@@ -66,10 +67,14 @@ jobs:
       - name: Create plugin archive
         shell: bash
         run: |
+          TAG="${GITHUB_REF_NAME}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.tag }}"
+          fi
           mkdir -p dist
           cp manifest.json main.js styles.css versions.json dist/
           cd dist
-          zip -r "rolay-${GITHUB_REF_NAME#v}.zip" manifest.json main.js styles.css versions.json
+          zip -r "rolay-${TAG#v}.zip" manifest.json main.js styles.css versions.json
 
       - name: Publish GitHub release
         uses: softprops/action-gh-release@v2

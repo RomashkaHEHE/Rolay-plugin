@@ -12282,6 +12282,7 @@ var import_obsidian4 = require("obsidian");
 var setRemotePresenceEffect = import_state.StateEffect.define();
 var END_OF_LINE_LABEL_DELAY_MS = 700;
 var sharedCursorUiState = /* @__PURE__ */ new Map();
+var lastPresenceSignatureByView = /* @__PURE__ */ new WeakMap();
 var remotePresenceField = import_state.StateField.define({
   create() {
     return import_view.Decoration.none;
@@ -12327,9 +12328,26 @@ function getMarkdownViewsForFile(app, filePath) {
   return app.workspace.getLeavesOfType("markdown").map((leaf) => leaf.view).filter((view) => view instanceof import_obsidian4.MarkdownView).filter((view) => view.file?.path === filePath);
 }
 function setRemotePresenceDecorations(view, presences) {
+  const nextSignature = getPresenceSignature(presences);
+  if (lastPresenceSignatureByView.get(view) === nextSignature) {
+    return;
+  }
+  lastPresenceSignatureByView.set(view, nextSignature);
   view.dispatch({
     effects: setRemotePresenceEffect.of(presences)
   });
+}
+function getPresenceSignature(presences) {
+  return presences.map((presence) => {
+    return [
+      presence.clientId,
+      presence.userId,
+      presence.displayName,
+      presence.color,
+      presence.selection.anchor,
+      presence.selection.head
+    ].join(":");
+  }).sort().join("|");
 }
 function buildRemotePresenceDecorations(documentLength, presences) {
   cleanupSharedCursorUiState(presences);
