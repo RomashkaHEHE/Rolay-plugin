@@ -584,6 +584,34 @@
   padding: 0 0.3rem;
 }
 
+.rolay-transfer-progress-badge {
+  align-items: center;
+  border-radius: 6px;
+  color: var(--text-normal);
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 0.69rem;
+  font-weight: 700;
+  height: 1rem;
+  justify-content: center;
+  margin-left: 0.35rem;
+  min-width: 2.2rem;
+  padding: 0 0.35rem;
+  vertical-align: middle;
+}
+
+.rolay-transfer-progress-badge-download {
+  background: color-mix(in srgb, var(--text-error) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-error) 34%, var(--background-modifier-border));
+  color: var(--text-error);
+}
+
+.rolay-transfer-progress-badge-upload {
+  background: color-mix(in srgb, var(--text-warning, #d4a100) 16%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-warning, #d4a100) 34%, var(--background-modifier-border));
+  color: var(--text-warning, #d4a100);
+}
+
 @media (max-width: 820px) {
   .rolay-settings-tabs {
     display: grid;

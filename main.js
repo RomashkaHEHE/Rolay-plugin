@@ -10729,6 +10729,9 @@ var _FileBridge = class _FileBridge {
     this.clearProtectedRemoteBinaryPlaceholder(localPath);
     return localPath;
   }
+  getProtectedRemoteBinaryPlaceholderPaths() {
+    return [...this.protectedRemoteBinaryPlaceholders.keys()];
+  }
   isSuppressedPath(path) {
     const normalizedPath = (0, import_obsidian3.normalizePath)(path);
     for (const prefix of this.suppressedPrefixes.keys()) {
@@ -17657,6 +17660,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     runtime.treeStore.applySnapshot(snapshot);
     this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
     await this.fileBridge.applySnapshot(snapshot, previousEntries);
+    this.scheduleExplorerLoadingDecorations();
     this.setRoomSyncState(room.workspace.id, {
       lastCursor: snapshot.cursor,
       lastSnapshotAt: (/* @__PURE__ */ new Date()).toISOString()
@@ -18651,6 +18655,7 @@ ${keptTail}`;
     const loadingPaths = this.getLoadingExplorerPaths();
     const uploadingPaths = this.getUploadingExplorerPaths();
     const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
+    const transferBadges = this.getExplorerTransferBadges();
     const notePresenceBadges = this.getExplorerNotePresenceBadges();
     const pathElements = container.querySelectorAll("[data-path]");
     for (const element2 of pathElements) {
@@ -18700,6 +18705,10 @@ ${keptTail}`;
           element2.classList.add("rolay-room-folder-connecting");
         }
       }
+      this.updateExplorerTransferBadge(
+        element2,
+        transferBadges.get(normalizedPath) ?? null
+      );
       this.updateExplorerNotePresenceBadge(
         element2,
         notePresenceBadges.get(normalizedPath) ?? null
@@ -18789,14 +18798,86 @@ ${keptTail}`;
     badge.classList.toggle("rolay-note-presence-badge-multi", badgeState.count > 1);
     badge.setAttribute("aria-label", badgeState.count <= 1 ? "1 viewer" : `${badgeState.count} viewers`);
   }
+  getExplorerTransferBadges() {
+    const badges = /* @__PURE__ */ new Map();
+    for (const transfer of this.binaryTransferState.values()) {
+      const activeUpload = transfer.kind === "upload" && (transfer.status === "preparing" || transfer.status === "uploading" || transfer.status === "canceling" || transfer.status === "committing");
+      const activeDownload = transfer.kind === "download" && (transfer.status === "preparing" || transfer.status === "downloading");
+      if (!activeUpload && !activeDownload) {
+        continue;
+      }
+      badges.set((0, import_obsidian9.normalizePath)(transfer.localPath), {
+        label: this.formatBinaryTransferPercentLabel(transfer),
+        kind: transfer.kind
+      });
+    }
+    for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
+      const normalizedPath = (0, import_obsidian9.normalizePath)(placeholderPath);
+      if (badges.has(normalizedPath)) {
+        continue;
+      }
+      badges.set(normalizedPath, {
+        label: "0%",
+        kind: "download"
+      });
+    }
+    return badges;
+  }
+  updateExplorerTransferBadge(element2, badgeState) {
+    const titleHost = this.findExplorerTitleHost(element2);
+    if (!titleHost) {
+      return;
+    }
+    let badge = titleHost.querySelector(".rolay-transfer-progress-badge");
+    if (!badgeState) {
+      badge?.remove();
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "rolay-transfer-progress-badge";
+      const notePresenceBadge = titleHost.querySelector(".rolay-note-presence-badge");
+      if (notePresenceBadge) {
+        titleHost.insertBefore(badge, notePresenceBadge);
+      } else {
+        titleHost.appendChild(badge);
+      }
+    }
+    badge.textContent = badgeState.label;
+    badge.classList.toggle("rolay-transfer-progress-badge-upload", badgeState.kind === "upload");
+    badge.classList.toggle("rolay-transfer-progress-badge-download", badgeState.kind === "download");
+    badge.setAttribute(
+      "aria-label",
+      badgeState.kind === "upload" ? `Upload progress ${badgeState.label}` : `Download progress ${badgeState.label}`
+    );
+  }
   findExplorerTitleHost(element2) {
     return element2.querySelector(".nav-file-title-content") ?? element2.querySelector(".tree-item-inner");
+  }
+  formatBinaryTransferPercentLabel(transfer) {
+    const totalBytes = Math.max(0, transfer.bytesTotal);
+    const doneBytes = Math.min(Math.max(0, transfer.bytesDone), totalBytes);
+    if (totalBytes <= 0) {
+      return transfer.status === "committing" ? "100%" : "0%";
+    }
+    return `${Math.max(0, Math.min(100, Math.round(doneBytes / totalBytes * 100)))}%`;
   }
   getLoadingExplorerPaths() {
     const loadingPaths = /* @__PURE__ */ new Set();
     for (const runtime of this.roomRuntime.values()) {
       for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
         loadingPaths.add(lockedPath);
+      }
+    }
+    for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
+      const normalizedPath = (0, import_obsidian9.normalizePath)(placeholderPath);
+      const transfer = this.binaryTransferState.get(normalizedPath);
+      if (!transfer) {
+        loadingPaths.add(normalizedPath);
+        continue;
+      }
+      if (transfer.kind === "download" && (transfer.status === "preparing" || transfer.status === "downloading")) {
+        loadingPaths.add(normalizedPath);
       }
     }
     for (const transfer of this.binaryTransferState.values()) {

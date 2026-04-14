@@ -581,6 +581,10 @@ export class FileBridge {
     return localPath;
   }
 
+  getProtectedRemoteBinaryPlaceholderPaths(): string[] {
+    return [...this.protectedRemoteBinaryPlaceholders.keys()];
+  }
+
   private isSuppressedPath(path: string): boolean {
     const normalizedPath = normalizePath(path);
 

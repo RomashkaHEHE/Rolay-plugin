@@ -142,6 +142,11 @@ interface ExplorerNotePresenceBadgeState {
   color: string;
 }
 
+interface ExplorerTransferBadgeState {
+  label: string;
+  kind: BinaryTransferKind;
+}
+
 export interface RoomCardState {
   room: RoomListItem;
   folderName: string;
@@ -1383,6 +1388,7 @@ export default class RolayPlugin extends Plugin {
     runtime.treeStore.applySnapshot(snapshot);
     this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
     await this.fileBridge.applySnapshot(snapshot, previousEntries);
+    this.scheduleExplorerLoadingDecorations();
     this.setRoomSyncState(room.workspace.id, {
       lastCursor: snapshot.cursor,
       lastSnapshotAt: new Date().toISOString()
@@ -2588,6 +2594,7 @@ export default class RolayPlugin extends Plugin {
     const loadingPaths = this.getLoadingExplorerPaths();
     const uploadingPaths = this.getUploadingExplorerPaths();
     const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
+    const transferBadges = this.getExplorerTransferBadges();
     const notePresenceBadges = this.getExplorerNotePresenceBadges();
 
     const pathElements = container.querySelectorAll<HTMLElement>("[data-path]");
@@ -2646,6 +2653,10 @@ export default class RolayPlugin extends Plugin {
         }
       }
 
+      this.updateExplorerTransferBadge(
+        element,
+        transferBadges.get(normalizedPath) ?? null
+      );
       this.updateExplorerNotePresenceBadge(
         element,
         notePresenceBadges.get(normalizedPath) ?? null
@@ -2761,11 +2772,99 @@ export default class RolayPlugin extends Plugin {
     badge.setAttribute("aria-label", badgeState.count <= 1 ? "1 viewer" : `${badgeState.count} viewers`);
   }
 
+  private getExplorerTransferBadges(): Map<string, ExplorerTransferBadgeState> {
+    const badges = new Map<string, ExplorerTransferBadgeState>();
+
+    for (const transfer of this.binaryTransferState.values()) {
+      const activeUpload =
+        transfer.kind === "upload" &&
+        (
+          transfer.status === "preparing" ||
+          transfer.status === "uploading" ||
+          transfer.status === "canceling" ||
+          transfer.status === "committing"
+        );
+      const activeDownload =
+        transfer.kind === "download" &&
+        (transfer.status === "preparing" || transfer.status === "downloading");
+
+      if (!activeUpload && !activeDownload) {
+        continue;
+      }
+
+      badges.set(normalizePath(transfer.localPath), {
+        label: this.formatBinaryTransferPercentLabel(transfer),
+        kind: transfer.kind
+      });
+    }
+
+    for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
+      const normalizedPath = normalizePath(placeholderPath);
+      if (badges.has(normalizedPath)) {
+        continue;
+      }
+
+      badges.set(normalizedPath, {
+        label: "0%",
+        kind: "download"
+      });
+    }
+
+    return badges;
+  }
+
+  private updateExplorerTransferBadge(
+    element: HTMLElement,
+    badgeState: ExplorerTransferBadgeState | null
+  ): void {
+    const titleHost = this.findExplorerTitleHost(element);
+    if (!titleHost) {
+      return;
+    }
+
+    let badge = titleHost.querySelector<HTMLElement>(".rolay-transfer-progress-badge");
+    if (!badgeState) {
+      badge?.remove();
+      return;
+    }
+
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "rolay-transfer-progress-badge";
+      const notePresenceBadge = titleHost.querySelector<HTMLElement>(".rolay-note-presence-badge");
+      if (notePresenceBadge) {
+        titleHost.insertBefore(badge, notePresenceBadge);
+      } else {
+        titleHost.appendChild(badge);
+      }
+    }
+
+    badge.textContent = badgeState.label;
+    badge.classList.toggle("rolay-transfer-progress-badge-upload", badgeState.kind === "upload");
+    badge.classList.toggle("rolay-transfer-progress-badge-download", badgeState.kind === "download");
+    badge.setAttribute(
+      "aria-label",
+      badgeState.kind === "upload"
+        ? `Upload progress ${badgeState.label}`
+        : `Download progress ${badgeState.label}`
+    );
+  }
+
   private findExplorerTitleHost(element: HTMLElement): HTMLElement | null {
     return (
       element.querySelector<HTMLElement>(".nav-file-title-content") ??
       element.querySelector<HTMLElement>(".tree-item-inner")
     );
+  }
+
+  private formatBinaryTransferPercentLabel(transfer: BinaryTransferState): string {
+    const totalBytes = Math.max(0, transfer.bytesTotal);
+    const doneBytes = Math.min(Math.max(0, transfer.bytesDone), totalBytes);
+    if (totalBytes <= 0) {
+      return transfer.status === "committing" ? "100%" : "0%";
+    }
+
+    return `${Math.max(0, Math.min(100, Math.round((doneBytes / totalBytes) * 100)))}%`;
   }
 
   private getLoadingExplorerPaths(): Set<string> {
@@ -2774,6 +2873,25 @@ export default class RolayPlugin extends Plugin {
     for (const runtime of this.roomRuntime.values()) {
       for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
         loadingPaths.add(lockedPath);
+      }
+    }
+
+    // Snapshot materialization creates empty binary placeholders before the
+    // actual blob download starts. Treat those protected placeholders as
+    // loading immediately so the file is red from the first rendered frame.
+    for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
+      const normalizedPath = normalizePath(placeholderPath);
+      const transfer = this.binaryTransferState.get(normalizedPath);
+      if (!transfer) {
+        loadingPaths.add(normalizedPath);
+        continue;
+      }
+
+      if (
+        transfer.kind === "download" &&
+        (transfer.status === "preparing" || transfer.status === "downloading")
+      ) {
+        loadingPaths.add(normalizedPath);
       }
     }
 
