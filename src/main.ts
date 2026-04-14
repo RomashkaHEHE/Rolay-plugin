@@ -27,6 +27,7 @@ import { RolaySettingTab } from "./settings/tab";
 import { WorkspaceEventStream, type WorkspaceEventStreamStatus } from "./sync/event-stream";
 import { OperationsQueue, RolayOperationError } from "./sync/operations";
 import { SettingsEventStream } from "./sync/settings-stream";
+import { NotePresenceEventStream } from "./sync/note-presence-stream";
 import {
   getRoomRoot,
   isValidRoomFolderName,
@@ -43,6 +44,9 @@ import type {
   InviteState,
   MarkdownBootstrapDocument,
   ManagedUser,
+  NotePresenceSnapshotPayload,
+  NotePresenceUpdatedPayload,
+  NotePresenceViewer,
   RoomListItem,
   RoomMember,
   SettingsEventEnvelope,
@@ -60,6 +64,12 @@ interface RoomRuntimeState {
   treeStore: TreeStore;
   eventStream: WorkspaceEventStream | null;
   eventStreamGeneration: number;
+  // Room-level note presence is a separate live stream aggregated by the
+  // server from markdown awareness. We keep it per room so explorer badges and
+  // viewer chips can update without opening every markdown document locally.
+  notePresenceStream: NotePresenceEventStream | null;
+  notePresenceStreamGeneration: number;
+  notePresenceByEntryId: Map<string, NotePresenceViewer[]>;
   streamStatus: WorkspaceEventStreamStatus;
   lastHandledEventId: number | null;
   snapshotRefreshHandle: number | null;
@@ -117,6 +127,16 @@ interface BinaryTransferState {
   lastError: string | null;
   rerunRequested: boolean;
   abortController: AbortController | null;
+}
+
+// Important: this runtime map is only for live progress/cancel state. Durable
+// crash recovery currently comes from persisted pendingBinaryWrites plus the
+// next authoritative snapshot, so transfers are replayed after restart rather
+// than resumed from a stored byte offset.
+
+interface ExplorerNotePresenceBadgeState {
+  count: number;
+  color: string;
 }
 
 export interface RoomCardState {
@@ -183,6 +203,7 @@ export default class RolayPlugin extends Plugin {
   private readonly pendingRemoteMarkdownSettles = new Map<string, number>();
   private persistHandle: number | null = null;
   private explorerDecorationHandle: number | null = null;
+  private notePresenceUiHandle: number | null = null;
   private statusBarEl!: HTMLElement;
   private roomList: RoomListItem[] = [];
   private adminRoomList: AdminRoomListItem[] = [];
@@ -242,6 +263,7 @@ export default class RolayPlugin extends Plugin {
       apiClient: this.apiClient,
       getCurrentUser: () => this.getCurrentUser(),
       getPresenceColor: () => this.getPresenceColor(),
+      resolveWorkspaceIdByLocalPath: (localPath) => this.resolveDownloadedRoomByLocalPath(localPath)?.workspaceId ?? null,
       isLiveSyncEnabledForLocalPath: (localPath) => this.isLiveSyncEnabledForLocalPath(localPath),
       getPersistedCrdtState: (entryId) => this.getPersistedCrdtState(entryId),
       persistCrdtState: (entryId, filePath, state) => this.persistCrdtState(entryId, filePath, state),
@@ -306,6 +328,7 @@ export default class RolayPlugin extends Plugin {
     this.registerEvent(
       this.app.workspace.on("layout-change", () => {
         this.scheduleExplorerLoadingDecorations();
+        this.scheduleNotePresenceUiRefresh();
       })
     );
     this.registerEvent(
@@ -337,6 +360,10 @@ export default class RolayPlugin extends Plugin {
 
       if (this.explorerDecorationHandle !== null) {
         window.clearTimeout(this.explorerDecorationHandle);
+      }
+
+      if (this.notePresenceUiHandle !== null) {
+        window.clearTimeout(this.notePresenceUiHandle);
       }
 
       if (this.logFlushHandle !== null) {
@@ -1429,6 +1456,7 @@ export default class RolayPlugin extends Plugin {
         runtime.streamStatus = status;
         this.updateStatusBar();
         this.scheduleExplorerLoadingDecorations();
+        this.scheduleNotePresenceUiRefresh();
       },
       onError: (error) => {
         if (runtime.eventStreamGeneration !== generation) {
@@ -1437,6 +1465,8 @@ export default class RolayPlugin extends Plugin {
         this.handleError(`Workspace event stream error (${room.workspace.id})`, error, false);
       }
     });
+
+    this.startRoomNotePresenceStream(room.workspace.id);
   }
 
   stopRoomEventStream(workspaceId: string): void {
@@ -1456,16 +1486,76 @@ export default class RolayPlugin extends Plugin {
     runtime.eventStreamGeneration += 1;
     runtime.eventStream?.stop();
     runtime.eventStream = null;
+    this.stopRoomNotePresenceStream(workspaceId);
     runtime.streamStatus = "stopped";
     runtime.lastHandledEventId = runtime.treeStore.getCursor();
     this.updateStatusBar();
     this.scheduleExplorerLoadingDecorations();
+    this.scheduleNotePresenceUiRefresh();
   }
 
   stopAllRoomEventStreams(): void {
     for (const workspaceId of this.roomRuntime.keys()) {
       this.stopRoomEventStream(workspaceId);
     }
+  }
+
+  private startRoomNotePresenceStream(workspaceId: string): void {
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    this.stopRoomNotePresenceStream(workspaceId);
+    const generation = runtime.notePresenceStreamGeneration + 1;
+    runtime.notePresenceStreamGeneration = generation;
+
+    const stream = new NotePresenceEventStream(this.apiClient, (message) => {
+      this.recordLog("presence", `[${workspaceId}] ${message}`);
+    });
+    runtime.notePresenceStream = stream;
+    stream.start(workspaceId, {
+      onOpen: () => {
+        if (runtime.notePresenceStreamGeneration !== generation) {
+          return;
+        }
+        this.recordLog("presence", `Subscribed to note presence for room ${workspaceId}.`);
+      },
+      onEvent: async (event) => {
+        if (runtime.notePresenceStreamGeneration !== generation) {
+          return;
+        }
+
+        if (event.event === "ping") {
+          return;
+        }
+
+        if (event.event === "presence.snapshot") {
+          this.applyNotePresenceSnapshot(workspaceId, event.data);
+          return;
+        }
+
+        if (event.event === "note.presence.updated") {
+          this.applyNotePresenceUpdate(workspaceId, event.data);
+        }
+      },
+      onError: (error) => {
+        if (runtime.notePresenceStreamGeneration !== generation) {
+          return;
+        }
+        this.handleError(`Note presence stream error (${workspaceId})`, error, false);
+      }
+    });
+  }
+
+  private stopRoomNotePresenceStream(workspaceId: string): void {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+
+    runtime.notePresenceStreamGeneration += 1;
+    runtime.notePresenceStream?.stop();
+    runtime.notePresenceStream = null;
+    runtime.notePresenceByEntryId.clear();
+    this.scheduleExplorerLoadingDecorations();
+    this.scheduleNotePresenceUiRefresh();
   }
 
   private startSettingsEventStream(cursor: number | null): void {
@@ -1717,6 +1807,8 @@ export default class RolayPlugin extends Plugin {
     }
     await this.syncMarkdownLockForLocalPath(file?.path ?? null);
     this.updateStatusBar();
+    this.scheduleNotePresenceUiRefresh();
+    this.scheduleExplorerLoadingDecorations();
   }
 
   private async handleVaultCreate(file: TAbstractFile): Promise<void> {
@@ -2160,6 +2252,9 @@ export default class RolayPlugin extends Plugin {
       treeStore: new TreeStore(),
       eventStream: null,
       eventStreamGeneration: 0,
+      notePresenceStream: null,
+      notePresenceStreamGeneration: 0,
+      notePresenceByEntryId: new Map(),
       streamStatus: "stopped",
       lastHandledEventId: null,
       snapshotRefreshHandle: null,
@@ -2372,6 +2467,28 @@ export default class RolayPlugin extends Plugin {
     }, 80);
   }
 
+  private scheduleNotePresenceUiRefresh(): void {
+    if (this.notePresenceUiHandle !== null) {
+      return;
+    }
+
+    this.notePresenceUiHandle = window.setTimeout(() => {
+      this.notePresenceUiHandle = null;
+      this.refreshNotePresenceUi();
+    }, 80);
+  }
+
+  private refreshNotePresenceUi(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!(view instanceof MarkdownView)) {
+        continue;
+      }
+
+      this.renderNotePresenceChipsForView(view);
+    }
+  }
+
   private refreshExplorerLoadingDecorations(): void {
     const container = this.app.workspace.containerEl;
     if (!container) {
@@ -2381,6 +2498,7 @@ export default class RolayPlugin extends Plugin {
     const loadingPaths = this.getLoadingExplorerPaths();
     const uploadingPaths = this.getUploadingExplorerPaths();
     const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
+    const notePresenceBadges = this.getExplorerNotePresenceBadges();
 
     const pathElements = container.querySelectorAll<HTMLElement>("[data-path]");
     for (const element of pathElements) {
@@ -2437,7 +2555,127 @@ export default class RolayPlugin extends Plugin {
           element.classList.add("rolay-room-folder-connecting");
         }
       }
+
+      this.updateExplorerNotePresenceBadge(
+        element,
+        notePresenceBadges.get(normalizedPath) ?? null
+      );
     }
+  }
+
+  private renderNotePresenceChipsForView(view: MarkdownView): void {
+    const file = view.file;
+    const host = this.findNotePresenceHost(view);
+    if (!host) {
+      this.removeNotePresenceBar(view);
+      return;
+    }
+
+    const presence = file ? this.getNotePresenceForLocalPath(file.path) : [];
+    if (presence.length === 0) {
+      this.removeNotePresenceBar(view);
+      return;
+    }
+
+    let bar = view.containerEl.querySelector<HTMLElement>(".rolay-note-presence-bar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "rolay-note-presence-bar";
+      host.parentElement?.insertBefore(bar, host);
+    }
+
+    const signature = presence
+      .map((viewer) => `${viewer.presenceId}:${viewer.displayName}:${viewer.color}`)
+      .join("|");
+    if (bar.dataset.signature === signature) {
+      return;
+    }
+
+    bar.dataset.signature = signature;
+    bar.replaceChildren(
+      ...presence.map((viewer) => {
+        const chip = document.createElement("span");
+        chip.className = "rolay-note-presence-chip";
+        chip.textContent = viewer.displayName;
+        chip.style.setProperty("--rolay-note-presence-color", viewer.color);
+        return chip;
+      })
+    );
+  }
+
+  private removeNotePresenceBar(view: MarkdownView): void {
+    view.containerEl.querySelector<HTMLElement>(".rolay-note-presence-bar")?.remove();
+  }
+
+  private findNotePresenceHost(view: MarkdownView): HTMLElement | null {
+    const container = view.containerEl;
+    return (
+      container.querySelector<HTMLElement>(".inline-title") ??
+      container.querySelector<HTMLElement>(".view-content .inline-title")
+    );
+  }
+
+  private getExplorerNotePresenceBadges(): Map<string, ExplorerNotePresenceBadgeState> {
+    const badges = new Map<string, ExplorerNotePresenceBadgeState>();
+
+    for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
+      for (const [entryId, viewers] of runtime.notePresenceByEntryId.entries()) {
+        if (viewers.length === 0) {
+          continue;
+        }
+
+        const entry = runtime.treeStore.getEntryById(entryId);
+        if (!entry || entry.deleted || entry.kind !== "markdown") {
+          continue;
+        }
+
+        const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path);
+        if (!localPath) {
+          continue;
+        }
+
+        badges.set(normalizePath(localPath), {
+          count: viewers.length,
+          color: viewers.length === 1 ? viewers[0].color : "var(--interactive-accent, #8b5cf6)"
+        });
+      }
+    }
+
+    return badges;
+  }
+
+  private updateExplorerNotePresenceBadge(
+    element: HTMLElement,
+    badgeState: ExplorerNotePresenceBadgeState | null
+  ): void {
+    const titleHost = this.findExplorerTitleHost(element);
+    if (!titleHost) {
+      return;
+    }
+
+    let badge = titleHost.querySelector<HTMLElement>(".rolay-note-presence-badge");
+    if (!badgeState) {
+      badge?.remove();
+      return;
+    }
+
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "rolay-note-presence-badge";
+      titleHost.appendChild(badge);
+    }
+
+    badge.style.setProperty("--rolay-note-presence-badge-color", badgeState.color);
+    badge.textContent = badgeState.count <= 1 ? "" : String(badgeState.count);
+    badge.classList.toggle("rolay-note-presence-badge-multi", badgeState.count > 1);
+    badge.setAttribute("aria-label", badgeState.count <= 1 ? "1 viewer" : `${badgeState.count} viewers`);
+  }
+
+  private findExplorerTitleHost(element: HTMLElement): HTMLElement | null {
+    return (
+      element.querySelector<HTMLElement>(".nav-file-title-content") ??
+      element.querySelector<HTMLElement>(".tree-item-inner")
+    );
   }
 
   private getLoadingExplorerPaths(): Set<string> {
@@ -2511,6 +2749,67 @@ export default class RolayPlugin extends Plugin {
     }
 
     return statuses;
+  }
+
+  private getNotePresenceForLocalPath(localPath: string): NotePresenceViewer[] {
+    const room = this.resolveDownloadedRoomByLocalPath(localPath);
+    if (!room) {
+      return [];
+    }
+
+    const serverPath = toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName);
+    if (!serverPath) {
+      return [];
+    }
+
+    const entry = this.getRoomStore(room.workspaceId)?.getEntryByPath(serverPath);
+    if (!entry || entry.deleted || entry.kind !== "markdown") {
+      return [];
+    }
+
+    return this.getNotePresenceForEntry(room.workspaceId, entry.id);
+  }
+
+  private getNotePresenceForEntry(workspaceId: string, entryId: string): NotePresenceViewer[] {
+    const viewers = this.roomRuntime.get(workspaceId)?.notePresenceByEntryId.get(entryId) ?? [];
+    return [...viewers];
+  }
+
+  private applyNotePresenceSnapshot(workspaceId: string, payload: unknown): void {
+    const snapshot = extractNotePresenceSnapshotPayload(payload);
+    if (!snapshot || snapshot.workspaceId !== workspaceId) {
+      return;
+    }
+
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    runtime.notePresenceByEntryId.clear();
+    for (const note of snapshot.notes) {
+      if (note.viewers.length === 0) {
+        continue;
+      }
+
+      runtime.notePresenceByEntryId.set(note.entryId, note.viewers);
+    }
+
+    this.scheduleExplorerLoadingDecorations();
+    this.scheduleNotePresenceUiRefresh();
+  }
+
+  private applyNotePresenceUpdate(workspaceId: string, payload: unknown): void {
+    const update = extractNotePresenceUpdatedPayload(payload);
+    if (!update || update.workspaceId !== workspaceId) {
+      return;
+    }
+
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    if (update.viewers.length === 0) {
+      runtime.notePresenceByEntryId.delete(update.entryId);
+    } else {
+      runtime.notePresenceByEntryId.set(update.entryId, update.viewers);
+    }
+
+    this.scheduleExplorerLoadingDecorations();
+    this.scheduleNotePresenceUiRefresh();
   }
 
   private getBinaryTransfersForWorkspace(workspaceId: string): BinaryTransferState[] {
@@ -6239,6 +6538,82 @@ function extractAdminRoomMembersPayload(
   };
 }
 
+function extractNotePresenceSnapshotPayload(payload: unknown): NotePresenceSnapshotPayload | null {
+  if (!isRecord(payload) || typeof payload.workspaceId !== "string" || !Array.isArray(payload.notes)) {
+    return null;
+  }
+
+  const notes = payload.notes
+    .map((note) => extractNotePresenceSnapshotNote(note))
+    .filter((note): note is NotePresenceSnapshotPayload["notes"][number] => note !== null);
+
+  return {
+    workspaceId: payload.workspaceId,
+    notes
+  };
+}
+
+function extractNotePresenceUpdatedPayload(payload: unknown): NotePresenceUpdatedPayload | null {
+  if (
+    !isRecord(payload) ||
+    typeof payload.workspaceId !== "string" ||
+    typeof payload.entryId !== "string" ||
+    !Array.isArray(payload.viewers)
+  ) {
+    return null;
+  }
+
+  const viewers = payload.viewers
+    .map((viewer) => extractNotePresenceViewer(viewer))
+    .filter((viewer): viewer is NotePresenceViewer => viewer !== null)
+    .sort(compareNotePresenceViewers);
+
+  return {
+    workspaceId: payload.workspaceId,
+    entryId: payload.entryId,
+    viewers
+  };
+}
+
+function extractNotePresenceSnapshotNote(
+  payload: unknown
+): NotePresenceSnapshotPayload["notes"][number] | null {
+  if (!isRecord(payload) || typeof payload.entryId !== "string" || !Array.isArray(payload.viewers)) {
+    return null;
+  }
+
+  const viewers = payload.viewers
+    .map((viewer) => extractNotePresenceViewer(viewer))
+    .filter((viewer): viewer is NotePresenceViewer => viewer !== null)
+    .sort(compareNotePresenceViewers);
+
+  return {
+    entryId: payload.entryId,
+    viewers
+  };
+}
+
+function extractNotePresenceViewer(payload: unknown): NotePresenceViewer | null {
+  if (
+    !isRecord(payload) ||
+    typeof payload.presenceId !== "string" ||
+    typeof payload.userId !== "string" ||
+    typeof payload.displayName !== "string" ||
+    typeof payload.color !== "string" ||
+    typeof payload.hasSelection !== "boolean"
+  ) {
+    return null;
+  }
+
+  return {
+    presenceId: payload.presenceId,
+    userId: payload.userId,
+    displayName: payload.displayName,
+    color: payload.color,
+    hasSelection: payload.hasSelection
+  };
+}
+
 function extractRoomMember(payload: unknown): RoomMember | null {
   if (!isRecord(payload)) {
     return null;
@@ -6306,6 +6681,15 @@ function compareRoomMembers(left: RoomMember, right: RoomMember): number {
   }
 
   return left.user.username.localeCompare(right.user.username);
+}
+
+function compareNotePresenceViewers(left: NotePresenceViewer, right: NotePresenceViewer): number {
+  const displayNameComparison = left.displayName.localeCompare(right.displayName);
+  if (displayNameComparison !== 0) {
+    return displayNameComparison;
+  }
+
+  return left.presenceId.localeCompare(right.presenceId);
 }
 
 function normalizeBootstrapState(encodedState: string): Uint8Array {

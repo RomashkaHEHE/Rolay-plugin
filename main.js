@@ -12674,6 +12674,7 @@ var CrdtSessionManager = class {
     this.apiClient = config.apiClient;
     this.getCurrentUser = config.getCurrentUser;
     this.getPresenceColor = config.getPresenceColor;
+    this.resolveWorkspaceIdByLocalPath = config.resolveWorkspaceIdByLocalPath;
     this.isLiveSyncEnabledForLocalPath = config.isLiveSyncEnabledForLocalPath;
     this.getPersistedCrdtState = config.getPersistedCrdtState;
     this.persistCrdtState = config.persistCrdtState;
@@ -12828,11 +12829,17 @@ var CrdtSessionManager = class {
       return;
     }
     this.log(`Opening CRDT session for ${file.path}.`);
+    const workspaceId = this.resolveWorkspaceIdByLocalPath(file.path);
+    if (!workspaceId) {
+      this.log(`Skipping CRDT session for ${file.path} because no room workspace could be resolved.`);
+      return;
+    }
     const bootstrap = await this.apiClient.createCrdtToken(entry.id);
     const session = new BoundCrdtSession(
       this.app,
       file,
       entry,
+      workspaceId,
       currentUser,
       this.getPresenceColor(),
       bootstrap.docId,
@@ -12851,10 +12858,15 @@ var CrdtSessionManager = class {
     if (!currentUser) {
       return;
     }
+    const workspaceId = this.resolveWorkspaceIdByLocalPath(file.path);
+    if (!workspaceId) {
+      return;
+    }
     const session = new BoundCrdtSession(
       this.app,
       file,
       entry,
+      workspaceId,
       currentUser,
       this.getPresenceColor(),
       entry.id,
@@ -12889,7 +12901,7 @@ var CrdtSessionManager = class {
   }
 };
 var BoundCrdtSession = class {
-  constructor(app, file, entry, currentUser, presenceColor, docId, wsUrl, token, log, persistCrdtState, initialState = null) {
+  constructor(app, file, entry, workspaceId, currentUser, presenceColor, docId, wsUrl, token, log, persistCrdtState, initialState = null) {
     this.yDocument = new Doc();
     this.provider = null;
     this.status = "idle";
@@ -12901,6 +12913,7 @@ var BoundCrdtSession = class {
     this.app = app;
     this.file = file;
     this.entry = entry;
+    this.workspaceId = workspaceId;
     this.currentUser = currentUser;
     this.docId = docId;
     this.wsUrl = wsUrl;
@@ -12908,6 +12921,7 @@ var BoundCrdtSession = class {
     this.log = log;
     this.persistCrdtState = persistCrdtState;
     this.awarenessUser = buildAwarenessUserPayload(currentUser, presenceColor);
+    this.awarenessViewer = buildAwarenessViewerPayload(workspaceId, entry.id);
     this.yText = this.yDocument.getText("content");
     if (initialState && initialState.byteLength > 0) {
       applyUpdate(this.yDocument, initialState, "rolay-local-bootstrap");
@@ -12961,6 +12975,7 @@ var BoundCrdtSession = class {
       }
     });
     this.publishLocalUserPresence();
+    this.publishLocalViewerPresence();
   }
   async openOffline() {
     this.bindRemoteObserver();
@@ -13122,12 +13137,22 @@ var BoundCrdtSession = class {
   publishLocalUserPresence() {
     this.provider?.setAwarenessField("user", this.awarenessUser);
   }
-  clearLocalPresence() {
+  publishLocalViewerPresence() {
+    this.provider?.setAwarenessField("viewer", this.awarenessViewer);
+  }
+  clearLocalSelectionPresence() {
     if (!this.provider) {
       return;
     }
     this.provider.setAwarenessField("selection", null);
     this.lastLocalSelectionKey = null;
+  }
+  clearLocalPresence() {
+    if (!this.provider) {
+      return;
+    }
+    this.provider.setAwarenessField("viewer", null);
+    this.clearLocalSelectionPresence();
   }
   schedulePersistedState() {
     if (this.persistHandle !== null) {
@@ -13148,12 +13173,12 @@ var BoundCrdtSession = class {
   updateLocalPresenceFromActiveView() {
     const view = this.app.workspace.getActiveViewOfType(import_obsidian5.MarkdownView);
     if (!view?.file || view.file.path !== this.file.path) {
-      this.clearLocalPresence();
+      this.clearLocalSelectionPresence();
       return;
     }
     const editorView = getCodeMirrorEditorView(view.editor);
     if (!editorView) {
-      this.clearLocalPresence();
+      this.clearLocalSelectionPresence();
       return;
     }
     this.updateLocalPresence(view.editor, editorView.hasFocus);
@@ -13192,6 +13217,13 @@ function buildAwarenessUserPayload(user, presenceColor) {
     userId: user.id,
     displayName: user.displayName || user.username,
     color: presenceColor || buildPresenceColor(user.id)
+  };
+}
+function buildAwarenessViewerPayload(workspaceId, entryId) {
+  return {
+    workspaceId,
+    entryId,
+    active: true
   };
 }
 function buildPresenceColor(seed) {
@@ -15722,6 +15754,225 @@ async function openNodeRequest2(urlString, accessToken, lastEventId, signal, nod
   });
 }
 
+// src/sync/note-presence-stream.ts
+var NotePresenceEventStream = class {
+  constructor(apiClient, log) {
+    this.abortController = null;
+    this.stopped = true;
+    this.reconnectAttempt = 0;
+    this.reconnectHandle = null;
+    this.workspaceId = null;
+    this.handlers = null;
+    this.apiClient = apiClient;
+    this.log = log;
+  }
+  start(workspaceId, handlers) {
+    this.stop();
+    this.workspaceId = workspaceId;
+    this.handlers = handlers;
+    this.stopped = false;
+    void this.connect();
+  }
+  stop() {
+    this.stopped = true;
+    this.workspaceId = null;
+    this.handlers?.onStatusChange?.("stopped");
+    this.abortController?.abort();
+    this.abortController = null;
+    if (this.reconnectHandle !== null) {
+      window.clearTimeout(this.reconnectHandle);
+      this.reconnectHandle = null;
+    }
+  }
+  async connect() {
+    if (this.stopped || !this.workspaceId || !this.handlers) {
+      return;
+    }
+    this.handlers.onStatusChange?.(this.reconnectAttempt === 0 ? "connecting" : "reconnecting");
+    this.abortController = new AbortController();
+    try {
+      const response = await this.openAuthorizedStream(this.workspaceId, this.abortController.signal);
+      this.reconnectAttempt = 0;
+      this.handlers.onStatusChange?.("open");
+      this.handlers.onOpen?.();
+      await this.consumeStream(response, this.abortController.signal);
+      if (!this.stopped) {
+        this.scheduleReconnect();
+      }
+    } catch (error) {
+      if (this.stopped || isAbortError3(error)) {
+        return;
+      }
+      const normalizedError = error instanceof Error ? error : new Error(String(error));
+      this.handlers.onStatusChange?.("error");
+      this.handlers.onError?.(normalizedError);
+      this.scheduleReconnect();
+    }
+  }
+  async consumeStream(response, signal) {
+    const parser = createParser({
+      onEvent: (message) => {
+        void this.handleMessage(message);
+      }
+    });
+    if (isNodeResponse3(response)) {
+      response.setEncoding("utf8");
+      await new Promise((resolve, reject) => {
+        const abortHandler = () => {
+          reject(createAbortError4());
+        };
+        signal.addEventListener("abort", abortHandler, { once: true });
+        response.on("data", (chunk) => {
+          parser.feed(chunk);
+        });
+        response.on("end", () => {
+          signal.removeEventListener("abort", abortHandler);
+          resolve();
+        });
+        response.on("error", (error) => {
+          signal.removeEventListener("abort", abortHandler);
+          reject(error);
+        });
+      });
+      return;
+    }
+    if (!response.body) {
+      throw new Error("Note presence SSE response body is empty.");
+    }
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    while (!this.stopped) {
+      const { done, value } = await reader.read();
+      if (done) {
+        break;
+      }
+      parser.feed(decoder.decode(value, { stream: true }));
+    }
+  }
+  async handleMessage(message) {
+    if (!message.event || !message.data) {
+      return;
+    }
+    let data;
+    try {
+      data = JSON.parse(message.data);
+    } catch {
+      data = message.data;
+    }
+    await this.handlers?.onEvent?.({
+      id: 0,
+      event: message.event,
+      data
+    });
+  }
+  scheduleReconnect() {
+    if (this.stopped) {
+      return;
+    }
+    this.reconnectAttempt += 1;
+    const delay = Math.min(3e4, 1e3 * 2 ** Math.min(this.reconnectAttempt, 5));
+    this.log(`Note presence SSE disconnected. Reconnecting in ${delay}ms.`);
+    this.handlers?.onStatusChange?.("reconnecting");
+    this.reconnectHandle = window.setTimeout(() => {
+      this.reconnectHandle = null;
+      void this.connect();
+    }, delay);
+  }
+  async openAuthorizedStream(workspaceId, signal) {
+    const accessToken = await this.apiClient.getValidAccessToken();
+    let response = await this.openStream(workspaceId, accessToken, signal);
+    if (getResponseStatus3(response) === 401) {
+      await this.apiClient.refresh();
+      const refreshedToken = await this.apiClient.getValidAccessToken();
+      response = await this.openStream(workspaceId, refreshedToken, signal);
+    }
+    const status = getResponseStatus3(response);
+    if (status >= 400) {
+      throw new Error(`Note presence SSE request failed with HTTP ${status}.`);
+    }
+    return response;
+  }
+  async openStream(workspaceId, accessToken, signal) {
+    const url = this.apiClient.buildAbsoluteUrl(
+      `/v1/workspaces/${encodeURIComponent(workspaceId)}/note-presence/events`
+    );
+    const nodeRequire = getNodeRequire5();
+    if (nodeRequire) {
+      return openNodeRequest3(url, accessToken, signal, nodeRequire);
+    }
+    return fetch(url, {
+      method: "GET",
+      headers: {
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${accessToken}`
+      },
+      signal
+    });
+  }
+};
+function isAbortError3(error) {
+  return error instanceof DOMException && error.name === "AbortError" || error instanceof Error && error.name === "AbortError";
+}
+function isNodeResponse3(response) {
+  return typeof response.setEncoding === "function";
+}
+function getResponseStatus3(response) {
+  return isNodeResponse3(response) ? response.statusCode ?? 0 : response.status;
+}
+function createAbortError4() {
+  const error = new Error("The operation was aborted.");
+  error.name = "AbortError";
+  return error;
+}
+function getNodeRequire5() {
+  const candidate = globalThis.require ?? globalThis.window?.require;
+  if (typeof candidate === "function") {
+    return candidate;
+  }
+  try {
+    return Function("return typeof require === 'function' ? require : undefined;")() ?? null;
+  } catch {
+    return null;
+  }
+}
+async function openNodeRequest3(urlString, accessToken, signal, nodeRequire) {
+  const url = new URL(urlString);
+  const requestModule = url.protocol === "https:" ? nodeRequire("node:https") : nodeRequire("node:http");
+  return new Promise((resolve, reject) => {
+    const options = {
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port ? Number(url.port) : void 0,
+      path: `${url.pathname}${url.search}`,
+      method: "GET",
+      headers: {
+        Accept: "text/event-stream",
+        Authorization: `Bearer ${accessToken}`
+      }
+    };
+    const request = requestModule.request(options, (response) => {
+      cleanup();
+      resolve(response);
+    });
+    const abortHandler = () => {
+      request.destroy(createAbortError4());
+      cleanup();
+      reject(createAbortError4());
+    };
+    const errorHandler = (error) => {
+      cleanup();
+      reject(error);
+    };
+    const cleanup = () => {
+      signal.removeEventListener("abort", abortHandler);
+      request.removeListener("error", errorHandler);
+    };
+    signal.addEventListener("abort", abortHandler, { once: true });
+    request.on("error", errorHandler);
+    request.end();
+  });
+}
+
 // src/sync/tree-store.ts
 var TreeStore = class {
   constructor() {
@@ -15830,6 +16081,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.pendingRemoteMarkdownSettles = /* @__PURE__ */ new Map();
     this.persistHandle = null;
     this.explorerDecorationHandle = null;
+    this.notePresenceUiHandle = null;
     this.roomList = [];
     this.adminRoomList = [];
     this.managedUsers = [];
@@ -15887,6 +16139,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       apiClient: this.apiClient,
       getCurrentUser: () => this.getCurrentUser(),
       getPresenceColor: () => this.getPresenceColor(),
+      resolveWorkspaceIdByLocalPath: (localPath) => this.resolveDownloadedRoomByLocalPath(localPath)?.workspaceId ?? null,
       isLiveSyncEnabledForLocalPath: (localPath) => this.isLiveSyncEnabledForLocalPath(localPath),
       getPersistedCrdtState: (entryId) => this.getPersistedCrdtState(entryId),
       persistCrdtState: (entryId, filePath, state) => this.persistCrdtState(entryId, filePath, state),
@@ -15947,6 +16200,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.registerEvent(
       this.app.workspace.on("layout-change", () => {
         this.scheduleExplorerLoadingDecorations();
+        this.scheduleNotePresenceUiRefresh();
       })
     );
     this.registerEvent(
@@ -15976,6 +16230,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       }
       if (this.explorerDecorationHandle !== null) {
         window.clearTimeout(this.explorerDecorationHandle);
+      }
+      if (this.notePresenceUiHandle !== null) {
+        window.clearTimeout(this.notePresenceUiHandle);
       }
       if (this.logFlushHandle !== null) {
         window.clearTimeout(this.logFlushHandle);
@@ -16897,6 +17154,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         runtime.streamStatus = status;
         this.updateStatusBar();
         this.scheduleExplorerLoadingDecorations();
+        this.scheduleNotePresenceUiRefresh();
       },
       onError: (error) => {
         if (runtime.eventStreamGeneration !== generation) {
@@ -16905,6 +17163,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         this.handleError(`Workspace event stream error (${room.workspace.id})`, error, false);
       }
     });
+    this.startRoomNotePresenceStream(room.workspace.id);
   }
   stopRoomEventStream(workspaceId) {
     const runtime = this.roomRuntime.get(workspaceId);
@@ -16922,15 +17181,68 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     runtime.eventStreamGeneration += 1;
     runtime.eventStream?.stop();
     runtime.eventStream = null;
+    this.stopRoomNotePresenceStream(workspaceId);
     runtime.streamStatus = "stopped";
     runtime.lastHandledEventId = runtime.treeStore.getCursor();
     this.updateStatusBar();
     this.scheduleExplorerLoadingDecorations();
+    this.scheduleNotePresenceUiRefresh();
   }
   stopAllRoomEventStreams() {
     for (const workspaceId of this.roomRuntime.keys()) {
       this.stopRoomEventStream(workspaceId);
     }
+  }
+  startRoomNotePresenceStream(workspaceId) {
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    this.stopRoomNotePresenceStream(workspaceId);
+    const generation = runtime.notePresenceStreamGeneration + 1;
+    runtime.notePresenceStreamGeneration = generation;
+    const stream = new NotePresenceEventStream(this.apiClient, (message) => {
+      this.recordLog("presence", `[${workspaceId}] ${message}`);
+    });
+    runtime.notePresenceStream = stream;
+    stream.start(workspaceId, {
+      onOpen: () => {
+        if (runtime.notePresenceStreamGeneration !== generation) {
+          return;
+        }
+        this.recordLog("presence", `Subscribed to note presence for room ${workspaceId}.`);
+      },
+      onEvent: async (event) => {
+        if (runtime.notePresenceStreamGeneration !== generation) {
+          return;
+        }
+        if (event.event === "ping") {
+          return;
+        }
+        if (event.event === "presence.snapshot") {
+          this.applyNotePresenceSnapshot(workspaceId, event.data);
+          return;
+        }
+        if (event.event === "note.presence.updated") {
+          this.applyNotePresenceUpdate(workspaceId, event.data);
+        }
+      },
+      onError: (error) => {
+        if (runtime.notePresenceStreamGeneration !== generation) {
+          return;
+        }
+        this.handleError(`Note presence stream error (${workspaceId})`, error, false);
+      }
+    });
+  }
+  stopRoomNotePresenceStream(workspaceId) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return;
+    }
+    runtime.notePresenceStreamGeneration += 1;
+    runtime.notePresenceStream?.stop();
+    runtime.notePresenceStream = null;
+    runtime.notePresenceByEntryId.clear();
+    this.scheduleExplorerLoadingDecorations();
+    this.scheduleNotePresenceUiRefresh();
   }
   startSettingsEventStream(cursor) {
     this.stopSettingsEventStream();
@@ -17153,6 +17465,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
     await this.syncMarkdownLockForLocalPath(file?.path ?? null);
     this.updateStatusBar();
+    this.scheduleNotePresenceUiRefresh();
+    this.scheduleExplorerLoadingDecorations();
   }
   async handleVaultCreate(file) {
     try {
@@ -17512,6 +17826,9 @@ ${keptTail}`;
       treeStore: new TreeStore(),
       eventStream: null,
       eventStreamGeneration: 0,
+      notePresenceStream: null,
+      notePresenceStreamGeneration: 0,
+      notePresenceByEntryId: /* @__PURE__ */ new Map(),
       streamStatus: "stopped",
       lastHandledEventId: null,
       snapshotRefreshHandle: null,
@@ -17670,6 +17987,24 @@ ${keptTail}`;
       this.refreshExplorerLoadingDecorations();
     }, 80);
   }
+  scheduleNotePresenceUiRefresh() {
+    if (this.notePresenceUiHandle !== null) {
+      return;
+    }
+    this.notePresenceUiHandle = window.setTimeout(() => {
+      this.notePresenceUiHandle = null;
+      this.refreshNotePresenceUi();
+    }, 80);
+  }
+  refreshNotePresenceUi() {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (!(view instanceof import_obsidian9.MarkdownView)) {
+        continue;
+      }
+      this.renderNotePresenceChipsForView(view);
+    }
+  }
   refreshExplorerLoadingDecorations() {
     const container = this.app.workspace.containerEl;
     if (!container) {
@@ -17678,6 +18013,7 @@ ${keptTail}`;
     const loadingPaths = this.getLoadingExplorerPaths();
     const uploadingPaths = this.getUploadingExplorerPaths();
     const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
+    const notePresenceBadges = this.getExplorerNotePresenceBadges();
     const pathElements = container.querySelectorAll("[data-path]");
     for (const element2 of pathElements) {
       element2.classList.remove(
@@ -17726,7 +18062,97 @@ ${keptTail}`;
           element2.classList.add("rolay-room-folder-connecting");
         }
       }
+      this.updateExplorerNotePresenceBadge(
+        element2,
+        notePresenceBadges.get(normalizedPath) ?? null
+      );
     }
+  }
+  renderNotePresenceChipsForView(view) {
+    const file = view.file;
+    const host = this.findNotePresenceHost(view);
+    if (!host) {
+      this.removeNotePresenceBar(view);
+      return;
+    }
+    const presence = file ? this.getNotePresenceForLocalPath(file.path) : [];
+    if (presence.length === 0) {
+      this.removeNotePresenceBar(view);
+      return;
+    }
+    let bar = view.containerEl.querySelector(".rolay-note-presence-bar");
+    if (!bar) {
+      bar = document.createElement("div");
+      bar.className = "rolay-note-presence-bar";
+      host.parentElement?.insertBefore(bar, host);
+    }
+    const signature = presence.map((viewer) => `${viewer.presenceId}:${viewer.displayName}:${viewer.color}`).join("|");
+    if (bar.dataset.signature === signature) {
+      return;
+    }
+    bar.dataset.signature = signature;
+    bar.replaceChildren(
+      ...presence.map((viewer) => {
+        const chip = document.createElement("span");
+        chip.className = "rolay-note-presence-chip";
+        chip.textContent = viewer.displayName;
+        chip.style.setProperty("--rolay-note-presence-color", viewer.color);
+        return chip;
+      })
+    );
+  }
+  removeNotePresenceBar(view) {
+    view.containerEl.querySelector(".rolay-note-presence-bar")?.remove();
+  }
+  findNotePresenceHost(view) {
+    const container = view.containerEl;
+    return container.querySelector(".inline-title") ?? container.querySelector(".view-content .inline-title");
+  }
+  getExplorerNotePresenceBadges() {
+    const badges = /* @__PURE__ */ new Map();
+    for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
+      for (const [entryId, viewers] of runtime.notePresenceByEntryId.entries()) {
+        if (viewers.length === 0) {
+          continue;
+        }
+        const entry = runtime.treeStore.getEntryById(entryId);
+        if (!entry || entry.deleted || entry.kind !== "markdown") {
+          continue;
+        }
+        const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path);
+        if (!localPath) {
+          continue;
+        }
+        badges.set((0, import_obsidian9.normalizePath)(localPath), {
+          count: viewers.length,
+          color: viewers.length === 1 ? viewers[0].color : "var(--interactive-accent, #8b5cf6)"
+        });
+      }
+    }
+    return badges;
+  }
+  updateExplorerNotePresenceBadge(element2, badgeState) {
+    const titleHost = this.findExplorerTitleHost(element2);
+    if (!titleHost) {
+      return;
+    }
+    let badge = titleHost.querySelector(".rolay-note-presence-badge");
+    if (!badgeState) {
+      badge?.remove();
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "rolay-note-presence-badge";
+      titleHost.appendChild(badge);
+    }
+    badge.style.setProperty("--rolay-note-presence-badge-color", badgeState.color);
+    badge.textContent = badgeState.count <= 1 ? "" : String(badgeState.count);
+    badge.classList.toggle("rolay-note-presence-badge-multi", badgeState.count > 1);
+    badge.setAttribute("aria-label", badgeState.count <= 1 ? "1 viewer" : `${badgeState.count} viewers`);
+  }
+  findExplorerTitleHost(element2) {
+    return element2.querySelector(".nav-file-title-content") ?? element2.querySelector(".tree-item-inner");
   }
   getLoadingExplorerPaths() {
     const loadingPaths = /* @__PURE__ */ new Set();
@@ -17779,6 +18205,55 @@ ${keptTail}`;
       );
     }
     return statuses;
+  }
+  getNotePresenceForLocalPath(localPath) {
+    const room = this.resolveDownloadedRoomByLocalPath(localPath);
+    if (!room) {
+      return [];
+    }
+    const serverPath = toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName);
+    if (!serverPath) {
+      return [];
+    }
+    const entry = this.getRoomStore(room.workspaceId)?.getEntryByPath(serverPath);
+    if (!entry || entry.deleted || entry.kind !== "markdown") {
+      return [];
+    }
+    return this.getNotePresenceForEntry(room.workspaceId, entry.id);
+  }
+  getNotePresenceForEntry(workspaceId, entryId) {
+    const viewers = this.roomRuntime.get(workspaceId)?.notePresenceByEntryId.get(entryId) ?? [];
+    return [...viewers];
+  }
+  applyNotePresenceSnapshot(workspaceId, payload) {
+    const snapshot = extractNotePresenceSnapshotPayload(payload);
+    if (!snapshot || snapshot.workspaceId !== workspaceId) {
+      return;
+    }
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    runtime.notePresenceByEntryId.clear();
+    for (const note of snapshot.notes) {
+      if (note.viewers.length === 0) {
+        continue;
+      }
+      runtime.notePresenceByEntryId.set(note.entryId, note.viewers);
+    }
+    this.scheduleExplorerLoadingDecorations();
+    this.scheduleNotePresenceUiRefresh();
+  }
+  applyNotePresenceUpdate(workspaceId, payload) {
+    const update = extractNotePresenceUpdatedPayload(payload);
+    if (!update || update.workspaceId !== workspaceId) {
+      return;
+    }
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    if (update.viewers.length === 0) {
+      runtime.notePresenceByEntryId.delete(update.entryId);
+    } else {
+      runtime.notePresenceByEntryId.set(update.entryId, update.viewers);
+    }
+    this.scheduleExplorerLoadingDecorations();
+    this.scheduleNotePresenceUiRefresh();
   }
   getBinaryTransfersForWorkspace(workspaceId) {
     return [...this.binaryTransferState.values()].filter((transfer) => transfer.workspaceId === workspaceId);
@@ -20707,6 +21182,49 @@ function extractAdminRoomMembersPayload(payload) {
     members
   };
 }
+function extractNotePresenceSnapshotPayload(payload) {
+  if (!isRecord2(payload) || typeof payload.workspaceId !== "string" || !Array.isArray(payload.notes)) {
+    return null;
+  }
+  const notes = payload.notes.map((note) => extractNotePresenceSnapshotNote(note)).filter((note) => note !== null);
+  return {
+    workspaceId: payload.workspaceId,
+    notes
+  };
+}
+function extractNotePresenceUpdatedPayload(payload) {
+  if (!isRecord2(payload) || typeof payload.workspaceId !== "string" || typeof payload.entryId !== "string" || !Array.isArray(payload.viewers)) {
+    return null;
+  }
+  const viewers = payload.viewers.map((viewer) => extractNotePresenceViewer(viewer)).filter((viewer) => viewer !== null).sort(compareNotePresenceViewers);
+  return {
+    workspaceId: payload.workspaceId,
+    entryId: payload.entryId,
+    viewers
+  };
+}
+function extractNotePresenceSnapshotNote(payload) {
+  if (!isRecord2(payload) || typeof payload.entryId !== "string" || !Array.isArray(payload.viewers)) {
+    return null;
+  }
+  const viewers = payload.viewers.map((viewer) => extractNotePresenceViewer(viewer)).filter((viewer) => viewer !== null).sort(compareNotePresenceViewers);
+  return {
+    entryId: payload.entryId,
+    viewers
+  };
+}
+function extractNotePresenceViewer(payload) {
+  if (!isRecord2(payload) || typeof payload.presenceId !== "string" || typeof payload.userId !== "string" || typeof payload.displayName !== "string" || typeof payload.color !== "string" || typeof payload.hasSelection !== "boolean") {
+    return null;
+  }
+  return {
+    presenceId: payload.presenceId,
+    userId: payload.userId,
+    displayName: payload.displayName,
+    color: payload.color,
+    hasSelection: payload.hasSelection
+  };
+}
 function extractRoomMember(payload) {
   if (!isRecord2(payload)) {
     return null;
@@ -20755,6 +21273,13 @@ function compareRoomMembers(left, right) {
     return left.role === "owner" ? -1 : 1;
   }
   return left.user.username.localeCompare(right.user.username);
+}
+function compareNotePresenceViewers(left, right) {
+  const displayNameComparison = left.displayName.localeCompare(right.displayName);
+  if (displayNameComparison !== 0) {
+    return displayNameComparison;
+  }
+  return left.presenceId.localeCompare(right.presenceId);
 }
 function normalizeBootstrapState(encodedState) {
   const decodedState = decodeBase64(encodedState);

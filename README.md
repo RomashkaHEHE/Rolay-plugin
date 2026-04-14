@@ -20,6 +20,7 @@ The current MVP is built against the live Rolay `v1` contract and now follows th
 - admin-only room list, member inspection, add-user-to-room, and room deletion
 - separate in-settings admin tab that appears only for logged-in admins
 - settings/admin live updates through `GET /v1/events/settings`
+- room-level markdown note presence through `GET /v1/workspaces/{workspaceId}/note-presence/events`
 - CRDT bootstrap for markdown files through `crdt-token` and Yjs/Hocuspocus
 - room-level markdown bootstrap through `POST /v1/workspaces/{workspaceId}/markdown/bootstrap`
 - binary/blob sync for every non-markdown file through upload/download tickets and `commit_blob_revision`
@@ -34,6 +35,7 @@ The plugin treats Rolay as a layered sync system:
 - Markdown cold-start/bootstrap now uses `POST /v1/workspaces/{workspaceId}/markdown/bootstrap`
 - Markdown realtime still uses `POST /v1/files/{entryId}/crdt-token`
 - Settings/admin live UI updates use `GET /v1/events/settings`
+- Room-level note presence for markdown viewer chips and explorer badges uses `GET /v1/workspaces/{workspaceId}/note-presence/events`
 - Password change lives under `PATCH /v1/auth/me/password` and rotates the active session
 
 Important product rules reflected in the plugin:
@@ -67,6 +69,8 @@ Start here when entering the project without chat history:
   Expected conflict behavior for markdown, tree operations, and binary blobs.
 - [docs/debug-playbook.md](docs/debug-playbook.md)
   Fast triage guide for the most common sync failures and where to inspect them in code.
+- [docs/roadmap.md](docs/roadmap.md)
+  Short list of the next substantial product/architecture steps, including resumable file transfer work.
 
 ## Development
 
@@ -162,6 +166,7 @@ Tag note:
 - If a locally created offline markdown note collides with a server path on reconnect, the plugin keeps both by renaming the local file to the next free name such as `file(1).md` before retrying the create.
 - When a markdown file with existing local text is created or moved into a room, the plugin now turns that text into a reusable Yjs update, persists it locally, and retries CRDT merge until the remote document has absorbed it. This avoids the old "empty file first, content only after reopen" race.
 - Non-markdown local creates and modifications now upload through `create_binary_placeholder -> upload-ticket -> PUT /v1/files/{entryId}/blob/uploads/{uploadId}/content -> commit_blob_revision`, with byte-based room progress and cancel support. Blob hashes are normalized to canonical `sha256:<base64>`, while legacy hex hashes are still accepted on read. The legacy raw `upload.url` is kept only as a fallback, not the main path.
+- Current binary crash recovery is replay-based, not yet true byte-offset resume: after restart the plugin can retry pending uploads/downloads from authoritative state, but resumable transfer sessions are future work and tracked in [docs/roadmap.md](docs/roadmap.md).
 - If a local binary file conflicts with an already existing remote path or with a newer incoming blob revision, the plugin renames the local file to the next free Explorer-style filename such as `file(1).pdf` so both copies survive.
 - Admin account creation currently supports `writer` and `reader` global roles.
 - Session credentials are still stored in Obsidian plugin data for MVP speed. Hardening storage is future work.

@@ -26,6 +26,7 @@ interface CrdtSessionManagerConfig {
   apiClient: RolayApiClient;
   getCurrentUser: () => User | null;
   getPresenceColor: () => string | null;
+  resolveWorkspaceIdByLocalPath: (localPath: string) => string | null;
   isLiveSyncEnabledForLocalPath: (localPath: string) => boolean;
   getPersistedCrdtState: (entryId: string) => Uint8Array | null;
   persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void;
@@ -38,6 +39,7 @@ export class CrdtSessionManager {
   private readonly apiClient: RolayApiClient;
   private readonly getCurrentUser: () => User | null;
   private readonly getPresenceColor: () => string | null;
+  private readonly resolveWorkspaceIdByLocalPath: (localPath: string) => string | null;
   private readonly isLiveSyncEnabledForLocalPath: (localPath: string) => boolean;
   private readonly getPersistedCrdtState: (entryId: string) => Uint8Array | null;
   private readonly persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void;
@@ -52,6 +54,7 @@ export class CrdtSessionManager {
     this.apiClient = config.apiClient;
     this.getCurrentUser = config.getCurrentUser;
     this.getPresenceColor = config.getPresenceColor;
+    this.resolveWorkspaceIdByLocalPath = config.resolveWorkspaceIdByLocalPath;
     this.isLiveSyncEnabledForLocalPath = config.isLiveSyncEnabledForLocalPath;
     this.getPersistedCrdtState = config.getPersistedCrdtState;
     this.persistCrdtState = config.persistCrdtState;
@@ -244,11 +247,18 @@ export class CrdtSessionManager {
 
     this.log(`Opening CRDT session for ${file.path}.`);
 
+    const workspaceId = this.resolveWorkspaceIdByLocalPath(file.path);
+    if (!workspaceId) {
+      this.log(`Skipping CRDT session for ${file.path} because no room workspace could be resolved.`);
+      return;
+    }
+
     const bootstrap = await this.apiClient.createCrdtToken(entry.id);
     const session = new BoundCrdtSession(
       this.app,
       file,
       entry,
+      workspaceId,
       currentUser,
       this.getPresenceColor(),
       bootstrap.docId,
@@ -270,10 +280,16 @@ export class CrdtSessionManager {
       return;
     }
 
+    const workspaceId = this.resolveWorkspaceIdByLocalPath(file.path);
+    if (!workspaceId) {
+      return;
+    }
+
     const session = new BoundCrdtSession(
       this.app,
       file,
       entry,
+      workspaceId,
       currentUser,
       this.getPresenceColor(),
       entry.id,
@@ -318,6 +334,12 @@ interface AwarenessUserPayload {
   color: string;
 }
 
+interface AwarenessViewerPayload {
+  workspaceId: string;
+  entryId: string;
+  active: boolean;
+}
+
 interface AwarenessSelectionPayload {
   anchor: number;
   head: number;
@@ -326,6 +348,7 @@ interface AwarenessSelectionPayload {
 class BoundCrdtSession {
   readonly file: TFile;
   readonly entry: FileEntry;
+  readonly workspaceId: string;
 
   private readonly app: App;
   private readonly currentUser: User;
@@ -335,6 +358,7 @@ class BoundCrdtSession {
   private readonly wsUrl: string | null;
   private readonly token: string | (() => Promise<string>) | null;
   private awarenessUser: AwarenessUserPayload;
+  private readonly awarenessViewer: AwarenessViewerPayload;
   private readonly yDocument = new Y.Doc();
   private readonly yText: Y.Text;
   private provider: HocuspocusProvider | null = null;
@@ -349,6 +373,7 @@ class BoundCrdtSession {
     app: App,
     file: TFile,
     entry: FileEntry,
+    workspaceId: string,
     currentUser: User,
     presenceColor: string | null,
     docId: string,
@@ -361,6 +386,7 @@ class BoundCrdtSession {
     this.app = app;
     this.file = file;
     this.entry = entry;
+    this.workspaceId = workspaceId;
     this.currentUser = currentUser;
     this.docId = docId;
     this.wsUrl = wsUrl;
@@ -368,6 +394,7 @@ class BoundCrdtSession {
     this.log = log;
     this.persistCrdtState = persistCrdtState;
     this.awarenessUser = buildAwarenessUserPayload(currentUser, presenceColor);
+    this.awarenessViewer = buildAwarenessViewerPayload(workspaceId, entry.id);
     this.yText = this.yDocument.getText("content");
     if (initialState && initialState.byteLength > 0) {
       Y.applyUpdate(this.yDocument, initialState, "rolay-local-bootstrap");
@@ -425,6 +452,7 @@ class BoundCrdtSession {
     });
 
     this.publishLocalUserPresence();
+    this.publishLocalViewerPresence();
   }
 
   async openOffline(): Promise<void> {
@@ -623,13 +651,26 @@ class BoundCrdtSession {
     this.provider?.setAwarenessField("user", this.awarenessUser);
   }
 
-  private clearLocalPresence(): void {
+  private publishLocalViewerPresence(): void {
+    this.provider?.setAwarenessField("viewer", this.awarenessViewer);
+  }
+
+  private clearLocalSelectionPresence(): void {
     if (!this.provider) {
       return;
     }
 
     this.provider.setAwarenessField("selection", null);
     this.lastLocalSelectionKey = null;
+  }
+
+  private clearLocalPresence(): void {
+    if (!this.provider) {
+      return;
+    }
+
+    this.provider.setAwarenessField("viewer", null);
+    this.clearLocalSelectionPresence();
   }
 
   private schedulePersistedState(): void {
@@ -655,13 +696,13 @@ class BoundCrdtSession {
   private updateLocalPresenceFromActiveView(): void {
     const view = this.app.workspace.getActiveViewOfType(MarkdownView);
     if (!view?.file || view.file.path !== this.file.path) {
-      this.clearLocalPresence();
+      this.clearLocalSelectionPresence();
       return;
     }
 
     const editorView = getCodeMirrorEditorView(view.editor);
     if (!editorView) {
-      this.clearLocalPresence();
+      this.clearLocalSelectionPresence();
       return;
     }
 
@@ -708,6 +749,14 @@ function buildAwarenessUserPayload(user: User, presenceColor: string | null): Aw
     userId: user.id,
     displayName: user.displayName || user.username,
     color: presenceColor || buildPresenceColor(user.id)
+  };
+}
+
+function buildAwarenessViewerPayload(workspaceId: string, entryId: string): AwarenessViewerPayload {
+  return {
+    workspaceId,
+    entryId,
+    active: true
   };
 }
 

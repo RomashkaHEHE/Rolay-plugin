@@ -23,12 +23,14 @@ The plugin is split into a few strong boundaries:
   One-file-at-a-time markdown CRDT sessions. Owns Yjs/Hocuspocus connection lifecycle, persisted CRDT cache, awareness publishing, editor patching, and offline session behavior.
 - `src/realtime/shared-presence.ts`
   Shared remote cursor/selection rendering for CodeMirror. If the issue is cursor placement, label behavior, selection color, or cursor jitter, start here.
+- `src/sync/note-presence-stream.ts`
+  Room-level markdown note presence SSE. This powers viewer chips above notes and per-note explorer badges without opening every markdown document locally.
 - `src/settings/tab.ts`
   All settings UI and navigation. Rooms view, room detail page, account page, admin page, pagination, room install button, color picker, and tooltips all live here.
 - `src/settings/data.ts`
   Persisted plugin data schema and normalization. This is the place to inspect when the plugin "forgets" state after restart or when older stored data should be migrated safely.
 - `src/sync/*`
-  Tree SSE, settings SSE, tree store, operations queue, and local/server path mapping.
+  Tree SSE, settings SSE, note-presence SSE, tree store, operations queue, and local/server path mapping.
 - `src/types/protocol.ts`
   TypeScript view of the current server contract.
 
@@ -54,7 +56,11 @@ Search here for:
 - `refreshRoomSnapshot`
 - `bootstrapRoomMarkdownCache`
 - `syncBinaryEntriesFromSnapshot`
+- `queueBinaryWrite`
+- `reconcilePendingBinaryWrites`
 - `loadRoomMembersForUi`
+- `applyNotePresenceSnapshot`
+- `applyNotePresenceUpdate`
 - `getRoomCardStates`
 
 ### `src/api/client.ts`
@@ -70,6 +76,20 @@ Search here for:
 - `createBlobDownloadTicket`
 - `downloadBlobFromUrl`
 - `openSettingsEventStream`
+
+### `src/sync/note-presence-stream.ts`
+
+What it does:
+
+- subscribes to room-level markdown note presence SSE
+- keeps reconnect logic separate from tree SSE
+- delivers `presence.snapshot` and `note.presence.updated` events into `main.ts`
+
+Search here for:
+
+- `NotePresenceEventStream`
+- `start`
+- `connect`
 
 ### `src/obsidian/file-bridge.ts`
 
@@ -97,7 +117,7 @@ What it does:
 - keeps offline CRDT cache alive across reconnects
 - pushes local editor text into Yjs
 - patches remote text into open editors
-- publishes awareness `user + selection`
+- publishes awareness `user + viewer + optional selection`
 
 Search here for:
 
@@ -190,6 +210,22 @@ Look at:
 - `SharedCursorWidget`
 - awareness `selection` publication
 
+### "Viewer chips or explorer presence badges are wrong"
+
+Start with:
+
+- [src/main.ts](../src/main.ts)
+- [src/sync/note-presence-stream.ts](../src/sync/note-presence-stream.ts)
+- [src/realtime/crdt-session.ts](../src/realtime/crdt-session.ts)
+
+Look at:
+
+- `applyNotePresenceSnapshot`
+- `applyNotePresenceUpdate`
+- `renderNotePresenceChipsForView`
+- `getExplorerNotePresenceBadges`
+- `publishLocalViewerPresence`
+
 ### "Markdown text only appears after reopening note"
 
 Start with:
@@ -217,6 +253,11 @@ Look at:
 - `ensureBinaryEntryDownloaded`
 - `applyDownloadedBinary`
 - `downloadBlobFromUrl`
+
+Important current constraint:
+
+- persisted `pendingBinaryWrites` let the plugin retry binary uploads after reconnect/restart
+- `BinaryTransferState` itself is still runtime-only, so current crash recovery is replay-based rather than byte-offset resume
 
 ### "Settings/admin UI is stale or weirdly reset"
 

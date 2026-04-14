@@ -379,3 +379,29 @@ export interface SettingsAdminRoomMembersUpdatedPayload {
 }
 
 export type SettingsStreamEvent<TPayload = unknown> = WorkspaceEvent<TPayload>;
+
+export interface NotePresenceViewer {
+  presenceId: string;
+  userId: string;
+  displayName: string;
+  color: string;
+  hasSelection: boolean;
+}
+
+export interface NotePresenceSnapshotNote {
+  entryId: string;
+  viewers: NotePresenceViewer[];
+}
+
+export interface NotePresenceSnapshotPayload {
+  workspaceId: string;
+  notes: NotePresenceSnapshotNote[];
+}
+
+export interface NotePresenceUpdatedPayload {
+  workspaceId: string;
+  entryId: string;
+  viewers: NotePresenceViewer[];
+}
+
+export type NotePresenceStreamEvent<TPayload = unknown> = WorkspaceEvent<TPayload>;

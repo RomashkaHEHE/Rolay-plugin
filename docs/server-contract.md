@@ -14,6 +14,8 @@ Rolay `v1` splits sync into three layers:
    Yjs document synced over Hocuspocus-compatible websocket transport.
 4. Settings/admin realtime
    Dedicated SSE stream for profile, room-list, invite, and admin management UI.
+5. Room note presence
+   Dedicated room-level SSE stream for live markdown viewer presence used by note chips and explorer badges.
 
 Binary content remains blob-based and is addressed by canonical `sha256:<base64>` digests. Legacy hex digests may still appear in older local/plugin state and should be normalized on read.
 
@@ -45,7 +47,9 @@ Expected client order:
    fetch `GET /v1/workspaces/{workspaceId}/tree`
 7. For each downloaded room:
    open `GET /v1/workspaces/{workspaceId}/events?cursor=...`
-8. For opened markdown files inside downloaded room folders:
+8. For each connected/downloaded room:
+   open `GET /v1/workspaces/{workspaceId}/note-presence/events`
+9. For opened markdown files inside downloaded room folders:
    request a `crdt-token` and connect a Yjs provider.
 
 ## REST Endpoints Used By The MVP
@@ -136,6 +140,48 @@ The plugin currently reacts to:
 - `admin.user.deleted`
 - `admin.room.members.updated`
 
+### Room Note Presence Events
+
+- `GET /v1/workspaces/{workspaceId}/note-presence/events`
+- alias: `GET /v1/rooms/{workspaceId}/note-presence/events`
+
+This stream is distinct from both room tree SSE and settings SSE.
+
+Important behavior:
+
+- available to any room member
+- durable resume is not used
+- a new connection starts with `presence.snapshot`
+- incremental updates arrive as `note.presence.updated`
+- `ping` is keepalive only
+- presence is markdown-only
+- presence is keyed by `workspaceId` + `entryId`
+- the same `userId` may appear multiple times via distinct `presenceId` values
+- `selection` is optional; viewer presence still counts without a caret/selection
+
+Snapshot payload:
+
+- `workspaceId`
+- `notes[]`
+  - `entryId`
+  - `viewers[]`
+    - `presenceId`
+    - `userId`
+    - `displayName`
+    - `color`
+    - `hasSelection`
+
+Incremental update payload:
+
+- `workspaceId`
+- `entryId`
+- `viewers[]`
+
+The plugin uses this stream for two UI surfaces:
+
+- viewer chips above the currently opened markdown note
+- per-note presence badges in the file explorer
+
 ### Markdown CRDT Bootstrap
 
 - `POST /v1/workspaces/{workspaceId}/markdown/bootstrap`
@@ -182,6 +228,20 @@ The response provides:
 
 The websocket transport is standard Yjs-compatible transport, not a custom binary protocol. The plugin first fills local CRDT cache via `/markdown/bootstrap`, then still uses `crdt-token` for live collaborative editing.
 
+For server-side note presence aggregation, the plugin now also publishes a `viewer` awareness field:
+
+- `user`
+  - `userId`
+  - `displayName`
+  - `color`
+- `viewer`
+  - `workspaceId`
+  - `entryId`
+  - `active`
+- optional `selection`
+  - `anchor`
+  - `head`
+
 ### Binary Blob Transfer
 
 - `POST /v1/files/{entryId}/blob/upload-ticket`
@@ -218,6 +278,16 @@ Binary download contract:
 3. trust `Content-Length` and `X-Rolay-Blob-Hash` for byte-aware progress and integrity checks
 
 The plugin treats only `.md` as CRDT content. Every other file extension, including `.txt`, uses this blob flow.
+
+Current limitation:
+
+- the contract is sufficient for honest live byte progress
+- the plugin can replay pending uploads/downloads after reconnect or restart
+- but true resumable transfer from a stored byte offset is not part of the current contract yet
+
+Planned follow-up:
+
+- see [roadmap.md](./roadmap.md) and [../info-for-server/FILE_TRANSFER_RESUME_TASK.md](../info-for-server/FILE_TRANSFER_RESUME_TASK.md)
 
 ## Tree Mutation Rules
 

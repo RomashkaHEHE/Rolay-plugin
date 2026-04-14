@@ -38,6 +38,22 @@ Key functions:
 - `setRemotePresenceDecorations`
 - `getPresenceSignature`
 
+### Viewer chips or explorer badges are wrong
+
+Check:
+
+1. `presence/info` and `presence/error` lines in the log
+2. whether room note presence SSE connected successfully
+3. [src/main.ts](../src/main.ts):
+   - `applyNotePresenceSnapshot`
+   - `applyNotePresenceUpdate`
+   - `renderNotePresenceChipsForView`
+   - `getExplorerNotePresenceBadges`
+4. [src/realtime/crdt-session.ts](../src/realtime/crdt-session.ts):
+   - `publishLocalViewerPresence`
+   - `clearLocalPresence`
+5. [src/sync/note-presence-stream.ts](../src/sync/note-presence-stream.ts)
+
 ### Binary file path appears but bytes do not
 
 Check:
@@ -51,6 +67,25 @@ Check:
 4. [src/api/client.ts](../src/api/client.ts):
    - `createBlobDownloadTicket`
    - `downloadBlobFromUrl`
+
+### Binary transfer restarts from zero after app restart
+
+Check:
+
+1. whether the transfer only existed in runtime `BinaryTransferState`
+2. whether `pendingBinaryWrites` in `data.json` still points at the local file
+3. [src/main.ts](../src/main.ts):
+   - `rememberPendingBinaryWrite`
+   - `reconcilePendingBinaryWrites`
+   - `syncBinaryEntriesFromSnapshot`
+
+Current expectation:
+
+- uploads/downloads can be replayed after restart
+- true byte-offset resume is not implemented yet
+- roadmap and required server changes are tracked in:
+  - [roadmap.md](./roadmap.md)
+  - [../info-for-server/FILE_TRANSFER_RESUME_TASK.md](../info-for-server/FILE_TRANSFER_RESUME_TASK.md)
 
 ### Markdown opens but live sync is weird
 
