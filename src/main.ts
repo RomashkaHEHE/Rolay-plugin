@@ -179,6 +179,7 @@ interface PasswordChangeDraft {
 export default class RolayPlugin extends Plugin {
   private static readonly MAX_PERSISTED_CRDT_DOCS = 64;
   private static readonly MAX_PERSISTED_BINARY_ENTRIES = 128;
+  private static readonly ENABLE_BLOB_TRANSFER_TRACE = true;
   private static readonly BINARY_TRANSFER_PARTS_FOLDER = "transfers";
   private static readonly BINARY_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
   private static readonly MAX_BINARY_UPLOAD_OFFSET_RECOVERY_ATTEMPTS = 8;
@@ -288,6 +289,17 @@ export default class RolayPlugin extends Plugin {
       apiClient: this.apiClient,
       getDeviceId: () => this.data.deviceId,
       log: (message) => this.recordLog("ops", message),
+      onTrace: (workspaceId, operation, reason, meta) => {
+        if (operation.type !== "commit_blob_revision") {
+          return;
+        }
+
+        this.traceBlob(
+          `[${workspaceId}] commit_blob_revision entryId=${operation.entryId} hash=${operation.hash} sizeBytes=${operation.sizeBytes} ` +
+          `entryVersion=${operation.preconditions?.entryVersion ?? "?"} path=${operation.preconditions?.path ?? "?"} ` +
+          `reason=${reason} status=${meta.status} requestId=${meta.requestId ?? "-"}`
+        );
+      },
       onAfterApply: (workspaceId) => {
         this.scheduleSnapshotRefresh(workspaceId, "local-op");
       }
@@ -3013,6 +3025,14 @@ export default class RolayPlugin extends Plugin {
     this.persistBinaryTransferState(nextState);
     this.scheduleExplorerLoadingDecorations();
     this.updateStatusBar();
+  }
+
+  private traceBlob(message: string, level: RolayLogEntry["level"] = "info"): void {
+    if (!RolayPlugin.ENABLE_BLOB_TRANSFER_TRACE) {
+      return;
+    }
+
+    this.recordLog("blob-trace", message, level);
   }
 
   private clearBinaryTransferRuntimeState(localPath: string): void {
@@ -5771,11 +5791,20 @@ export default class RolayPlugin extends Plugin {
         abortController: null
       });
 
+      this.traceBlob(
+        `[${workspaceId}] upload-ticket request entryId=${entry.id} localPath=${desiredLocalPath} serverPath=${desiredServerPath} ` +
+        `hash=${hash} sizeBytes=${sizeBytes} mimeType=${mimeType}`
+      );
       const ticket = await this.apiClient.createBlobUploadTicket(entry.id, {
         hash,
         sizeBytes,
         mimeType
       });
+      this.traceBlob(
+        `[${workspaceId}] upload-ticket response entryId=${entry.id} localPath=${desiredLocalPath} serverPath=${desiredServerPath} ` +
+        `status=${ticket._meta.status} requestId=${ticket._meta.requestId ?? "-"} alreadyExists=${ticket.alreadyExists} ` +
+        `uploadId=${ticket.uploadId} uploadedBytes=${ticket.uploadedBytes} sizeBytes=${ticket.sizeBytes} hash=${ticket.hash}`
+      );
       const normalizedTicketHash = normalizeSha256Hash(ticket.hash);
       if (!normalizedTicketHash) {
         throw new Error(`Blob upload ticket for ${desiredServerPath} is missing a valid hash.`);
@@ -5825,6 +5854,12 @@ export default class RolayPlugin extends Plugin {
             currentOffset + RolayPlugin.BINARY_UPLOAD_CHUNK_SIZE
           );
           const uploadChunk = binaryContent.slice(currentOffset, nextChunkEnd);
+          const contentRange = `bytes ${currentOffset}-${nextChunkEnd - 1}/${totalUploadBytes}`;
+          this.traceBlob(
+            `[${workspaceId}] upload content request entryId=${entry.id} uploadId=${ticket.uploadId} localPath=${desiredLocalPath} ` +
+            `hash=${commitHash} sizeBytes=${totalUploadBytes} chunkStart=${currentOffset} chunkEnd=${nextChunkEnd - 1} ` +
+            `contentRange="${contentRange}"`
+          );
 
           let uploadResponse;
           try {
@@ -5861,6 +5896,11 @@ export default class RolayPlugin extends Plugin {
                 `[${workspaceId}] Upload offset mismatch for ${desiredServerPath}; resuming from ${formatByteCount(expectedOffset)}.`,
                 "error"
               );
+              this.traceBlob(
+                `[${workspaceId}] upload content mismatch entryId=${entry.id} uploadId=${ticket.uploadId} localPath=${desiredLocalPath} ` +
+                `expectedOffset=${expectedOffset} chunkStart=${currentOffset} chunkEnd=${nextChunkEnd - 1}`,
+                "error"
+              );
               this.maybeUpdateBinaryTransferState(desiredLocalPath, {
                 status: "uploading",
                 bytesDone: expectedOffset,
@@ -5885,6 +5925,13 @@ export default class RolayPlugin extends Plugin {
 
           commitHash = serverHash;
           uploadedBytes = nextUploadedBytes;
+          this.traceBlob(
+            `[${workspaceId}] upload content response entryId=${entry.id} uploadId=${uploadResponse.uploadId ?? ticket.uploadId} ` +
+            `localPath=${desiredLocalPath} transport=${uploadResponse.transport} status=${uploadResponse.status} ` +
+            `requestId=${uploadResponse.requestId ?? "-"} uploadedBytes=${uploadResponse.uploadedBytes ?? nextUploadedBytes} ` +
+            `receivedBytes=${uploadResponse.receivedBytes ?? uploadChunk.byteLength} complete=${uploadResponse.complete === true} ` +
+            `hash=${uploadResponse.hash ?? commitHash}`
+          );
           if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
             hash: commitHash,
             uploadId: uploadResponse.uploadId ?? ticket.uploadId,
@@ -5931,6 +5978,10 @@ export default class RolayPlugin extends Plugin {
         return;
       }
 
+      this.traceBlob(
+        `[${workspaceId}] commit_blob_revision request entryId=${entry.id} localPath=${desiredLocalPath} hash=${commitHash} ` +
+        `sizeBytes=${totalUploadBytes} entryVersion=${entry.entryVersion} path=${entry.path}`
+      );
       const commitResponse = await this.operationsQueue.enqueue(
         workspaceId,
         {
@@ -5962,6 +6013,10 @@ export default class RolayPlugin extends Plugin {
       this.recordLog(
         "blob",
         `[${workspaceId}] Uploaded ${desiredServerPath} (${formatByteCount(totalUploadBytes)}, ${commitHash.slice(0, 19)}...).`
+      );
+      this.traceBlob(
+        `[${workspaceId}] upload complete entryId=${entry.id} localPath=${desiredLocalPath} hash=${commitHash} sizeBytes=${totalUploadBytes} ` +
+        `results=${commitResponse.results.length}`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -6270,7 +6325,16 @@ export default class RolayPlugin extends Plugin {
     }
 
     try {
+      this.traceBlob(
+        `[${workspaceId}] download-ticket request entryId=${entry.id} localPath=${localPath} serverPath=${entry.path} ` +
+        `expectedHash=${remoteHash} expectedSizeBytes=${remoteSize}`
+      );
       const ticket = await this.apiClient.createBlobDownloadTicket(entry.id);
+      this.traceBlob(
+        `[${workspaceId}] download-ticket response entryId=${entry.id} localPath=${localPath} serverPath=${entry.path} ` +
+        `status=${ticket._meta.status} requestId=${ticket._meta.requestId ?? "-"} hash=${ticket.hash} sizeBytes=${ticket.sizeBytes} ` +
+        `contentUrl=${ticket.contentUrl ?? "-"} rangeSupported=${ticket.rangeSupported === true}`
+      );
       const ticketHash = normalizeSha256Hash(ticket.hash) ?? remoteHash;
       if (!ticketHash) {
         throw new Error(`Binary download ticket for ${entry.path} is missing a valid blob hash.`);
@@ -6345,6 +6409,10 @@ export default class RolayPlugin extends Plugin {
         // Downloads never touch the live vault file until the full `.part`
         // payload is present and matches the expected blob hash.
         const downloadUrl = this.getBinaryBlobContentUrl(entry.id, ticket.contentUrl ?? null);
+        this.traceBlob(
+          `[${workspaceId}] blob content request entryId=${entry.id} localPath=${localPath} expectedHash=${ticketHash} ` +
+          `expectedSizeBytes=${totalDownloadBytes} partialOffset=${resumeOffset} range=${resumeOffset > 0 ? `bytes=${resumeOffset}-` : "-"}`
+        );
         const download = await this.apiClient.downloadBlobContent(
           downloadUrl,
           resumeOffset,
@@ -6361,6 +6429,12 @@ export default class RolayPlugin extends Plugin {
           },
           transfer.abortController?.signal
         );
+        this.traceBlob(
+          `[${workspaceId}] blob content response entryId=${entry.id} localPath=${localPath} transport=${download.transport} ` +
+          `status=${download.status} requestId=${download.requestId ?? "-"} contentLength=${download.contentLength ?? -1} ` +
+          `contentRange=${download.contentRange ?? "-"} acceptRanges=${download.acceptRanges ?? "-"} ` +
+          `blobHash=${download.hash ?? "-"}`
+        );
 
         await this.applyDownloadedBinary(
           workspaceId,
@@ -6375,6 +6449,9 @@ export default class RolayPlugin extends Plugin {
           reason
         );
       } else {
+        this.traceBlob(
+          `[${workspaceId}] blob content skipped entryId=${entry.id} localPath=${localPath} reason=already-complete partialOffset=${resumeOffset}`
+        );
         await this.applyDownloadedBinary(
           workspaceId,
           entry,
@@ -6438,6 +6515,10 @@ export default class RolayPlugin extends Plugin {
     }
 
     const computedHash = await sha256Hash(downloadData);
+    this.traceBlob(
+      `[${workspaceId}] download finalize entryId=${entry.id} localPath=${localPath} partPath=${partPath} ` +
+      `computedHash=${computedHash} expectedHash=${effectiveHash ?? "-"} sizeBytes=${downloadData.byteLength}`
+    );
     if (effectiveHash && computedHash !== effectiveHash) {
       await this.removeAdapterPathIfExists(partPath);
       throw new Error(`Downloaded blob hash mismatch for ${entry.path}.`);

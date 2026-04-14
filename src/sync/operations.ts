@@ -1,4 +1,4 @@
-import { RolayApiClient } from "../api/client";
+import { RolayApiClient, type ApiResponseMeta } from "../api/client";
 import type {
   BatchOperationsResponse,
   OperationResult,
@@ -9,6 +9,7 @@ interface OperationsQueueConfig {
   apiClient: RolayApiClient;
   getDeviceId: () => string;
   log: (message: string) => void;
+  onTrace?: (workspaceId: string, operation: TreeOperation, reason: string, meta: ApiResponseMeta) => void;
   onAfterApply?: (workspaceId: string, reason: string) => Promise<void> | void;
 }
 
@@ -16,6 +17,7 @@ export class OperationsQueue {
   private readonly apiClient: RolayApiClient;
   private readonly getDeviceId: () => string;
   private readonly log: (message: string) => void;
+  private readonly onTrace?: (workspaceId: string, operation: TreeOperation, reason: string, meta: ApiResponseMeta) => void;
   private readonly onAfterApply?: (workspaceId: string, reason: string) => Promise<void> | void;
   private chain: Promise<void> = Promise.resolve();
 
@@ -23,6 +25,7 @@ export class OperationsQueue {
     this.apiClient = config.apiClient;
     this.getDeviceId = config.getDeviceId;
     this.log = config.log;
+    this.onTrace = config.onTrace;
     this.onAfterApply = config.onAfterApply;
   }
 
@@ -42,6 +45,9 @@ export class OperationsQueue {
         deviceId: this.getDeviceId(),
         operations: [opWithId]
       });
+      if (response._meta) {
+        this.onTrace?.(workspaceId, opWithId, reason, response._meta);
+      }
 
       const failed = response.results.find((result) => result.status !== "applied");
       for (const result of response.results) {
