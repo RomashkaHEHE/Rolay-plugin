@@ -1,11 +1,12 @@
 import { MarkdownView, Notice, Plugin, TFile, normalizePath, type TAbstractFile } from "obsidian";
 import * as Y from "yjs";
-import { RolayApiClient, RolayApiError, type BlobDownloadResult, type BlobTransferProgress } from "./api/client";
+import { RolayApiClient, RolayApiError } from "./api/client";
 import { FileBridge } from "./obsidian/file-bridge";
 import { buildPresenceColor, createMarkdownTextState, CrdtSessionManager } from "./realtime/crdt-session";
 import { createSharedPresenceExtension, getMarkdownViewsForFile } from "./realtime/shared-presence";
 import {
   type RolayBinaryCacheEntry,
+  type RolayBinaryTransferEntry,
   getRoomBindingSettings,
   ROLAY_AUTO_CONNECT,
   ROLAY_DEVICE_NAME,
@@ -125,14 +126,16 @@ interface BinaryTransferState {
   uploadId: string | null;
   cancelUrl: string | null;
   lastError: string | null;
+  rangeSupported: boolean;
+  createdAt: string;
+  updatedAt: string;
   rerunRequested: boolean;
   abortController: AbortController | null;
 }
 
-// Important: this runtime map is only for live progress/cancel state. Durable
-// crash recovery currently comes from persisted pendingBinaryWrites plus the
-// next authoritative snapshot, so transfers are replayed after restart rather
-// than resumed from a stored byte offset.
+// Runtime transfer state mirrors persisted binaryTransfers entries. The
+// persisted copy is the crash-recovery source of truth, while this in-memory
+// layer adds live AbortController handles and rerun bookkeeping.
 
 interface ExplorerNotePresenceBadgeState {
   count: number;
@@ -176,6 +179,9 @@ interface PasswordChangeDraft {
 export default class RolayPlugin extends Plugin {
   private static readonly MAX_PERSISTED_CRDT_DOCS = 64;
   private static readonly MAX_PERSISTED_BINARY_ENTRIES = 128;
+  private static readonly BINARY_TRANSFER_PARTS_FOLDER = "transfers";
+  private static readonly BINARY_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
+  private static readonly MAX_BINARY_UPLOAD_OFFSET_RECOVERY_ATTEMPTS = 8;
   private static readonly MAX_LOG_FILE_BYTES = 512 * 1024;
   private static readonly LOG_FILE_NAME = "rolay-sync.log";
   private static readonly PENDING_CREATE_CONFIRMATION_TTL_MS = 60_000;
@@ -202,6 +208,7 @@ export default class RolayPlugin extends Plugin {
   private readonly recentRemoteObservedPaths = new Map<string, number>();
   private readonly pendingRemoteMarkdownSettles = new Map<string, number>();
   private persistHandle: number | null = null;
+  private isUnloading = false;
   private explorerDecorationHandle: number | null = null;
   private notePresenceUiHandle: number | null = null;
   private statusBarEl!: HTMLElement;
@@ -244,7 +251,9 @@ export default class RolayPlugin extends Plugin {
   };
 
   override async onload(): Promise<void> {
+    this.isUnloading = false;
     this.data = mergePluginData(await this.loadData());
+    this.restorePersistedBinaryTransfers();
     this.resetProfileDraft();
     this.apiClient = new RolayApiClient({
       getServerUrl: () => normalizeServerUrl(this.data.settings.serverUrl),
@@ -353,6 +362,7 @@ export default class RolayPlugin extends Plugin {
     );
 
     this.register(() => {
+      this.isUnloading = true;
       this.stopSettingsEventStream();
       if (this.persistHandle !== null) {
         window.clearTimeout(this.persistHandle);
@@ -401,6 +411,7 @@ export default class RolayPlugin extends Plugin {
   }
 
   override async onunload(): Promise<void> {
+    this.isUnloading = true;
     this.stopSettingsEventStream();
     this.stopAllRoomEventStreams();
     await this.crdtManager.disconnect();
@@ -2145,10 +2156,27 @@ export default class RolayPlugin extends Plugin {
     return normalizePath(`${this.app.vault.configDir}/plugins/${this.manifest.id}`);
   }
 
-  private async ensurePersistentLogFolderExists(): Promise<void> {
+  private getBinaryTransferFolderPath(): string {
+    return normalizePath(
+      `${this.app.vault.configDir}/plugins/${this.manifest.id}/${RolayPlugin.BINARY_TRANSFER_PARTS_FOLDER}`
+    );
+  }
+
+  private getBinaryTransferWorkspaceFolderPath(workspaceId: string): string {
+    return normalizePath(`${this.getBinaryTransferFolderPath()}/${sanitizePathSegment(workspaceId)}`);
+  }
+
+  private getBinaryDownloadPartPath(workspaceId: string, entryId: string, hash: string): string {
+    const normalizedHash = normalizeSha256Hash(hash) ?? hash;
+    const safeHash = sanitizePathSegment(normalizedHash.replace(/[:/+=]/g, "-")).slice(0, 48) || "blob";
+    return normalizePath(
+      `${this.getBinaryTransferWorkspaceFolderPath(workspaceId)}/${sanitizePathSegment(entryId)}-${safeHash}.part`
+    );
+  }
+
+  private async ensureAdapterFolderExists(folderPath: string): Promise<void> {
     const adapter = this.app.vault.adapter;
-    const folderPath = this.getPersistentLogFolderPath();
-    const segments = folderPath.split("/").filter(Boolean);
+    const segments = normalizePath(folderPath).split("/").filter(Boolean);
     let currentPath = "";
 
     for (const segment of segments) {
@@ -2161,6 +2189,10 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
+  private async ensurePersistentLogFolderExists(): Promise<void> {
+    await this.ensureAdapterFolderExists(this.getPersistentLogFolderPath());
+  }
+
   private async trimPersistentLogFileIfNeeded(logFilePath: string): Promise<void> {
     const stat = await this.app.vault.adapter.stat(logFilePath);
     if (!stat || stat.size <= RolayPlugin.MAX_LOG_FILE_BYTES) {
@@ -2171,6 +2203,52 @@ export default class RolayPlugin extends Plugin {
     const keptTail = fileContents.slice(-Math.floor(RolayPlugin.MAX_LOG_FILE_BYTES / 2));
     const trimmedContents = `... trimmed older Rolay log lines ...\n${keptTail}`;
     await this.app.vault.adapter.write(logFilePath, trimmedContents);
+  }
+
+  private async getAdapterFileSize(path: string): Promise<number> {
+    try {
+      const stat = await this.app.vault.adapter.stat(normalizePath(path));
+      return stat?.size ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  private async removeAdapterPathIfExists(path: string): Promise<void> {
+    const normalizedPath = normalizePath(path);
+    try {
+      if (!(await this.app.vault.adapter.exists(normalizedPath))) {
+        return;
+      }
+      await this.app.vault.adapter.remove(normalizedPath);
+    } catch {
+      // Best-effort cleanup for transfer temp files.
+    }
+  }
+
+  private async writeBinaryTransferPart(
+    partPath: string,
+    data: ArrayBuffer,
+    append: boolean
+  ): Promise<void> {
+    await this.ensureAdapterFolderExists(getParentPath(partPath));
+    if (append) {
+      await this.app.vault.adapter.appendBinary(normalizePath(partPath), data);
+      return;
+    }
+
+    await this.app.vault.adapter.writeBinary(normalizePath(partPath), data);
+  }
+
+  private async readBinaryTransferPart(partPath: string): Promise<ArrayBuffer | null> {
+    try {
+      if (!(await this.app.vault.adapter.exists(normalizePath(partPath)))) {
+        return null;
+      }
+      return await this.app.vault.adapter.readBinary(normalizePath(partPath));
+    } catch {
+      return null;
+    }
   }
 
   private requireAdmin(): void {
@@ -2902,9 +2980,11 @@ export default class RolayPlugin extends Plugin {
     const nextState: BinaryTransferState = {
       ...existing,
       ...patch,
-      localPath: normalizedLocalPath
+      localPath: normalizedLocalPath,
+      updatedAt: patch.updatedAt ?? new Date().toISOString()
     };
     this.binaryTransferState.set(normalizedLocalPath, nextState);
+    this.persistBinaryTransferState(nextState);
     this.scheduleExplorerLoadingDecorations();
     this.updateStatusBar();
     return nextState;
@@ -2924,21 +3004,141 @@ export default class RolayPlugin extends Plugin {
   }
 
   private setBinaryTransferState(state: BinaryTransferState): void {
-    this.binaryTransferState.set(normalizePath(state.localPath), {
+    const normalizedLocalPath = normalizePath(state.localPath);
+    const nextState = {
       ...state,
-      localPath: normalizePath(state.localPath)
-    });
+      localPath: normalizedLocalPath
+    };
+    this.binaryTransferState.set(normalizedLocalPath, nextState);
+    this.persistBinaryTransferState(nextState);
     this.scheduleExplorerLoadingDecorations();
     this.updateStatusBar();
   }
 
-  private clearBinaryTransferState(localPath: string): void {
+  private clearBinaryTransferRuntimeState(localPath: string): void {
     if (!this.binaryTransferState.delete(normalizePath(localPath))) {
       return;
     }
 
     this.scheduleExplorerLoadingDecorations();
     this.updateStatusBar();
+  }
+
+  private clearBinaryTransferState(localPath: string): void {
+    const normalizedLocalPath = normalizePath(localPath);
+    this.clearPersistedBinaryTransferState(normalizedLocalPath);
+    this.clearBinaryTransferRuntimeState(normalizedLocalPath);
+  }
+
+  private restorePersistedBinaryTransfers(): void {
+    for (const persisted of Object.values(this.data.binaryTransfers)) {
+      this.binaryTransferState.set(normalizePath(persisted.localPath), {
+        workspaceId: persisted.workspaceId,
+        entryId: persisted.entryId,
+        localPath: normalizePath(persisted.localPath),
+        serverPath: persisted.serverPath,
+        kind: persisted.kind,
+        status: persisted.status,
+        bytesTotal: persisted.bytesTotal,
+        bytesDone: persisted.bytesDone,
+        hash: persisted.hash,
+        mimeType: persisted.mimeType,
+        uploadId: persisted.uploadId,
+        cancelUrl: null,
+        lastError: persisted.lastError,
+        rangeSupported: persisted.rangeSupported,
+        createdAt: persisted.createdAt,
+        updatedAt: persisted.updatedAt,
+        rerunRequested: false,
+        abortController: null
+      });
+    }
+  }
+
+  private persistBinaryTransferState(state: BinaryTransferState): void {
+    const normalizedLocalPath = normalizePath(state.localPath);
+    this.data.binaryTransfers[normalizedLocalPath] = {
+      workspaceId: state.workspaceId,
+      entryId: state.entryId,
+      localPath: normalizedLocalPath,
+      serverPath: state.serverPath,
+      kind: state.kind,
+      status: state.status,
+      bytesTotal: state.bytesTotal,
+      bytesDone: state.bytesDone,
+      hash: state.hash,
+      mimeType: state.mimeType,
+      uploadId: state.uploadId,
+      rangeSupported: state.rangeSupported,
+      createdAt: state.createdAt,
+      updatedAt: state.updatedAt,
+      lastError: state.lastError
+    };
+    this.schedulePersist();
+  }
+
+  private clearPersistedBinaryTransferState(localPath: string): void {
+    const normalizedLocalPath = normalizePath(localPath);
+    if (!(normalizedLocalPath in this.data.binaryTransfers)) {
+      return;
+    }
+
+    delete this.data.binaryTransfers[normalizedLocalPath];
+    this.schedulePersist();
+  }
+
+  private movePersistedBinaryTransferState(oldPath: string, newPath: string, serverPath?: string): void {
+    const normalizedOldPath = normalizePath(oldPath);
+    const normalizedNewPath = normalizePath(newPath);
+    const existing = this.data.binaryTransfers[normalizedOldPath];
+    if (!existing) {
+      return;
+    }
+
+    delete this.data.binaryTransfers[normalizedOldPath];
+    this.data.binaryTransfers[normalizedNewPath] = {
+      ...existing,
+      localPath: normalizedNewPath,
+      serverPath: serverPath ?? existing.serverPath,
+      updatedAt: new Date().toISOString()
+    };
+
+    const runtime = this.binaryTransferState.get(normalizedOldPath);
+    if (runtime) {
+      this.binaryTransferState.delete(normalizedOldPath);
+      this.binaryTransferState.set(normalizedNewPath, {
+        ...runtime,
+        localPath: normalizedNewPath,
+        serverPath: serverPath ?? runtime.serverPath,
+        updatedAt: new Date().toISOString()
+      });
+    }
+
+    this.schedulePersist();
+    this.scheduleExplorerLoadingDecorations();
+  }
+
+  private getBinaryBlobContentUrl(entryId: string, contentUrl?: string | null): string {
+    if (contentUrl?.trim()) {
+      return contentUrl.trim();
+    }
+
+    return `/v1/files/${encodeURIComponent(entryId)}/blob/content`;
+  }
+
+  private async clearBinaryDownloadPart(
+    workspaceId: string,
+    entryId: string | null,
+    hash: string | null
+  ): Promise<void> {
+    const normalizedHash = normalizeSha256Hash(hash);
+    if (!entryId || !normalizedHash) {
+      return;
+    }
+
+    await this.removeAdapterPathIfExists(
+      this.getBinaryDownloadPartPath(workspaceId, entryId, normalizedHash)
+    );
   }
 
   private async cancelBinaryTransferForLocalPath(localPath: string, reason: string): Promise<void> {
@@ -2970,6 +3170,10 @@ export default class RolayPlugin extends Plugin {
           "error"
         );
       }
+    }
+
+    if (transfer.kind === "download") {
+      await this.clearBinaryDownloadPart(transfer.workspaceId, transfer.entryId, transfer.hash);
     }
 
     this.clearBinaryTransferState(normalizedLocalPath);
@@ -3912,6 +4116,7 @@ export default class RolayPlugin extends Plugin {
 
     delete this.data.pendingBinaryWrites[normalizedOldPath];
     this.moveBinarySyncToken(normalizedOldPath, normalizedNewPath);
+    this.movePersistedBinaryTransferState(normalizedOldPath, normalizedNewPath);
     await this.cancelBinaryTransferForLocalPath(normalizedOldPath, "rename");
 
     const nextServerPath = this.resolvePendingMarkdownServerPath(
@@ -5375,7 +5580,8 @@ export default class RolayPlugin extends Plugin {
       activeTransfer &&
       activeTransfer.kind === "upload" &&
       activeTransfer.status !== "done" &&
-      activeTransfer.status !== "failed"
+      activeTransfer.status !== "failed" &&
+      this.binarySyncTokens.has(localPath)
     ) {
       this.updateBinaryTransferState(localPath, {
         rerunRequested: true
@@ -5543,6 +5749,7 @@ export default class RolayPlugin extends Plugin {
         return;
       }
 
+      const existingTransfer = this.binaryTransferState.get(desiredLocalPath);
       this.setBinaryTransferState({
         workspaceId,
         entryId: entry.id,
@@ -5557,6 +5764,9 @@ export default class RolayPlugin extends Plugin {
         uploadId: null,
         cancelUrl: null,
         lastError: null,
+        rangeSupported: false,
+        createdAt: existingTransfer?.createdAt ?? new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
         rerunRequested: false,
         abortController: null
       });
@@ -5571,9 +5781,14 @@ export default class RolayPlugin extends Plugin {
         throw new Error(`Blob upload ticket for ${desiredServerPath} is missing a valid hash.`);
       }
 
+      const totalUploadBytes = ticket.sizeBytes > 0 ? ticket.sizeBytes : sizeBytes;
+      let commitHash = normalizedTicketHash;
+      let uploadedBytes = clampTransferBytes(ticket.uploadedBytes, totalUploadBytes);
+
       if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
         entryId: entry.id,
-        bytesTotal: ticket.sizeBytes > 0 ? ticket.sizeBytes : sizeBytes,
+        bytesTotal: totalUploadBytes,
+        bytesDone: uploadedBytes,
         hash: normalizedTicketHash,
         mimeType: ticket.mimeType,
         uploadId: ticket.uploadId,
@@ -5586,55 +5801,118 @@ export default class RolayPlugin extends Plugin {
         const abortController = new AbortController();
         if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
           status: "uploading",
+          bytesDone: uploadedBytes,
           abortController
         })) {
           return;
         }
 
-        const uploadResponse = await this.apiClient.uploadBlobContent(
-          entry.id,
-          ticket.uploadId,
-          binaryContent,
-          normalizedTicketHash,
-          (progress) => {
-            this.maybeUpdateBinaryTransferState(desiredLocalPath, {
-              status: "uploading",
-              bytesDone: progress.loadedBytes,
-              bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : ticket.sizeBytes
-            });
-          },
-          abortController.signal,
-          ticket.upload
-        );
-
-        const uploadedHash = normalizeSha256Hash(uploadResponse.hash) ?? normalizedTicketHash;
-        const uploadedSizeBytes =
-          Number.isFinite(uploadResponse.sizeBytes) && uploadResponse.sizeBytes > 0
-            ? uploadResponse.sizeBytes
-            : ticket.sizeBytes;
-
-        if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
-          hash: uploadedHash,
-          bytesDone: uploadedSizeBytes,
-          bytesTotal: uploadedSizeBytes
-        })) {
-          return;
-        }
-
-        if (uploadedHash !== normalizedTicketHash) {
+        if (uploadedBytes > 0) {
           this.recordLog(
             "blob",
-            `[${workspaceId}] Upload endpoint returned ${uploadedHash} for ${desiredServerPath} instead of ticket hash ${normalizedTicketHash}. Using server-confirmed hash.`,
+            `[${workspaceId}] Resuming binary upload for ${desiredServerPath} at ${formatByteCount(uploadedBytes)} of ${formatByteCount(totalUploadBytes)}.`
+          );
+        }
+
+        let offsetRecoveryAttempts = 0;
+        while (uploadedBytes < totalUploadBytes) {
+          // Resumable blob upload always sends the remaining tail from the
+          // server-confirmed offset. If the server reports an offset mismatch,
+          // we realign to expectedOffset instead of restarting from zero.
+          const currentOffset = uploadedBytes;
+          const nextChunkEnd = Math.min(
+            totalUploadBytes,
+            currentOffset + RolayPlugin.BINARY_UPLOAD_CHUNK_SIZE
+          );
+          const uploadChunk = binaryContent.slice(currentOffset, nextChunkEnd);
+
+          let uploadResponse;
+          try {
+            uploadResponse = await this.apiClient.uploadBlobContent(
+              entry.id,
+              ticket.uploadId,
+              uploadChunk,
+              commitHash,
+              currentOffset,
+              totalUploadBytes,
+              (progress) => {
+                this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+                  status: "uploading",
+                  bytesDone: progress.loadedBytes,
+                  bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : totalUploadBytes
+                });
+              },
+              abortController.signal,
+              currentOffset === 0 && nextChunkEnd === totalUploadBytes ? ticket.upload : undefined
+            );
+          } catch (error) {
+            const expectedOffset = extractBlobOffsetMismatchExpectedOffset(error, totalUploadBytes);
+            if (expectedOffset !== null) {
+              offsetRecoveryAttempts += 1;
+              if (offsetRecoveryAttempts > RolayPlugin.MAX_BINARY_UPLOAD_OFFSET_RECOVERY_ATTEMPTS) {
+                throw new Error(
+                  `Blob upload offset recovery exceeded ${RolayPlugin.MAX_BINARY_UPLOAD_OFFSET_RECOVERY_ATTEMPTS} attempts.`
+                );
+              }
+
+              uploadedBytes = expectedOffset;
+              this.recordLog(
+                "blob",
+                `[${workspaceId}] Upload offset mismatch for ${desiredServerPath}; resuming from ${formatByteCount(expectedOffset)}.`,
+                "error"
+              );
+              this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+                status: "uploading",
+                bytesDone: expectedOffset,
+                bytesTotal: totalUploadBytes
+              });
+              continue;
+            }
+
+            throw error;
+          }
+
+          offsetRecoveryAttempts = 0;
+          const serverHash = normalizeSha256Hash(uploadResponse.hash) ?? commitHash;
+          const fallbackUploadedBytes = currentOffset + uploadChunk.byteLength;
+          const nextUploadedBytes = clampTransferBytes(
+            uploadResponse.uploadedBytes ?? fallbackUploadedBytes,
+            totalUploadBytes
+          );
+          if (nextUploadedBytes < currentOffset) {
+            throw new Error(`Upload progress moved backwards for ${desiredServerPath}.`);
+          }
+
+          commitHash = serverHash;
+          uploadedBytes = nextUploadedBytes;
+          if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
+            hash: commitHash,
+            uploadId: uploadResponse.uploadId ?? ticket.uploadId,
+            bytesDone: uploadedBytes,
+            bytesTotal: totalUploadBytes
+          })) {
+            return;
+          }
+
+          if (uploadResponse.complete === true && uploadedBytes >= totalUploadBytes) {
+            break;
+          }
+        }
+
+        if (commitHash !== normalizedTicketHash) {
+          this.recordLog(
+            "blob",
+            `[${workspaceId}] Upload endpoint returned ${commitHash} for ${desiredServerPath} instead of ticket hash ${normalizedTicketHash}. Using server-confirmed hash.`,
             "error"
           );
         }
 
-        ticket.hash = uploadedHash;
-        ticket.sizeBytes = uploadedSizeBytes;
+        ticket.hash = commitHash;
+        ticket.sizeBytes = totalUploadBytes;
       } else {
         if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
           status: "committing",
-          bytesDone: ticket.sizeBytes
+          bytesDone: totalUploadBytes
         })) {
           return;
         }
@@ -5646,7 +5924,9 @@ export default class RolayPlugin extends Plugin {
 
       if (!this.maybeUpdateBinaryTransferState(desiredLocalPath, {
         status: "committing",
-        bytesDone: ticket.sizeBytes
+        hash: commitHash,
+        bytesDone: totalUploadBytes,
+        bytesTotal: totalUploadBytes
       })) {
         return;
       }
@@ -5656,8 +5936,8 @@ export default class RolayPlugin extends Plugin {
         {
           type: "commit_blob_revision",
           entryId: entry.id,
-          hash: normalizedTicketHash,
-          sizeBytes: ticket.sizeBytes,
+          hash: commitHash,
+          sizeBytes: totalUploadBytes,
           mimeType: ticket.mimeType,
           preconditions: {
             entryVersion: entry.entryVersion,
@@ -5675,18 +5955,20 @@ export default class RolayPlugin extends Plugin {
         finalServerPath = committedEntry.path;
       }
 
-      this.persistBinaryCacheEntry(entry.id, desiredLocalPath, normalizedTicketHash, ticket.sizeBytes, ticket.mimeType);
+      this.persistBinaryCacheEntry(entry.id, desiredLocalPath, commitHash, totalUploadBytes, ticket.mimeType);
       await this.clearPendingBinaryWriteForLocalPath(desiredLocalPath, false);
       this.clearBinaryTransferState(desiredLocalPath);
       this.invalidateBinarySyncToken(desiredLocalPath);
       this.recordLog(
         "blob",
-        `[${workspaceId}] Uploaded ${desiredServerPath} (${formatByteCount(ticket.sizeBytes)}, ${normalizedTicketHash.slice(0, 19)}...).`
+        `[${workspaceId}] Uploaded ${desiredServerPath} (${formatByteCount(totalUploadBytes)}, ${commitHash.slice(0, 19)}...).`
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (error instanceof Error && error.name === "AbortError") {
-        this.recordLog("blob", `[${workspaceId}] Binary transfer aborted for ${finalLocalPath}.`);
+        if (!this.isUnloading) {
+          this.recordLog("blob", `[${workspaceId}] Binary transfer aborted for ${finalLocalPath}.`);
+        }
       } else {
         const mismatchDetails = formatBlobHashMismatchDetails(error);
         if (mismatchDetails) {
@@ -5713,6 +5995,10 @@ export default class RolayPlugin extends Plugin {
         this.rememberPendingBinaryWrite(workspaceId, finalLocalPath, finalServerPath, finalEntryId, error);
       }
     } finally {
+      if (this.isUnloading) {
+        return;
+      }
+
       const transfer = this.binaryTransferState.get(normalizePath(finalLocalPath));
       const normalizedFinalLocalPath = normalizePath(finalLocalPath);
       const shouldRerun = Boolean(transfer?.rerunRequested) || this.pendingBinarySyncReruns.has(normalizedFinalLocalPath);
@@ -5946,7 +6232,8 @@ export default class RolayPlugin extends Plugin {
       existingTransfer &&
       existingTransfer.kind === "download" &&
       existingTransfer.hash === remoteHash &&
-      (existingTransfer.status === "preparing" || existingTransfer.status === "downloading")
+      (existingTransfer.status === "preparing" || existingTransfer.status === "downloading") &&
+      existingTransfer.abortController
     ) {
       return;
     }
@@ -5960,6 +6247,7 @@ export default class RolayPlugin extends Plugin {
       if (normalizePath(cached.filePath) !== localPath) {
         this.persistBinaryCacheEntry(entry.id, localPath, remoteHash, remoteSize, remoteMimeType);
       }
+      await this.clearBinaryDownloadPart(workspaceId, entry.id, remoteHash);
       return;
     }
 
@@ -5968,6 +6256,7 @@ export default class RolayPlugin extends Plugin {
       const localHash = await sha256Hash(localBytes);
       if (localHash === remoteHash) {
         this.persistBinaryCacheEntry(entry.id, localPath, remoteHash, remoteSize, remoteMimeType);
+        await this.clearBinaryDownloadPart(workspaceId, entry.id, remoteHash);
         return;
       }
 
@@ -5980,47 +6269,126 @@ export default class RolayPlugin extends Plugin {
       }
     }
 
-    this.setBinaryTransferState({
-      workspaceId,
-      entryId: entry.id,
-      localPath,
-      serverPath: entry.path,
-      kind: "download",
-      status: "preparing",
-      bytesTotal: remoteSize,
-      bytesDone: 0,
-      hash: remoteHash,
-      mimeType: remoteMimeType,
-      uploadId: null,
-      cancelUrl: null,
-      lastError: null,
-      rerunRequested: false,
-      abortController: new AbortController()
-    });
-
     try {
       const ticket = await this.apiClient.createBlobDownloadTicket(entry.id);
+      const ticketHash = normalizeSha256Hash(ticket.hash) ?? remoteHash;
+      if (!ticketHash) {
+        throw new Error(`Binary download ticket for ${entry.path} is missing a valid blob hash.`);
+      }
+
+      const totalDownloadBytes = ticket.sizeBytes > 0 ? ticket.sizeBytes : remoteSize;
+      const partPath = this.getBinaryDownloadPartPath(workspaceId, entry.id, ticketHash);
+      let resumeOffset = await this.getAdapterFileSize(partPath);
+      if (resumeOffset > totalDownloadBytes) {
+        await this.removeAdapterPathIfExists(partPath);
+        resumeOffset = 0;
+      }
+      if (!ticket.rangeSupported && resumeOffset > 0 && resumeOffset < totalDownloadBytes) {
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Restarting binary download for ${entry.path} from zero because ranged resume is unavailable.`
+        );
+        await this.removeAdapterPathIfExists(partPath);
+        resumeOffset = 0;
+      }
+
+      if (totalDownloadBytes === 0 && resumeOffset === 0) {
+        await this.writeBinaryTransferPart(partPath, new ArrayBuffer(0), false);
+      }
+
+      this.setBinaryTransferState({
+        workspaceId,
+        entryId: entry.id,
+        localPath,
+        serverPath: entry.path,
+        kind: "download",
+        status: "preparing",
+        bytesTotal: totalDownloadBytes,
+        bytesDone: resumeOffset,
+        hash: ticketHash,
+        mimeType: ticket.mimeType || remoteMimeType,
+        uploadId: null,
+        cancelUrl: null,
+        lastError: null,
+        rangeSupported: Boolean(ticket.rangeSupported),
+        createdAt: existingTransfer?.createdAt ?? new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        rerunRequested: false,
+        abortController: new AbortController()
+      });
+
       const transfer = this.maybeUpdateBinaryTransferState(localPath, {
         status: "downloading",
-        bytesTotal: ticket.sizeBytes > 0 ? ticket.sizeBytes : remoteSize
+        bytesTotal: totalDownloadBytes,
+        bytesDone: resumeOffset,
+        hash: ticketHash,
+        mimeType: ticket.mimeType || remoteMimeType,
+        rangeSupported: Boolean(ticket.rangeSupported)
       });
       if (!transfer) {
         return;
       }
 
-      const download = await this.apiClient.downloadBlobFromUrl(
-        ticket.url,
-        (progress) => {
-          this.maybeUpdateBinaryTransferState(localPath, {
-            status: "downloading",
-            bytesDone: progress.loadedBytes,
-            bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : transfer.bytesTotal
-          });
-        },
-        transfer.abortController?.signal
-      );
+      if (resumeOffset > 0 && resumeOffset < totalDownloadBytes) {
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Resuming binary download for ${entry.path} at ${formatByteCount(resumeOffset)} of ${formatByteCount(totalDownloadBytes)}.`
+        );
+      }
 
-      await this.applyDownloadedBinary(workspaceId, entry, localPath, ticket, download, reason);
+      if (resumeOffset < totalDownloadBytes) {
+        let append = resumeOffset > 0;
+        if (!append) {
+          await this.removeAdapterPathIfExists(partPath);
+        }
+
+        // Downloads never touch the live vault file until the full `.part`
+        // payload is present and matches the expected blob hash.
+        const downloadUrl = this.getBinaryBlobContentUrl(entry.id, ticket.contentUrl ?? null);
+        const download = await this.apiClient.downloadBlobContent(
+          downloadUrl,
+          resumeOffset,
+          async (chunk) => {
+            await this.writeBinaryTransferPart(partPath, chunk, append);
+            append = true;
+          },
+          (progress) => {
+            this.maybeUpdateBinaryTransferState(localPath, {
+              status: "downloading",
+              bytesDone: progress.loadedBytes,
+              bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : totalDownloadBytes
+            });
+          },
+          transfer.abortController?.signal
+        );
+
+        await this.applyDownloadedBinary(
+          workspaceId,
+          entry,
+          localPath,
+          partPath,
+          {
+            hash: normalizeSha256Hash(download.hash ?? ticketHash) ?? ticketHash,
+            sizeBytes: totalDownloadBytes,
+            mimeType: download.contentType ?? ticket.mimeType ?? remoteMimeType
+          },
+          reason
+        );
+      } else {
+        await this.applyDownloadedBinary(
+          workspaceId,
+          entry,
+          localPath,
+          partPath,
+          {
+            hash: ticketHash,
+            sizeBytes: totalDownloadBytes,
+            mimeType: ticket.mimeType ?? remoteMimeType
+          },
+          reason
+        );
+      }
+
       this.clearBinaryTransferState(localPath);
     } catch (error) {
       if (!(error instanceof Error && error.name === "AbortError")) {
@@ -6029,8 +6397,19 @@ export default class RolayPlugin extends Plugin {
           `[${workspaceId}] Binary download failed for ${entry.path}: ${error instanceof Error ? error.message : String(error)}`,
           "error"
         );
+      } else if (!this.isUnloading) {
+        this.recordLog("blob", `[${workspaceId}] Binary download aborted for ${entry.path}.`);
       }
-      this.clearBinaryTransferState(localPath);
+
+      if (this.isUnloading) {
+        return;
+      }
+
+      this.updateBinaryTransferState(localPath, {
+        status: "failed",
+        lastError: error instanceof Error ? error.message : String(error),
+        abortController: null
+      });
     }
   }
 
@@ -6038,15 +6417,29 @@ export default class RolayPlugin extends Plugin {
     workspaceId: string,
     entry: FileEntry,
     localPath: string,
-    ticket: { hash: string; sizeBytes: number; mimeType: string },
-    download: BlobDownloadResult,
+    partPath: string,
+    downloadMeta: { hash: string; sizeBytes: number; mimeType: string | null },
     reason: string
   ): Promise<void> {
-    const effectiveHash = normalizeSha256Hash(download.hash ?? ticket.hash);
-    const effectiveSize = download.contentLength ?? ticket.sizeBytes ?? download.data.byteLength;
-    const effectiveMimeType = download.contentType ?? ticket.mimeType;
-    const computedHash = await sha256Hash(download.data);
+    const downloadData = await this.readBinaryTransferPart(partPath);
+    if (!downloadData) {
+      throw new Error(`Downloaded binary part for ${entry.path} is missing.`);
+    }
+
+    const effectiveHash = normalizeSha256Hash(downloadMeta.hash);
+    const effectiveSize = downloadMeta.sizeBytes > 0 ? downloadMeta.sizeBytes : downloadData.byteLength;
+    const effectiveMimeType =
+      downloadMeta.mimeType ?? entry.blob?.mimeType ?? entry.mimeType ?? "application/octet-stream";
+    if (effectiveSize !== downloadData.byteLength) {
+      await this.removeAdapterPathIfExists(partPath);
+      throw new Error(
+        `Downloaded blob size mismatch for ${entry.path}: expected ${effectiveSize} bytes, got ${downloadData.byteLength}.`
+      );
+    }
+
+    const computedHash = await sha256Hash(downloadData);
     if (effectiveHash && computedHash !== effectiveHash) {
+      await this.removeAdapterPathIfExists(partPath);
       throw new Error(`Downloaded blob hash mismatch for ${entry.path}.`);
     }
 
@@ -6057,7 +6450,8 @@ export default class RolayPlugin extends Plugin {
       const currentLocalHash = await sha256Hash(currentLocalBytes);
 
       if (currentLocalHash === computedHash) {
-        this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType ?? ticket.mimeType);
+        this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType);
+        await this.removeAdapterPathIfExists(partPath);
         return;
       }
 
@@ -6070,11 +6464,12 @@ export default class RolayPlugin extends Plugin {
       }
     }
 
-    await this.fileBridge.writeBinaryContent(workspaceId, entry.path, download.data);
-    this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType ?? ticket.mimeType);
+    await this.fileBridge.writeBinaryContent(workspaceId, entry.path, downloadData);
+    await this.removeAdapterPathIfExists(partPath);
+    this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType);
     this.recordLog(
       "blob",
-      `[${workspaceId}] Downloaded ${entry.path} (${formatByteCount(download.data.byteLength)}) from ${reason}.`
+      `[${workspaceId}] Downloaded ${entry.path} (${formatByteCount(downloadData.byteLength)}) from ${reason}.`
     );
   }
 
@@ -6770,6 +7165,31 @@ function formatBlobHashMismatchDetails(error: unknown): string | null {
   return parts.join(", ");
 }
 
+function clampTransferBytes(value: number, totalBytes: number): number {
+  if (!Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+
+  if (!Number.isFinite(totalBytes) || totalBytes <= 0) {
+    return Math.max(0, Math.trunc(value));
+  }
+
+  return Math.max(0, Math.min(Math.trunc(value), Math.trunc(totalBytes)));
+}
+
+function extractBlobOffsetMismatchExpectedOffset(error: unknown, totalBytes: number): number | null {
+  if (!(error instanceof RolayApiError) || error.code !== "blob_offset_mismatch") {
+    return null;
+  }
+
+  const rawOffset = error.details?.expectedOffset;
+  if (typeof rawOffset !== "number" || !Number.isFinite(rawOffset)) {
+    return null;
+  }
+
+  return clampTransferBytes(rawOffset, totalBytes);
+}
+
 function areUint8ArraysEqual(left: Uint8Array, right: Uint8Array): boolean {
   if (left.byteLength !== right.byteLength) {
     return false;
@@ -6801,6 +7221,10 @@ function getFileName(path: string): string {
 function getParentPath(path: string): string {
   const separatorIndex = path.lastIndexOf("/");
   return separatorIndex === -1 ? "" : path.slice(0, separatorIndex);
+}
+
+function sanitizePathSegment(value: string): string {
+  return value.trim().replace(/[<>:"/\\|?*\x00-\x1f]+/g, "-");
 }
 
 function getFileExtension(fileName: string): string {

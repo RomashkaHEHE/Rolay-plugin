@@ -254,16 +254,19 @@ Binary upload contract:
 1. create a tree entry through `create_binary_placeholder`
 2. ask the server for an upload ticket with `hash`, `sizeBytes`, `mimeType`
 3. if `alreadyExists=true`, skip byte upload
-4. otherwise upload the raw bytes to `PUT /v1/files/{entryId}/blob/uploads/{uploadId}/content` with Bearer auth and `Content-Type: application/octet-stream`
-5. publish the new revision through `commit_blob_revision`
+4. otherwise resume from `uploadedBytes` and upload raw bytes to `PUT /v1/files/{entryId}/blob/uploads/{uploadId}/content`
+5. resumable upload uses `Content-Range: bytes start-end/total`
+6. if the server returns `blob_offset_mismatch`, the client should continue from `error.details.expectedOffset`
+7. publish the new revision through `commit_blob_revision`
 
 The plugin normalizes blob hashes to canonical `sha256:<base64>` before upload, commit, download verification, and local cache comparisons.
-6. if the new API endpoint is unavailable, the plugin may still fall back to the legacy raw `upload.url`, but that is no longer the primary flow
+8. if the new API endpoint is unavailable, the plugin may still fall back to the legacy raw `upload.url`, but that is no longer the primary flow
 
 Important upload fields:
 
 - `alreadyExists`
 - `uploadId`
+- `uploadedBytes`
 - `hash`
 - `sizeBytes`
 - `mimeType`
@@ -274,20 +277,13 @@ Important upload fields:
 Binary download contract:
 
 1. request a download ticket
-2. fetch the returned download URL
-3. trust `Content-Length` and `X-Rolay-Blob-Hash` for byte-aware progress and integrity checks
+2. use `contentUrl` as the main authenticated download endpoint
+3. if range resume is available, continue with `Range: bytes=<partialSize>-`
+4. store partial bytes in a `.part` file until the full blob is present
+5. trust `Content-Length`, `Content-Range`, and `X-Rolay-Blob-Hash` for byte-aware progress and integrity checks
+6. only materialize the final vault file after full hash verification succeeds
 
 The plugin treats only `.md` as CRDT content. Every other file extension, including `.txt`, uses this blob flow.
-
-Current limitation:
-
-- the contract is sufficient for honest live byte progress
-- the plugin can replay pending uploads/downloads after reconnect or restart
-- but true resumable transfer from a stored byte offset is not part of the current contract yet
-
-Planned follow-up:
-
-- see [roadmap.md](./roadmap.md) and [../info-for-server/FILE_TRANSFER_RESUME_TASK.md](../info-for-server/FILE_TRANSFER_RESUME_TASK.md)
 
 ## Tree Mutation Rules
 

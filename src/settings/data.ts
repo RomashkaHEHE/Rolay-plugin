@@ -96,6 +96,35 @@ export interface RolayPendingBinaryWriteEntry {
   lastError: string | null;
 }
 
+export type RolayBinaryTransferKind = "upload" | "download";
+
+export type RolayBinaryTransferStatus =
+  | "preparing"
+  | "uploading"
+  | "canceling"
+  | "downloading"
+  | "committing"
+  | "done"
+  | "failed";
+
+export interface RolayBinaryTransferEntry {
+  workspaceId: string;
+  entryId: string | null;
+  localPath: string;
+  serverPath: string;
+  kind: RolayBinaryTransferKind;
+  status: RolayBinaryTransferStatus;
+  bytesTotal: number;
+  bytesDone: number;
+  hash: string | null;
+  mimeType: string | null;
+  uploadId: string | null;
+  rangeSupported: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastError: string | null;
+}
+
 export interface RolayPluginData {
   settings: RolayPluginSettings;
   session: RolaySessionState | null;
@@ -105,6 +134,7 @@ export interface RolayPluginData {
   pendingMarkdownCreates: Record<string, RolayPendingMarkdownCreateEntry>;
   pendingMarkdownMerges: Record<string, RolayPendingMarkdownMergeEntry>;
   pendingBinaryWrites: Record<string, RolayPendingBinaryWriteEntry>;
+  binaryTransfers: Record<string, RolayBinaryTransferEntry>;
   deviceId: string;
   logs: RolayLogEntry[];
 }
@@ -166,6 +196,7 @@ export function createDefaultPluginData(): RolayPluginData {
     pendingMarkdownCreates: {},
     pendingMarkdownMerges: {},
     pendingBinaryWrites: {},
+    binaryTransfers: {},
     deviceId: createDeviceId(),
     logs: []
   };
@@ -210,6 +241,7 @@ export function mergePluginData(rawData: Partial<RolayPluginData> | null | undef
     pendingMarkdownCreates: normalizePendingMarkdownCreates(rawData?.pendingMarkdownCreates),
     pendingMarkdownMerges: normalizePendingMarkdownMerges(rawData?.pendingMarkdownMerges),
     pendingBinaryWrites: normalizePendingBinaryWrites(rawData?.pendingBinaryWrites),
+    binaryTransfers: normalizeBinaryTransfers(rawData?.binaryTransfers),
     deviceId: rawData?.deviceId ?? defaults.deviceId,
     logs: Array.isArray(rawData?.logs) ? rawData.logs.slice(-100) : defaults.logs
   };
@@ -475,6 +507,73 @@ function normalizePendingBinaryWrites(
   }
 
   return entries;
+}
+
+function normalizeBinaryTransfers(
+  rawTransfers: unknown
+): Record<string, RolayBinaryTransferEntry> {
+  if (!rawTransfers || typeof rawTransfers !== "object") {
+    return {};
+  }
+
+  const entries: Record<string, RolayBinaryTransferEntry> = {};
+  for (const [rawLocalPath, rawTransfer] of Object.entries(rawTransfers)) {
+    if (!rawTransfer || typeof rawTransfer !== "object") {
+      continue;
+    }
+
+    const candidate = rawTransfer as Partial<RolayBinaryTransferEntry>;
+    const localPath = normalizeStoredPath(candidate.localPath ?? rawLocalPath);
+    const serverPath = normalizeStoredPath(candidate.serverPath ?? "");
+    const workspaceId = typeof candidate.workspaceId === "string" ? candidate.workspaceId.trim() : "";
+    const kind = candidate.kind === "download" ? "download" : candidate.kind === "upload" ? "upload" : null;
+    const status = normalizeBinaryTransferStatus(candidate.status);
+    if (!localPath || !serverPath || !workspaceId || !kind || !status) {
+      continue;
+    }
+
+    const normalizedHash = normalizeSha256Hash(candidate.hash) ?? null;
+    entries[localPath] = {
+      workspaceId,
+      entryId: typeof candidate.entryId === "string" && candidate.entryId.trim() ? candidate.entryId.trim() : null,
+      localPath,
+      serverPath,
+      kind,
+      status,
+      bytesTotal: typeof candidate.bytesTotal === "number" && candidate.bytesTotal >= 0 ? candidate.bytesTotal : 0,
+      bytesDone: typeof candidate.bytesDone === "number" && candidate.bytesDone >= 0 ? candidate.bytesDone : 0,
+      hash: normalizedHash,
+      mimeType: typeof candidate.mimeType === "string" && candidate.mimeType.trim()
+        ? candidate.mimeType.trim()
+        : null,
+      uploadId: typeof candidate.uploadId === "string" && candidate.uploadId.trim()
+        ? candidate.uploadId.trim()
+        : null,
+      rangeSupported: Boolean(candidate.rangeSupported),
+      createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : new Date().toISOString(),
+      updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : new Date().toISOString(),
+      lastError: typeof candidate.lastError === "string" ? candidate.lastError : null
+    };
+  }
+
+  return entries;
+}
+
+function normalizeBinaryTransferStatus(
+  status: unknown
+): RolayBinaryTransferStatus | null {
+  switch (status) {
+    case "preparing":
+    case "uploading":
+    case "canceling":
+    case "downloading":
+    case "committing":
+    case "done":
+    case "failed":
+      return status;
+    default:
+      return null;
+  }
 }
 
 function normalizeUser(user: User | null | undefined): User | null {

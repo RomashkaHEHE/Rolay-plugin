@@ -58,6 +58,13 @@ export interface BlobDownloadResult {
   hash: string | null;
 }
 
+export interface BlobDownloadStreamResult {
+  contentType: string | null;
+  contentLength: number | null;
+  hash: string | null;
+  status: number;
+}
+
 const MAX_BINARY_REDIRECTS = 5;
 
 export class RolayApiError extends Error {
@@ -344,6 +351,8 @@ export class RolayApiClient {
     uploadId: string,
     data: ArrayBuffer,
     expectedHash: string,
+    startOffset = 0,
+    totalSize = data.byteLength,
     onProgress?: (progress: BlobTransferProgress) => void,
     signal?: AbortSignal,
     fallbackTarget?: BlobUploadTicketResponse["upload"]
@@ -356,6 +365,8 @@ export class RolayApiClient {
         path,
         data,
         expectedHash,
+        startOffset,
+        totalSize,
         onProgress,
         signal
       );
@@ -368,12 +379,19 @@ export class RolayApiClient {
         throw error;
       }
 
+      if (startOffset > 0) {
+        throw error;
+      }
+
       try {
         await this.uploadBlobToTarget(fallbackTarget, data, onProgress, signal);
         return {
           ok: true,
           hash: expectedHash,
-          sizeBytes: data.byteLength
+          sizeBytes: totalSize,
+          uploadedBytes: totalSize,
+          receivedBytes: totalSize,
+          complete: true
         };
       } catch (fallbackError) {
         if (fallbackError instanceof Error && fallbackError.name === "AbortError") {
@@ -550,6 +568,16 @@ export class RolayApiClient {
     throw new Error(`Blob download failed via all transports (${transportErrors.join("; ")})`);
   }
 
+  async downloadBlobContent(
+    url: string,
+    offset: number,
+    onChunk: (chunk: ArrayBuffer) => Promise<void> | void,
+    onProgress?: (progress: BlobTransferProgress) => void,
+    signal?: AbortSignal
+  ): Promise<BlobDownloadStreamResult> {
+    return this.downloadBlobContentWithRefresh(url, offset, onChunk, onProgress, signal);
+  }
+
   async fetchAuthorizedStream(path: string, init: RequestInit = {}): Promise<Response> {
     const initialToken = await this.getAccessToken();
     let response = await this.fetchStream(path, initialToken, init);
@@ -653,6 +681,10 @@ export class RolayApiClient {
   }
 
   private buildUrl(path: string): string {
+    if (/^https?:\/\//i.test(path)) {
+      return path;
+    }
+
     const baseUrl = this.config.getServerUrl().trim().replace(/\/+$/, "");
     if (!baseUrl) {
       throw new Error("Server URL is empty.");
@@ -682,10 +714,145 @@ export class RolayApiClient {
     return createTextError(response.status, responseText, fallbackMessage);
   }
 
+  private async downloadBlobContentWithRefresh(
+    url: string,
+    offset: number,
+    onChunk: (chunk: ArrayBuffer) => Promise<void> | void,
+    onProgress?: (progress: BlobTransferProgress) => void,
+    signal?: AbortSignal
+  ): Promise<BlobDownloadStreamResult> {
+    const initialToken = await this.getAccessToken();
+
+    try {
+      return await this.performAuthorizedBlobDownload(
+        url,
+        initialToken,
+        offset,
+        onChunk,
+        onProgress,
+        signal
+      );
+    } catch (error) {
+      if (!(error instanceof RolayApiError) || error.status !== 401) {
+        throw error;
+      }
+
+      await this.refresh();
+      const nextToken = await this.getAccessToken();
+      return this.performAuthorizedBlobDownload(
+        url,
+        nextToken,
+        offset,
+        onChunk,
+        onProgress,
+        signal
+      );
+    }
+  }
+
+  private async performAuthorizedBlobDownload(
+    url: string,
+    accessToken: string,
+    offset: number,
+    onChunk: (chunk: ArrayBuffer) => Promise<void> | void,
+    onProgress?: (progress: BlobTransferProgress) => void,
+    signal?: AbortSignal
+  ): Promise<BlobDownloadStreamResult> {
+    const headers: Record<string, string> = {
+      Accept: "application/octet-stream",
+      Authorization: `Bearer ${accessToken}`
+    };
+    if (offset > 0) {
+      headers.Range = `bytes=${offset}-`;
+    }
+
+    const absoluteUrl = this.buildUrl(url);
+    const mappedProgress = mapTransferProgress(onProgress, offset, 0);
+
+    const electronDownload = tryElectronBinaryDownloadStream(
+      absoluteUrl,
+      headers,
+      offset,
+      onChunk,
+      mappedProgress,
+      signal
+    );
+    if (electronDownload) {
+      try {
+        return await electronDownload;
+      } catch (error) {
+        if (error instanceof RolayApiError || (error instanceof Error && error.name === "AbortError")) {
+          throw error;
+        }
+      }
+    }
+
+    const nodeDownload = tryNodeBinaryDownloadStream(
+      absoluteUrl,
+      headers,
+      offset,
+      onChunk,
+      mappedProgress,
+      signal
+    );
+    if (nodeDownload) {
+      try {
+        return await nodeDownload;
+      } catch (error) {
+        if (error instanceof RolayApiError || (error instanceof Error && error.name === "AbortError")) {
+          throw error;
+        }
+      }
+    }
+
+    try {
+      return await fetchBinaryDownloadStream(
+        absoluteUrl,
+        headers,
+        offset,
+        onChunk,
+        mappedProgress,
+        signal
+      );
+    } catch (error) {
+      if (error instanceof RolayApiError || (error instanceof Error && error.name === "AbortError")) {
+        throw error;
+      }
+    }
+
+    const download = await xhrBinaryRequest<BlobDownloadResult>({
+      method: "GET",
+      url: absoluteUrl,
+      headers,
+      responseType: "arraybuffer",
+      signal,
+      onDownloadProgress: mappedProgress,
+      mapResponse: (request) => {
+        const data = normalizeArrayBufferResponse(request.response);
+        return {
+          data,
+          contentType: request.getResponseHeader("Content-Type"),
+          contentLength: parseContentLengthHeader(request.getResponseHeader("Content-Length")),
+          hash: request.getResponseHeader("X-Rolay-Blob-Hash")
+        };
+      }
+    });
+
+    await onChunk(download.data);
+    return {
+      contentType: download.contentType,
+      contentLength: download.contentLength,
+      hash: download.hash,
+      status: offset > 0 ? 206 : 200
+    };
+  }
+
   private async uploadBlobContentWithRefresh(
     path: string,
     data: ArrayBuffer,
     expectedHash: string,
+    startOffset: number,
+    totalSize: number,
     onProgress?: (progress: BlobTransferProgress) => void,
     signal?: AbortSignal
   ): Promise<BlobUploadContentResponse> {
@@ -697,6 +864,8 @@ export class RolayApiClient {
         initialToken,
         data,
         expectedHash,
+        startOffset,
+        totalSize,
         onProgress,
         signal
       );
@@ -712,6 +881,8 @@ export class RolayApiClient {
         nextToken,
         data,
         expectedHash,
+        startOffset,
+        totalSize,
         onProgress,
         signal
       );
@@ -723,6 +894,8 @@ export class RolayApiClient {
     accessToken: string,
     data: ArrayBuffer,
     expectedHash: string,
+    startOffset: number,
+    totalSize: number,
     onProgress?: (progress: BlobTransferProgress) => void,
     signal?: AbortSignal
   ): Promise<BlobUploadContentResponse> {
@@ -731,6 +904,10 @@ export class RolayApiClient {
       Authorization: `Bearer ${accessToken}`,
       "Content-Type": "application/octet-stream"
     };
+    if (data.byteLength > 0 && totalSize > 0) {
+      headers["Content-Range"] =
+        `bytes ${startOffset}-${startOffset + data.byteLength - 1}/${totalSize}`;
+    }
 
     const absoluteUrl = this.buildUrl(path);
 
@@ -741,7 +918,7 @@ export class RolayApiClient {
         headers
       },
       data,
-      onProgress,
+      mapTransferProgress(onProgress, startOffset, totalSize),
       signal
     );
     if (nodeResponse) {
@@ -750,7 +927,7 @@ export class RolayApiClient {
         return parseBlobUploadContentResponse(
           response.text,
           expectedHash,
-          data.byteLength
+          totalSize
         );
       }
 
@@ -764,12 +941,12 @@ export class RolayApiClient {
         headers,
         body: data,
         signal,
-        onUploadProgress: onProgress,
+        onUploadProgress: mapTransferProgress(onProgress, startOffset, totalSize),
         mapResponse: (request) => {
           return parseBlobUploadContentResponse(
             extractXhrResponseText(request),
             expectedHash,
-            data.byteLength
+            totalSize
           );
         }
       });
@@ -791,14 +968,14 @@ export class RolayApiClient {
     }
 
     onProgress?.({
-      loadedBytes: data.byteLength,
-      totalBytes: data.byteLength
+      loadedBytes: totalSize,
+      totalBytes: totalSize
     });
 
     return parseBlobUploadContentResponse(
       await response.text(),
       expectedHash,
-      data.byteLength
+      totalSize
     );
   }
 }
@@ -1447,6 +1624,286 @@ function startElectronBinaryDownload(
   });
 }
 
+function tryNodeBinaryDownloadStream(
+  url: string,
+  headers: Record<string, string>,
+  offset: number,
+  onChunk: (chunk: ArrayBuffer) => Promise<void> | void,
+  onProgress?: (progress: BlobTransferProgress) => void,
+  signal?: AbortSignal
+): Promise<BlobDownloadStreamResult> | null {
+  const nodeRequire = getNodeRequire();
+  if (!nodeRequire) {
+    return null;
+  }
+
+  const targetUrl = new URL(url);
+  const requestModule = nodeRequire(targetUrl.protocol === "https:" ? "node:https" : "node:http") as {
+    request: (
+      options: {
+        protocol: string;
+        hostname: string;
+        port?: number;
+        path: string;
+        method: string;
+        headers: Record<string, string>;
+      },
+      callback: (response: NodeLikeIncomingMessage) => void
+    ) => NodeLikeClientRequest;
+  };
+
+  return new Promise<BlobDownloadStreamResult>((resolve, reject) => {
+    let settled = false;
+    let loadedBytes = 0;
+    let request!: NodeLikeClientRequest;
+
+    const cleanup = () => {
+      signal?.removeEventListener("abort", abortHandler);
+    };
+
+    const finishResolve = (result: BlobDownloadStreamResult) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+
+    const finishReject = (error: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+
+    const abortHandler = () => {
+      request.destroy(createAbortError());
+      finishReject(createAbortError());
+    };
+
+    if (signal?.aborted) {
+      finishReject(createAbortError());
+      return;
+    }
+
+    signal?.addEventListener("abort", abortHandler, { once: true });
+    request = requestModule.request(
+      {
+        protocol: targetUrl.protocol,
+        hostname: targetUrl.hostname,
+        port: targetUrl.port ? Number(targetUrl.port) : undefined,
+        path: `${targetUrl.pathname}${targetUrl.search}`,
+        method: "GET",
+        headers
+      },
+      (response) => {
+        const status = response.statusCode ?? 0;
+        const errorChunks: Uint8Array[] = [];
+        if (status >= 200 && status < 300) {
+          ensureRangeRequestHonored(
+            status,
+            (name) => getHeaderValue(response.headers, name),
+            offset
+          );
+        }
+        const totalBytes = parseContentLengthHeader(getHeaderValue(response.headers, "content-length"));
+
+        response.on("data", (chunk: unknown) => {
+          const bytes =
+            typeof chunk === "string"
+              ? new Uint8Array(Buffer.from(chunk))
+              : chunk instanceof Uint8Array
+                ? new Uint8Array(chunk)
+                : new Uint8Array(Buffer.from(chunk as ArrayBuffer));
+          if (status < 200 || status >= 300) {
+            errorChunks.push(bytes);
+            return;
+          }
+          loadedBytes += bytes.byteLength;
+          Promise.resolve(onChunk(toOwnedArrayBuffer(bytes))).catch(finishReject);
+          onProgress?.({
+            loadedBytes,
+            totalBytes: totalBytes ?? loadedBytes
+          });
+        });
+
+        response.on("end", () => {
+          if (status < 200 || status >= 300) {
+            finishReject(
+              createTextError(
+                status,
+                Buffer.concat(errorChunks.map((chunk) => Buffer.from(chunk))).toString("utf8"),
+                response.statusMessage ?? `HTTP ${status}`
+              )
+            );
+            return;
+          }
+
+          finishResolve({
+            contentType: getHeaderValue(response.headers, "content-type"),
+            contentLength: totalBytes,
+            hash: getHeaderValue(response.headers, "x-rolay-blob-hash"),
+            status
+          });
+        });
+      }
+    );
+
+    request.on("error", (error: Error) => {
+      finishReject(new Error(`Request to ${url} failed: ${error.message}`));
+    });
+
+    request.end();
+  });
+}
+
+function tryElectronBinaryDownloadStream(
+  url: string,
+  headers: Record<string, string>,
+  offset: number,
+  onChunk: (chunk: ArrayBuffer) => Promise<void> | void,
+  onProgress?: (progress: BlobTransferProgress) => void,
+  signal?: AbortSignal
+): Promise<BlobDownloadStreamResult> | null {
+  const nodeRequire = getNodeRequire();
+  if (!nodeRequire) {
+    return null;
+  }
+
+  let electronModule: {
+    net?: {
+      request: (options: {
+        method: string;
+        url: string;
+      }) => ElectronLikeClientRequest;
+    };
+  } | null = null;
+  try {
+    electronModule = nodeRequire("electron") as {
+      net?: {
+        request: (options: {
+          method: string;
+          url: string;
+        }) => ElectronLikeClientRequest;
+      };
+    };
+  } catch {
+    return null;
+  }
+
+  if (!electronModule?.net?.request) {
+    return null;
+  }
+  const electronNet = electronModule.net;
+
+  return new Promise<BlobDownloadStreamResult>((resolve, reject) => {
+    let settled = false;
+    let loadedBytes = 0;
+    const request = electronNet.request({
+      method: "GET",
+      url
+    });
+
+    const cleanup = () => {
+      signal?.removeEventListener("abort", abortHandler);
+    };
+
+    const finishResolve = (result: BlobDownloadStreamResult) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      resolve(result);
+    };
+
+    const finishReject = (error: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      cleanup();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+
+    const abortHandler = () => {
+      request.abort();
+      finishReject(createAbortError());
+    };
+
+    if (signal?.aborted) {
+      finishReject(createAbortError());
+      return;
+    }
+
+    signal?.addEventListener("abort", abortHandler, { once: true });
+    for (const [headerName, headerValue] of Object.entries(headers)) {
+      request.setHeader(headerName, headerValue);
+    }
+
+    request.on("response", (response) => {
+      const status = response.statusCode ?? 0;
+      const errorChunks: Uint8Array[] = [];
+      if (status >= 200 && status < 300) {
+        ensureRangeRequestHonored(
+          status,
+          (name) => getHeaderValue(response.headers, name),
+          offset
+        );
+      }
+      const totalBytes = parseContentLengthHeader(getHeaderValue(response.headers, "content-length"));
+
+      response.on("data", (chunk: unknown) => {
+        const bytes =
+          typeof chunk === "string"
+            ? new Uint8Array(Buffer.from(chunk))
+            : chunk instanceof Uint8Array
+              ? new Uint8Array(chunk)
+              : new Uint8Array(Buffer.from(chunk as ArrayBuffer));
+        if (status < 200 || status >= 300) {
+          errorChunks.push(bytes);
+          return;
+        }
+        loadedBytes += bytes.byteLength;
+        Promise.resolve(onChunk(toOwnedArrayBuffer(bytes))).catch(finishReject);
+        onProgress?.({
+          loadedBytes,
+          totalBytes: totalBytes ?? loadedBytes
+        });
+      });
+
+      response.on("end", () => {
+        if (status < 200 || status >= 300) {
+          finishReject(
+            createTextError(
+              status,
+              Buffer.concat(errorChunks.map((chunk) => Buffer.from(chunk))).toString("utf8"),
+              response.statusMessage ?? `HTTP ${status}`
+            )
+          );
+          return;
+        }
+
+        finishResolve({
+          contentType: getHeaderValue(response.headers, "content-type"),
+          contentLength: totalBytes,
+          hash: getHeaderValue(response.headers, "x-rolay-blob-hash"),
+          status
+        });
+      });
+    });
+
+    request.on("error", (error: Error) => {
+      finishReject(new Error(`Request to ${url} failed: ${error.message}`));
+    });
+
+    request.end();
+  });
+}
+
 interface NodeLikeIncomingMessage {
   statusCode?: number;
   statusMessage?: string;
@@ -1620,21 +2077,36 @@ function parseBlobUploadContentResponse(
     return {
       ok: true,
       hash: expectedHash,
-      sizeBytes: fallbackSizeBytes
+      sizeBytes: fallbackSizeBytes,
+      uploadedBytes: fallbackSizeBytes,
+      receivedBytes: fallbackSizeBytes,
+      complete: true
     };
   }
 
   try {
     const parsed = JSON.parse(responseText) as Partial<BlobUploadContentResponse>;
     if (parsed?.ok === true) {
+      const sizeBytes = typeof parsed.sizeBytes === "number" && parsed.sizeBytes >= 0
+        ? parsed.sizeBytes
+        : fallbackSizeBytes;
+      const uploadedBytes = typeof parsed.uploadedBytes === "number" && parsed.uploadedBytes >= 0
+        ? parsed.uploadedBytes
+        : typeof parsed.receivedBytes === "number" && parsed.receivedBytes >= 0
+          ? parsed.receivedBytes
+          : sizeBytes;
       return {
         ok: true,
+        uploadId: typeof parsed.uploadId === "string" && parsed.uploadId.trim() ? parsed.uploadId : undefined,
+        receivedBytes: typeof parsed.receivedBytes === "number" && parsed.receivedBytes >= 0
+          ? parsed.receivedBytes
+          : uploadedBytes,
+        uploadedBytes,
+        complete: parsed.complete === true,
         hash: typeof parsed.hash === "string" && parsed.hash.trim()
           ? parsed.hash
           : expectedHash,
-        sizeBytes: typeof parsed.sizeBytes === "number" && parsed.sizeBytes >= 0
-          ? parsed.sizeBytes
-          : fallbackSizeBytes
+        sizeBytes
       };
     }
   } catch {
@@ -1644,7 +2116,10 @@ function parseBlobUploadContentResponse(
   return {
     ok: true,
     hash: expectedHash,
-    sizeBytes: fallbackSizeBytes
+    sizeBytes: fallbackSizeBytes,
+    uploadedBytes: fallbackSizeBytes,
+    receivedBytes: fallbackSizeBytes,
+    complete: true
   };
 }
 
@@ -1726,6 +2201,101 @@ function toOwnedArrayBuffer(bytes: Uint8Array): ArrayBuffer {
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   return copy.buffer;
+}
+
+function mapTransferProgress(
+  onProgress: ((progress: BlobTransferProgress) => void) | undefined,
+  baseLoadedBytes: number,
+  knownTotalBytes: number
+): ((progress: BlobTransferProgress) => void) | undefined {
+  if (!onProgress) {
+    return undefined;
+  }
+
+  return (progress) => {
+    const totalBytes =
+      knownTotalBytes > 0
+        ? knownTotalBytes
+        : progress.totalBytes > 0
+          ? baseLoadedBytes + progress.totalBytes
+          : baseLoadedBytes + progress.loadedBytes;
+    onProgress({
+      loadedBytes: baseLoadedBytes + progress.loadedBytes,
+      totalBytes
+    });
+  };
+}
+
+function ensureRangeRequestHonored(
+  status: number,
+  getHeader: (name: string) => string | null,
+  offset: number
+): void {
+  if (offset <= 0) {
+    return;
+  }
+
+  const contentRange = getHeader("Content-Range");
+  if (status === 206 && contentRange) {
+    return;
+  }
+
+  throw new Error(`Range request starting at ${offset} was not honored by the server.`);
+}
+
+async function fetchBinaryDownloadStream(
+  url: string,
+  headers: Record<string, string>,
+  offset: number,
+  onChunk: (chunk: ArrayBuffer) => Promise<void> | void,
+  onProgress?: (progress: BlobTransferProgress) => void,
+  signal?: AbortSignal
+): Promise<BlobDownloadStreamResult> {
+  const response = await fetch(url, {
+    method: "GET",
+    headers,
+    signal
+  });
+
+  if (!response.ok) {
+    const responseText = await response.text();
+    throw createTextError(response.status, responseText, `HTTP ${response.status}`);
+  }
+
+  if (!response.body) {
+    throw new Error("Binary download response body is empty.");
+  }
+
+  ensureRangeRequestHonored(response.status, (name) => response.headers.get(name), offset);
+
+  const totalBytes = parseContentLengthHeader(response.headers.get("Content-Length"));
+  const reader = response.body.getReader();
+  let loadedBytes = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    if (!value) {
+      continue;
+    }
+
+    loadedBytes += value.byteLength;
+    await onChunk(toOwnedArrayBuffer(value));
+    onProgress?.({
+      loadedBytes,
+      totalBytes: totalBytes ?? loadedBytes
+    });
+  }
+
+  return {
+    contentType: response.headers.get("Content-Type"),
+    contentLength: totalBytes,
+    hash: response.headers.get("X-Rolay-Blob-Hash"),
+    status: response.status
+  };
 }
 
 async function fetchBinaryDownload(

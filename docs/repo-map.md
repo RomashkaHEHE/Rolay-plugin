@@ -256,8 +256,9 @@ Look at:
 
 Important current constraint:
 
-- persisted `pendingBinaryWrites` let the plugin retry binary uploads after reconnect/restart
-- `BinaryTransferState` itself is still runtime-only, so current crash recovery is replay-based rather than byte-offset resume
+- active binary transfers are persisted in `data.json` under `binaryTransfers`
+- uploads resume from server-reported `uploadedBytes`
+- downloads resume from `.part` files in `.obsidian/plugins/rolay/transfers/`
 
 ### "Settings/admin UI is stale or weirdly reset"
 

@@ -278,6 +278,7 @@ export interface BlobUploadTicketResponse {
   hash: string;
   sizeBytes: number;
   mimeType: string;
+  uploadedBytes: number;
   expiresAt: string;
   upload?: UploadTarget;
   cancel?: CancelTarget;
@@ -285,14 +286,20 @@ export interface BlobUploadTicketResponse {
 
 export interface BlobUploadContentResponse {
   ok: boolean;
-  hash: string;
+  uploadId?: string;
+  receivedBytes?: number;
+  uploadedBytes?: number;
   sizeBytes: number;
+  complete?: boolean;
+  hash?: string;
 }
 
 export interface BlobDownloadTicketResponse {
   hash: string;
   sizeBytes: number;
   mimeType: string;
+  contentUrl?: string;
+  rangeSupported?: boolean;
   url: string;
 }
 

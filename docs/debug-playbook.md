@@ -72,8 +72,9 @@ Check:
 
 Check:
 
-1. whether the transfer only existed in runtime `BinaryTransferState`
-2. whether `pendingBinaryWrites` in `data.json` still points at the local file
+1. whether `binaryTransfers` in `data.json` still contains the task
+2. whether `pendingBinaryWrites` in `data.json` still points at the local upload file
+3. whether the `.part` file exists for downloads in `.obsidian/plugins/rolay/transfers/`
 3. [src/main.ts](../src/main.ts):
    - `rememberPendingBinaryWrite`
    - `reconcilePendingBinaryWrites`
@@ -81,11 +82,9 @@ Check:
 
 Current expectation:
 
-- uploads/downloads can be replayed after restart
-- true byte-offset resume is not implemented yet
-- roadmap and required server changes are tracked in:
-  - [roadmap.md](./roadmap.md)
-  - [../info-for-server/FILE_TRANSFER_RESUME_TASK.md](../info-for-server/FILE_TRANSFER_RESUME_TASK.md)
+- uploads resume from the server-reported offset in `upload-ticket.uploadedBytes`
+- downloads resume from the local `.part` file size plus ranged `GET /blob/content`
+- the final vault file should only be written after full hash verification succeeds
 
 ### Markdown opens but live sync is weird
 
