@@ -18756,8 +18756,16 @@ ${keptTail}`;
     return container.querySelector(".inline-title") ?? container.querySelector(".view-content .inline-title");
   }
   getExplorerNotePresenceBadges() {
-    const badges = /* @__PURE__ */ new Map();
+    const aggregate = /* @__PURE__ */ new Map();
+    const downloadedRooms = new Map(
+      this.getDownloadedRooms().map((room) => [room.workspaceId, room])
+    );
     for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
+      const downloadedRoom = downloadedRooms.get(workspaceId);
+      if (!downloadedRoom) {
+        continue;
+      }
+      const roomRoot = (0, import_obsidian9.normalizePath)(getRoomRoot(this.data.settings.syncRoot, downloadedRoom.folderName));
       for (const [entryId, viewers] of runtime.notePresenceByEntryId.entries()) {
         if (viewers.length === 0) {
           continue;
@@ -18770,13 +18778,38 @@ ${keptTail}`;
         if (!localPath) {
           continue;
         }
-        badges.set((0, import_obsidian9.normalizePath)(localPath), {
-          count: viewers.length,
-          color: viewers.length === 1 ? viewers[0].color : "var(--interactive-accent, #8b5cf6)"
-        });
+        const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+        this.accumulateExplorerNotePresenceBadge(aggregate, normalizedLocalPath, viewers);
+        let parentPath = getParentPath2(normalizedLocalPath);
+        while (parentPath) {
+          if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
+            break;
+          }
+          this.accumulateExplorerNotePresenceBadge(aggregate, parentPath, viewers);
+          if (parentPath === roomRoot) {
+            break;
+          }
+          parentPath = getParentPath2(parentPath);
+        }
       }
     }
+    const badges = /* @__PURE__ */ new Map();
+    for (const [localPath, state] of aggregate) {
+      badges.set(localPath, {
+        count: state.count,
+        color: state.count === 1 ? state.soleColor ?? "var(--interactive-accent, #8b5cf6)" : "var(--interactive-accent, #8b5cf6)"
+      });
+    }
     return badges;
+  }
+  accumulateExplorerNotePresenceBadge(aggregate, localPath, viewers) {
+    const existing = aggregate.get(localPath);
+    const nextCount = (existing?.count ?? 0) + viewers.length;
+    const nextSoleColor = nextCount === 1 ? viewers[0]?.color ?? existing?.soleColor ?? null : null;
+    aggregate.set(localPath, {
+      count: nextCount,
+      soleColor: nextSoleColor
+    });
   }
   updateExplorerNotePresenceBadge(element2, badgeState) {
     const titleHost = this.findExplorerTitleHost(element2);

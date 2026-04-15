@@ -2717,9 +2717,18 @@ export default class RolayPlugin extends Plugin {
   }
 
   private getExplorerNotePresenceBadges(): Map<string, ExplorerNotePresenceBadgeState> {
-    const badges = new Map<string, ExplorerNotePresenceBadgeState>();
+    const aggregate = new Map<string, { count: number; soleColor: string | null }>();
+    const downloadedRooms = new Map(
+      this.getDownloadedRooms().map((room) => [room.workspaceId, room] as const)
+    );
 
     for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
+      const downloadedRoom = downloadedRooms.get(workspaceId);
+      if (!downloadedRoom) {
+        continue;
+      }
+
+      const roomRoot = normalizePath(getRoomRoot(this.data.settings.syncRoot, downloadedRoom.folderName));
       for (const [entryId, viewers] of runtime.notePresenceByEntryId.entries()) {
         if (viewers.length === 0) {
           continue;
@@ -2735,14 +2744,54 @@ export default class RolayPlugin extends Plugin {
           continue;
         }
 
-        badges.set(normalizePath(localPath), {
-          count: viewers.length,
-          color: viewers.length === 1 ? viewers[0].color : "var(--interactive-accent, #8b5cf6)"
-        });
+        const normalizedLocalPath = normalizePath(localPath);
+        this.accumulateExplorerNotePresenceBadge(aggregate, normalizedLocalPath, viewers);
+
+        let parentPath = getParentPath(normalizedLocalPath);
+        while (parentPath) {
+          if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
+            break;
+          }
+
+          this.accumulateExplorerNotePresenceBadge(aggregate, parentPath, viewers);
+          if (parentPath === roomRoot) {
+            break;
+          }
+
+          parentPath = getParentPath(parentPath);
+        }
       }
     }
 
+    const badges = new Map<string, ExplorerNotePresenceBadgeState>();
+    for (const [localPath, state] of aggregate) {
+      badges.set(localPath, {
+        count: state.count,
+        color: state.count === 1
+          ? (state.soleColor ?? "var(--interactive-accent, #8b5cf6)")
+          : "var(--interactive-accent, #8b5cf6)"
+      });
+    }
+
     return badges;
+  }
+
+  private accumulateExplorerNotePresenceBadge(
+    aggregate: Map<string, { count: number; soleColor: string | null }>,
+    localPath: string,
+    viewers: NotePresenceViewer[]
+  ): void {
+    const existing = aggregate.get(localPath);
+    const nextCount = (existing?.count ?? 0) + viewers.length;
+    const nextSoleColor =
+      nextCount === 1
+        ? viewers[0]?.color ?? existing?.soleColor ?? null
+        : null;
+
+    aggregate.set(localPath, {
+      count: nextCount,
+      soleColor: nextSoleColor
+    });
   }
 
   private updateExplorerNotePresenceBadge(
