@@ -1,4 +1,4 @@
-import { RangeSetBuilder, StateEffect, StateField, type Extension } from "@codemirror/state";
+import { RangeSetBuilder, StateEffect, StateField, type ChangeDesc, type Extension } from "@codemirror/state";
 import { Decoration, EditorView, WidgetType, type DecorationSet } from "@codemirror/view";
 import { MarkdownView, editorInfoField, type App, type Editor } from "obsidian";
 
@@ -26,14 +26,21 @@ interface SharedCursorUiState {
   inlineVisible: boolean;
 }
 
+interface SharedPresenceViewState {
+  lastSignature: string | null;
+  lastDocChangeAt: number;
+  renderedPresences: Map<string, SharedCursorPresence>;
+}
+
 const setRemotePresenceEffect = StateEffect.define<SharedCursorPresence[]>();
 const END_OF_LINE_LABEL_DELAY_MS = 700;
+const STALE_REMOTE_CURSOR_REJECT_WINDOW_MS = 500;
 const sharedCursorUiState = new Map<string, SharedCursorUiState>();
-// CodeMirror already remaps remote cursor decorations through local document
-// transactions. We keep the last remote-awareness signature per view so a
-// local awareness update does not immediately re-render the cursor back to a
-// stale absolute offset and cause visible jitter.
-const lastPresenceSignatureByView = new WeakMap<EditorView, string>();
+// CodeMirror remaps remote cursor decorations through local document
+// transactions immediately. We also mirror that remap in view state so a
+// delayed awareness packet with pre-remap offsets does not yank the cursor
+// backwards and make it "chase" its true position.
+const sharedPresenceViewState = new WeakMap<EditorView, SharedPresenceViewState>();
 
 const remotePresenceField = StateField.define<DecorationSet>({
   create() {
@@ -59,6 +66,10 @@ export function createSharedPresenceExtension(
   return [
     remotePresenceField,
     EditorView.updateListener.of((update) => {
+      if (update.docChanged) {
+        recordMappedRemotePresence(update.view, update.changes);
+      }
+
       if (!update.selectionSet && !update.docChanged && !update.focusChanged) {
         return;
       }
@@ -97,14 +108,19 @@ export function getMarkdownViewsForFile(app: App, filePath: string): MarkdownVie
 }
 
 export function setRemotePresenceDecorations(view: EditorView, presences: SharedCursorPresence[]): void {
-  const nextSignature = getPresenceSignature(presences);
-  if (lastPresenceSignatureByView.get(view) === nextSignature) {
+  const stabilizedPresences = stabilizeIncomingPresences(view, presences);
+  const nextSignature = getPresenceSignature(stabilizedPresences);
+  const viewState = getSharedPresenceViewState(view);
+  if (viewState.lastSignature === nextSignature) {
     return;
   }
 
-  lastPresenceSignatureByView.set(view, nextSignature);
+  viewState.lastSignature = nextSignature;
+  viewState.renderedPresences = new Map(
+    stabilizedPresences.map((presence) => [getSharedCursorKey(presence), cloneSharedCursorPresence(presence)] as const)
+  );
   view.dispatch({
-    effects: setRemotePresenceEffect.of(presences)
+    effects: setRemotePresenceEffect.of(stabilizedPresences)
   });
 }
 
@@ -218,6 +234,90 @@ function isEditorView(value: unknown): value is EditorView {
     && "state" in value
     && "dom" in value
     && "hasFocus" in value;
+}
+
+function getSharedPresenceViewState(view: EditorView): SharedPresenceViewState {
+  const existing = sharedPresenceViewState.get(view);
+  if (existing) {
+    return existing;
+  }
+
+  const created: SharedPresenceViewState = {
+    lastSignature: null,
+    lastDocChangeAt: 0,
+    renderedPresences: new Map()
+  };
+  sharedPresenceViewState.set(view, created);
+  return created;
+}
+
+function recordMappedRemotePresence(view: EditorView, changes: ChangeDesc): void {
+  const viewState = getSharedPresenceViewState(view);
+  viewState.lastDocChangeAt = Date.now();
+  if (viewState.renderedPresences.size === 0) {
+    return;
+  }
+
+  const remappedPresences = new Map<string, SharedCursorPresence>();
+  for (const [cursorKey, presence] of viewState.renderedPresences) {
+    remappedPresences.set(cursorKey, {
+      ...presence,
+      selection: {
+        anchor: clampOffset(changes.mapPos(presence.selection.anchor, 1), view.state.doc.length),
+        head: clampOffset(changes.mapPos(presence.selection.head, 1), view.state.doc.length)
+      }
+    });
+  }
+
+  viewState.renderedPresences = remappedPresences;
+  viewState.lastSignature = getPresenceSignature([...remappedPresences.values()]);
+}
+
+function stabilizeIncomingPresences(view: EditorView, presences: SharedCursorPresence[]): SharedCursorPresence[] {
+  const viewState = getSharedPresenceViewState(view);
+  if (Date.now() - viewState.lastDocChangeAt > STALE_REMOTE_CURSOR_REJECT_WINDOW_MS) {
+    return presences;
+  }
+
+  return presences.map((presence) => {
+    const current = viewState.renderedPresences.get(getSharedCursorKey(presence));
+    if (!current) {
+      return presence;
+    }
+
+    const incomingHasSelection = presence.selection.anchor !== presence.selection.head;
+    const currentHasSelection = current.selection.anchor !== current.selection.head;
+    if (incomingHasSelection !== currentHasSelection) {
+      return presence;
+    }
+
+    const incomingStart = Math.min(presence.selection.anchor, presence.selection.head);
+    const incomingEnd = Math.max(presence.selection.anchor, presence.selection.head);
+    const currentStart = Math.min(current.selection.anchor, current.selection.head);
+    const currentEnd = Math.max(current.selection.anchor, current.selection.head);
+    const movesBackwards = incomingStart < currentStart || incomingEnd < currentEnd;
+    if (!movesBackwards) {
+      return presence;
+    }
+
+    return {
+      ...presence,
+      selection: {
+        anchor: current.selection.anchor,
+        head: current.selection.head
+      }
+    };
+  });
+}
+
+function cloneSharedCursorPresence(presence: SharedCursorPresence): SharedCursorPresence {
+  return {
+    ...presence,
+    selection: {
+      anchor: presence.selection.anchor,
+      head: presence.selection.head
+    }
+  };
 }
 
 class SharedCursorWidget extends WidgetType {

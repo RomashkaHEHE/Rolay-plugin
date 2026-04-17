@@ -616,7 +616,12 @@ class BoundCrdtSession {
           continue;
         }
 
-        applyTextPatchToEditor(view.editor, currentText, remoteText);
+        applyTextPatchToEditor(
+          view.editor,
+          currentText,
+          remoteText,
+          getCodeMirrorEditorView(view.editor)
+        );
       }
     } finally {
       this.applyingRemoteText = false;

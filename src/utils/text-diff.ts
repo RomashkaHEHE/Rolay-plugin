@@ -1,4 +1,5 @@
 import type { Editor, EditorPosition } from "obsidian";
+import type { EditorView } from "@codemirror/view";
 
 export interface TextPatch {
   start: number;
@@ -42,10 +43,39 @@ export function diffText(currentText: string, nextText: string): TextPatch {
 export function applyTextPatchToEditor(
   editor: Editor,
   currentText: string,
-  nextText: string
+  nextText: string,
+  editorView?: EditorView | null
 ): void {
   const patch = diffText(currentText, nextText);
   if (patch.deleteCount === 0 && patch.insertText.length === 0) {
+    return;
+  }
+
+  if (editorView) {
+    const preservedScrollTop = editorView.scrollDOM.scrollTop;
+    const preservedScrollLeft = editorView.scrollDOM.scrollLeft;
+
+    editorView.dispatch({
+      changes: {
+        from: patch.start,
+        to: patch.start + patch.deleteCount,
+        insert: patch.insertText
+      }
+    });
+
+    // Remote CRDT patches should not yank the local reader/editor viewport to a
+    // different position. CodeMirror keeps document/selection state correct, so
+    // we only restore the viewport that the local user already had.
+    editorView.scrollDOM.scrollTop = preservedScrollTop;
+    editorView.scrollDOM.scrollLeft = preservedScrollLeft;
+    window.requestAnimationFrame(() => {
+      if (!editorView.dom.isConnected) {
+        return;
+      }
+
+      editorView.scrollDOM.scrollTop = preservedScrollTop;
+      editorView.scrollDOM.scrollLeft = preservedScrollLeft;
+    });
     return;
   }
 
