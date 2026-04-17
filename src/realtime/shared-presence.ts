@@ -300,6 +300,10 @@ function stabilizeIncomingPresences(view: EditorView, presences: SharedCursorPre
       return presence;
     }
 
+    // Right after a local doc change, a delayed awareness packet can still
+    // describe the remote cursor before CodeMirror's local remap. Keeping the
+    // already-remapped position for a short window removes the visible
+    // "snap back, then catch up again" jitter without changing server state.
     return {
       ...presence,
       selection: {

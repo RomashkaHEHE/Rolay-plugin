@@ -37,6 +37,31 @@ Key functions:
 
 - `setRemotePresenceDecorations`
 - `getPresenceSignature`
+- `recordMappedRemotePresence`
+- `stabilizeIncomingPresences`
+
+Current expectation:
+
+- CodeMirror remaps the already-rendered remote cursor immediately through local transactions
+- the plugin mirrors that remap in per-view state
+- short-lived stale awareness payloads that would move the cursor backwards are rejected inside a small stabilization window
+
+### Local viewport jumps to the bottom while someone else edits
+
+Check:
+
+1. [src/realtime/crdt-session.ts](../src/realtime/crdt-session.ts)
+2. [src/utils/text-diff.ts](../src/utils/text-diff.ts)
+
+Key functions:
+
+- `syncRemoteIntoOpenEditors`
+- `applyTextPatchToEditor`
+
+Current expectation:
+
+- remote markdown patches should preserve the local editor viewport
+- incoming CRDT text should update the document without forcing a reveal/scroll jump
 
 ### Viewer chips or explorer badges are wrong
 
@@ -49,6 +74,7 @@ Check:
    - `applyNotePresenceUpdate`
    - `renderNotePresenceChipsForView`
    - `getExplorerNotePresenceBadges`
+   - ancestor-folder aggregation logic for note presence
 4. [src/realtime/crdt-session.ts](../src/realtime/crdt-session.ts):
    - `publishLocalViewerPresence`
    - `clearLocalPresence`
@@ -67,6 +93,11 @@ Check:
 4. [src/api/client.ts](../src/api/client.ts):
    - `createBlobDownloadTicket`
    - `downloadBlobFromUrl`
+
+Useful expectation:
+
+- a remote binary placeholder should immediately count as `loading` in the explorer
+- explorer transfer percent badges should come from `binaryTransferState` or from a placeholder-derived `0%` download badge
 
 ### Binary transfer restarts from zero after app restart
 

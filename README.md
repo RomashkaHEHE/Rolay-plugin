@@ -161,6 +161,7 @@ Tag note:
 - Non-markdown files now follow a separate blob flow: initial room snapshot materializes their paths, then the plugin downloads actual bytes through blob download tickets and keeps them updated from authoritative room snapshots/events.
 - Markdown files that are still waiting for safe preload are temporarily protected from local move/rename/delete, and the Files pane marks those notes and their parent folders in red until the room has finished loading them safely.
 - Binary files that are still downloading are also marked red and protected from local move/rename/delete; binary files with a local upload in flight are marked yellow until `commit_blob_revision` publishes the new revision.
+- Explorer badges now show live binary transfer percentages for active upload/download paths, with remote binary placeholders starting at `0%` the moment the file path appears.
 - Settings still do an initial REST snapshot on open, but further profile/rooms/invite/admin updates now come from a dedicated settings SSE stream instead of periodic polling.
 - Runtime sync logs are mirrored into `.obsidian/plugins/rolay/rolay-sync.log` so support/debugging does not depend only on the in-settings log widget.
 - If a locally created offline markdown note collides with a server path on reconnect, the plugin keeps both by renaming the local file to the next free name such as `file(1).md` before retrying the create.
@@ -168,6 +169,9 @@ Tag note:
 - Non-markdown local creates and modifications now upload through `create_binary_placeholder -> upload-ticket -> PUT /v1/files/{entryId}/blob/uploads/{uploadId}/content -> commit_blob_revision`, with byte-based room progress and cancel support. Blob hashes are normalized to canonical `sha256:<base64>`, while legacy hex hashes are still accepted on read. The legacy raw `upload.url` is kept only as a fallback, not the main path.
 - Current binary crash recovery is replay-based, not yet true byte-offset resume: after restart the plugin can retry pending uploads/downloads from authoritative state, but resumable transfer sessions are future work and tracked in [docs/roadmap.md](docs/roadmap.md).
 - If a local binary file conflicts with an already existing remote path or with a newer incoming blob revision, the plugin renames the local file to the next free Explorer-style filename such as `file(1).pdf` so both copies survive.
+- Room note presence now drives two explorer surfaces: per-note badges and aggregated ancestor-folder badges inside the downloaded room root.
+- Remote markdown patches preserve the local viewport while applying incoming CRDT text, so active collaboration should not yank the local reader/editor to the bottom of the document.
+- Remote cursor stabilization now mirrors CodeMirror remapping locally and ignores short-lived stale backward awareness offsets, reducing the "cursor chases its true position" jitter when someone types before a stationary remote cursor.
 - Admin account creation currently supports `writer` and `reader` global roles.
 - Session credentials are still stored in Obsidian plugin data for MVP speed. Hardening storage is future work.
 - Successful password changes immediately replace the stored access token, refresh token, and saved login password used by the plugin.

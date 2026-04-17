@@ -2749,6 +2749,10 @@ export default class RolayPlugin extends Plugin {
 
         let parentPath = getParentPath(normalizedLocalPath);
         while (parentPath) {
+          // Presence rolls up through room-local ancestor folders so explorer
+          // folders show "how many people are somewhere inside here", but it
+          // must stop at the downloaded room root and never leak into unrelated
+          // vault paths above that root.
           if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
             break;
           }
@@ -2853,6 +2857,10 @@ export default class RolayPlugin extends Plugin {
         continue;
       }
 
+      // The room tree may materialize an empty remote binary placeholder a
+      // moment before the actual blob ticket/download starts. Showing `0%`
+      // immediately keeps the explorer honest instead of flashing "normal"
+      // and only later turning into a red downloading file.
       badges.set(normalizedPath, {
         label: "0%",
         kind: "download"

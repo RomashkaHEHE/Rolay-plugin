@@ -62,6 +62,8 @@ Search here for:
 - `applyNotePresenceSnapshot`
 - `applyNotePresenceUpdate`
 - `getRoomCardStates`
+- `getExplorerTransferBadges`
+- `getExplorerNotePresenceBadges`
 
 ### `src/api/client.ts`
 
@@ -136,11 +138,14 @@ What it does:
 - renders remote selections and cursor widgets
 - manages end-of-line inline labels and hover labels
 - avoids cursor jitter from redundant awareness re-renders
+- mirrors CodeMirror local remapping so stale awareness offsets do not visually pull a remote cursor backwards after local edits
 
 Search here for:
 
 - `buildRemotePresenceDecorations`
 - `setRemotePresenceDecorations`
+- `recordMappedRemotePresence`
+- `stabilizeIncomingPresences`
 - `SharedCursorWidget`
 - `getPresenceSignature`
 
@@ -209,6 +214,20 @@ Look at:
 - `getPresenceSignature`
 - `SharedCursorWidget`
 - awareness `selection` publication
+- `recordMappedRemotePresence`
+- `stabilizeIncomingPresences`
+
+### "Local viewport jumps during active remote editing"
+
+Start with:
+
+- [src/realtime/crdt-session.ts](../src/realtime/crdt-session.ts)
+- [src/utils/text-diff.ts](../src/utils/text-diff.ts)
+
+Look at:
+
+- `syncRemoteIntoOpenEditors`
+- `applyTextPatchToEditor`
 
 ### "Viewer chips or explorer presence badges are wrong"
 
@@ -224,6 +243,7 @@ Look at:
 - `applyNotePresenceUpdate`
 - `renderNotePresenceChipsForView`
 - `getExplorerNotePresenceBadges`
+- folder aggregation from note path to ancestor room folders
 - `publishLocalViewerPresence`
 
 ### "Markdown text only appears after reopening note"
@@ -253,6 +273,11 @@ Look at:
 - `ensureBinaryEntryDownloaded`
 - `applyDownloadedBinary`
 - `downloadBlobFromUrl`
+
+Useful UI clue:
+
+- explorer progress badges are derived from `binaryTransferState`
+- a freshly materialized remote placeholder should already show `0%` download progress before the first ticket/content request completes
 
 Important current constraint:
 

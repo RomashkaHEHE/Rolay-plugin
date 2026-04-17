@@ -55,6 +55,9 @@ export function applyTextPatchToEditor(
     const preservedScrollTop = editorView.scrollDOM.scrollTop;
     const preservedScrollLeft = editorView.scrollDOM.scrollLeft;
 
+    // Applying remote text through CodeMirror transactions keeps document state
+    // consistent, but collaborative edits must not forcibly reveal the patch
+    // location and pull the local reader to another part of the note.
     editorView.dispatch({
       changes: {
         from: patch.start,
