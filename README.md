@@ -57,6 +57,10 @@ Important product rules reflected in the plugin:
 
 Start here when entering the project without chat history:
 
+- [AGENTS/AGENTS.md](AGENTS/AGENTS.md)
+  Live agent handoff entry point. Read this first when you need project/task context without relying on prior chat history.
+- [AGENTS/current-state.md](AGENTS/current-state.md)
+  Current priorities, unfinished work, and recently completed changes.
 - [docs/repo-map.md](docs/repo-map.md)
   Repository map, code ownership by file, and "where to look first" guidance.
 - [docs/server-contract.md](docs/server-contract.md)
