@@ -66,10 +66,14 @@ Prefer concrete notes over prose fluff. Include:
 
 `README.md` and `docs/*` stay canonical for stable project truth.
 
+`AGENTS/context/*` is for rationale, goals, and design intent.
+
 If a task changes stable behavior, update both:
 
 - the task file
 - the relevant canonical docs
+
+If a task changes why something is shaped a certain way, update the relevant file in `AGENTS/context/`.
 
 ## Required End-Of-Turn Hygiene
 
@@ -77,5 +81,6 @@ Before ending substantial work:
 
 1. Update the relevant task file
 2. Update [AGENTS/current-state.md](current-state.md) if priorities or active work changed
-3. Update canonical docs if stable behavior changed
-4. Leave the next agent enough information to continue without chat history
+3. Update `AGENTS/context/*` if design intent or tradeoffs changed
+4. Update canonical docs if stable behavior changed
+5. Leave the next agent enough information to continue without chat history
