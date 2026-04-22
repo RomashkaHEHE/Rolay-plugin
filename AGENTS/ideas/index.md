@@ -4,6 +4,10 @@ Last updated: 2026-04-22
 
 This file is the navigator for the future-work backlog.
 
+See also:
+
+- [parallel-workflow.md](parallel-workflow.md) for multi-branch idea development
+
 ## Current Guidance
 
 When choosing the next substantial product feature, prefer this order unless the user says otherwise:
@@ -25,6 +29,14 @@ These are the most promising ideas from the current conversation.
 6. [Safer move warnings](candidate/safer-move-warnings.md)
 7. [Room health badge](candidate/room-health-badge.md)
 8. [Notification polish](candidate/notification-polish.md)
+
+## Recommended Parallel Branch Batch
+
+If the team wants to develop several ideas in parallel, start with:
+
+1. [Unread remote changes](candidate/unread-remote-changes.md)
+2. [Follow mode](candidate/follow-mode.md)
+3. [Room install progress panel](candidate/room-install-progress-panel.md)
 
 ## Candidate Ideas
 

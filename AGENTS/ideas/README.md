@@ -13,6 +13,8 @@ Use it when you need to answer questions like:
 
 - [index.md](index.md)
   The navigation file. Read this first inside the idea backlog.
+- [parallel-workflow.md](parallel-workflow.md)
+  Rules for exploring multiple ideas at once on separate branches.
 - `candidate/`
   Ideas the user did not reject and that look plausible to build later.
 - `needs-discovery/`
@@ -23,15 +25,16 @@ Use it when you need to answer questions like:
 ## How To Use This Folder
 
 1. Start with [index.md](index.md).
-2. Open the specific idea file before proposing or resuming work.
-3. Preserve both:
+2. If parallel feature branches are active, also read [parallel-workflow.md](parallel-workflow.md).
+3. Open the specific idea file before proposing or resuming work.
+4. Preserve both:
    - the original idea
    - the user's reaction to it
-4. Update idea files when:
+5. Update idea files when:
    - priorities change
    - an idea is rejected or revived
    - an idea graduates into real implementation work
-5. If work actually starts, create or update a file in `AGENTS/tasks/` too.
+6. If work actually starts, create or update a file in `AGENTS/tasks/` too.
 
 ## Rule Of Thumb
 

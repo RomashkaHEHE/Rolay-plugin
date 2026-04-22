@@ -93,6 +93,7 @@ When starting work on an idea from `AGENTS/ideas/`:
 1. Keep the idea file as the product-history record
 2. Create or update a task file in `AGENTS/tasks/`
 3. Link the task and idea to each other if helpful
+4. If the idea has its own branch, record that branch name in the task file
 
 When an active task is intentionally paused for product reasons, say so in both places:
 
