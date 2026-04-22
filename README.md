@@ -63,6 +63,8 @@ Start here when entering the project without chat history:
   Current priorities, unfinished work, and recently completed changes.
 - [AGENTS/context/README.md](AGENTS/context/README.md)
   Design-intent layer: why key subsystems are shaped the way they are, not only what they currently do.
+- [AGENTS/ideas/README.md](AGENTS/ideas/README.md)
+  Backlog/intention layer for candidate ideas, rejected ideas, and ideas that still need clarification.
 - [docs/repo-map.md](docs/repo-map.md)
   Repository map, code ownership by file, and "where to look first" guidance.
 - [docs/server-contract.md](docs/server-contract.md)

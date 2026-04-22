@@ -17,11 +17,13 @@ When starting cold, read in this order:
 1. [current-state.md](current-state.md)
 2. [task-protocol.md](task-protocol.md)
 3. [context/README.md](context/README.md)
-4. [../README.md](../README.md)
-5. [../docs/repo-map.md](../docs/repo-map.md)
-6. [../docs/server-contract.md](../docs/server-contract.md)
-7. Relevant files in [tasks](tasks)
-8. [../docs/debug-playbook.md](../docs/debug-playbook.md) if the task is bug-fixing or incident triage
+4. [ideas/README.md](ideas/README.md)
+5. [ideas/index.md](ideas/index.md)
+6. [../README.md](../README.md)
+7. [../docs/repo-map.md](../docs/repo-map.md)
+8. [../docs/server-contract.md](../docs/server-contract.md)
+9. Relevant files in [tasks](tasks)
+10. [../docs/debug-playbook.md](../docs/debug-playbook.md) if the task is bug-fixing or incident triage
 
 ## What AGENTS Must Contain
 
@@ -42,9 +44,10 @@ It must help a new agent answer all of these quickly:
 2. If you start or continue a non-trivial task, update or create a task file in `AGENTS/tasks/`.
 3. If you discover a new blocker, subtle invariant, or server dependency, write it down in the relevant task file before ending your turn.
 4. If a change alters design intent, tradeoffs, or goals, update the relevant file in `AGENTS/context/`.
-5. If a change alters stable behavior, update the canonical docs too, not only `AGENTS/`.
-6. If priorities change, update [current-state.md](current-state.md).
-7. Before ending substantial work, leave the next agent a clean handoff:
+5. If you discuss or reshape future work, update the relevant file in `AGENTS/ideas/`.
+6. If a change alters stable behavior, update the canonical docs too, not only `AGENTS/`.
+7. If priorities change, update [current-state.md](current-state.md).
+8. Before ending substantial work, leave the next agent a clean handoff:
    - what changed
    - what remains
    - what to verify next
@@ -55,6 +58,8 @@ It must help a new agent answer all of these quickly:
   Live project snapshot, priorities, active work, and recently completed work.
 - [context](context)
   Intent/rationale layer for major project areas and design tradeoffs.
+- [ideas](ideas)
+  Product/backlog layer for candidate ideas, rejected ideas, and ideas that still need discovery.
 - [task-protocol.md](task-protocol.md)
   Rules for creating/updating task files and handing work off.
 - [task-template.md](task-template.md)

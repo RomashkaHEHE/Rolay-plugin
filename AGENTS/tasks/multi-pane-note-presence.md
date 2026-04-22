@@ -1,7 +1,7 @@
 # Multi-Pane Note Presence
 
-Status: TODO
-Priority: Medium
+Status: BLOCKED
+Priority: Low
 Last updated: 2026-04-22
 
 ## Goal
@@ -30,19 +30,20 @@ Make markdown note presence correctly represent multiple simultaneously visible 
 ## Progress Notes
 
 - 2026-04-22: Task documented in AGENTS layer. No implementation started here yet.
+- 2026-04-22: Product direction changed. This is intentionally deferred because the current academic-group workflow rarely benefits from simultaneous multi-pane viewing, while the bug surface is fairly large.
 
 ## Open Questions / Risks
 
 - Presence today is tied to the active markdown session; multi-pane support may require either multiple local viewer instances or a redesign of how the plugin tracks visible markdown leaves.
 - Need to preserve the existing invariant that hidden tabs should not count as viewers.
 - Need to ensure same-account multi-device and same-account multi-pane duplication keeps working intentionally.
+- Right now the product value looks low relative to the risk, so this should not be resumed casually.
 
 ## Next Steps
 
-1. Inspect how the plugin currently chooses the single active markdown session/viewer.
-2. Decide whether to track presence per visible leaf or per visible editor view.
-3. Implement without breaking current explorer badges and note chips.
-4. Update canonical docs if the behavior changes materially.
+1. Do not resume implementation unless the user explicitly reopens the idea.
+2. If reopened, first revisit the product need in [AGENTS/ideas/rejected/multi-pane-note-presence.md](../ideas/rejected/multi-pane-note-presence.md).
+3. Only then inspect how the plugin currently chooses the single active markdown session/viewer.
 
 ## Exit Criteria
 

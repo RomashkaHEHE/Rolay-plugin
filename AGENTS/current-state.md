@@ -13,7 +13,7 @@ Priority order for most work unless the user explicitly overrides it:
 
 1. Sync correctness and data safety
 2. Collaboration UX correctness
-3. Clear handoff/context for future agents
+3. Keep the AGENTS handoff layer current, especially backlog intent and product decisions
 4. Performance/scaling improvements only after correctness
 
 ## Stable Product Invariants
@@ -33,21 +33,7 @@ These should be treated as high-confidence truths unless code/docs are intention
 
 ## Currently Active / Unfinished Work
 
-### 1. Multi-Pane Note Presence
-
-Status: `TODO`
-
-Summary:
-
-- Presence is correct for the active visible markdown note in a client/window.
-- Invisible tabs do not count as viewers, which is desired.
-- Two simultaneously visible panes in one Obsidian window do not yet publish two independent viewer presences.
-
-Task file:
-
-- [AGENTS/tasks/multi-pane-note-presence.md](tasks/multi-pane-note-presence.md)
-
-### 2. Blob Transfer Trace Cleanup
+### 1. Blob Transfer Trace Cleanup
 
 Status: `TODO`, lower priority than sync correctness
 
@@ -61,6 +47,17 @@ Task file:
 
 - [AGENTS/tasks/blob-transfer-trace-cleanup.md](tasks/blob-transfer-trace-cleanup.md)
 
+## Idea Pipeline
+
+Potential future work now lives in:
+
+- [AGENTS/ideas/index.md](ideas/index.md)
+
+Important current product decisions:
+
+- Multi-pane note presence is intentionally deferred for now. The value looks low for the current academic-group workflow and the bug surface looks non-trivial.
+- The next likely UX-facing work should come from the approved idea backlog rather than from broad new system rewrites.
+
 ## Recently Completed Work
 
 These are important because future regressions will often land in these areas:
@@ -73,6 +70,7 @@ These are important because future regressions will often land in these areas:
 - Scroll-preserving remote markdown patches
 - Remote cursor jitter reduction by mirroring CodeMirror remap and rejecting short-lived stale backward offsets
 - BRAT-friendly release flow with plain semver tags like `1.2.5`
+- Dedicated `AGENTS/ideas/*` backlog layer for candidate, discovery, and rejected ideas
 
 ## First Places To Look By Task Type
 

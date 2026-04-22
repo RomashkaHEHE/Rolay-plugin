@@ -68,12 +68,36 @@ Prefer concrete notes over prose fluff. Include:
 
 `AGENTS/context/*` is for rationale, goals, and design intent.
 
+`AGENTS/ideas/*` is for product backlog items that are not active implementation tasks yet.
+
 If a task changes stable behavior, update both:
 
 - the task file
 - the relevant canonical docs
 
 If a task changes why something is shaped a certain way, update the relevant file in `AGENTS/context/`.
+
+If a product conversation changes whether an idea is approved, rejected, clarified, or reprioritized, update the relevant file in `AGENTS/ideas/`.
+
+## Relationship To The Idea Backlog
+
+Use this rule of thumb:
+
+- `AGENTS/ideas/*`:
+  the team is still deciding whether/how to do it
+- `AGENTS/tasks/*`:
+  real implementation work is underway or partially done
+
+When starting work on an idea from `AGENTS/ideas/`:
+
+1. Keep the idea file as the product-history record
+2. Create or update a task file in `AGENTS/tasks/`
+3. Link the task and idea to each other if helpful
+
+When an active task is intentionally paused for product reasons, say so in both places:
+
+- the task file
+- the relevant idea file or rejected/deferred backlog note
 
 ## Required End-Of-Turn Hygiene
 
@@ -82,5 +106,6 @@ Before ending substantial work:
 1. Update the relevant task file
 2. Update [AGENTS/current-state.md](current-state.md) if priorities or active work changed
 3. Update `AGENTS/context/*` if design intent or tradeoffs changed
-4. Update canonical docs if stable behavior changed
-5. Leave the next agent enough information to continue without chat history
+4. Update `AGENTS/ideas/*` if backlog intent or product decisions changed
+5. Update canonical docs if stable behavior changed
+6. Leave the next agent enough information to continue without chat history
