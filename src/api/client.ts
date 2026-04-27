@@ -27,8 +27,10 @@ import type {
   RefreshRequest,
   RefreshResponse,
   RoomListResponse,
+  RoomPublicationResponse,
   RoomMemberListResponse,
   TreeSnapshotResponse,
+  UpdateRoomPublicationRequest,
   UpdateInviteStateRequest,
   UpdateProfileRequest,
   UserListResponse,
@@ -234,6 +236,24 @@ export class RolayApiClient {
     return this.requestJson<InviteStateResponse>(
       "POST",
       `/v1/rooms/${encodeURIComponent(workspaceId)}/invite/regenerate`
+    );
+  }
+
+  async getRoomPublication(workspaceId: string): Promise<RoomPublicationResponse> {
+    return this.requestJson<RoomPublicationResponse>(
+      "GET",
+      `/v1/rooms/${encodeURIComponent(workspaceId)}/publication`
+    );
+  }
+
+  async updateRoomPublication(
+    workspaceId: string,
+    body: UpdateRoomPublicationRequest
+  ): Promise<RoomPublicationResponse> {
+    return this.requestJson<RoomPublicationResponse>(
+      "PATCH",
+      `/v1/rooms/${encodeURIComponent(workspaceId)}/publication`,
+      body
     );
   }
 

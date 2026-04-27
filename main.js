@@ -8548,6 +8548,19 @@ var RolayApiClient = class {
       `/v1/rooms/${encodeURIComponent(workspaceId)}/invite/regenerate`
     );
   }
+  async getRoomPublication(workspaceId) {
+    return this.requestJson(
+      "GET",
+      `/v1/rooms/${encodeURIComponent(workspaceId)}/publication`
+    );
+  }
+  async updateRoomPublication(workspaceId, body) {
+    return this.requestJson(
+      "PATCH",
+      `/v1/rooms/${encodeURIComponent(workspaceId)}/publication`,
+      body
+    );
+  }
   async listManagedUsers() {
     return this.requestJson(
       "GET",
@@ -14715,7 +14728,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
         this.finishRender(scrollHost, renderKey, preservedScrollTop);
         return;
       } else {
-        this.renderRoomDetailView(shell, activeRoom);
+        this.renderRoomDetailView(shell, activeRoom, currentUser);
         this.finishRender(scrollHost, renderKey, preservedScrollTop);
         return;
       }
@@ -15022,7 +15035,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       });
     }
   }
-  renderRoomDetailView(containerEl, room) {
+  renderRoomDetailView(containerEl, room, currentUser) {
     const pageTop = containerEl.createDiv({ cls: "rolay-settings-page-top" });
     const navRow = pageTop.createDiv({ cls: "rolay-settings-page-nav" });
     const backButton = navRow.createEl("button", {
@@ -15063,6 +15076,11 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       badges,
       room.room.membershipRole === "owner" ? "Owner" : "Member",
       room.room.membershipRole === "owner" ? "accent" : "muted"
+    );
+    this.createBadge(
+      badges,
+      room.publication.enabled ? "Public" : "Private",
+      room.publication.enabled ? "accent" : "muted"
     );
     const grid = this.createGrid(containerEl);
     const membersCard = this.createCard(grid, "Members");
@@ -15121,6 +15139,12 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
         });
       }
     }
+    this.renderPublicationCard(grid, {
+      workspaceId: room.room.workspace.id,
+      roomName: room.room.workspace.name,
+      publication: room.publication,
+      canManage: Boolean(currentUser?.isAdmin) || room.room.membershipRole === "owner"
+    });
     if (room.room.membershipRole === "owner") {
       const inviteCard = this.createCard(grid, "Invites", "Owner-only controls for the current invite key.");
       const inviteEnabled = room.invite?.enabled ?? room.room.inviteEnabled;
@@ -15399,7 +15423,18 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       adminRoom?.inviteEnabled ?? room.room.inviteEnabled ? "Invite on" : "Invite off",
       adminRoom?.inviteEnabled ?? room.room.inviteEnabled ? "ready" : "muted"
     );
+    this.createBadge(
+      badges,
+      (adminRoom?.publication ?? room.publication).enabled ? "Public" : "Private",
+      (adminRoom?.publication ?? room.publication).enabled ? "accent" : "muted"
+    );
     const grid = this.createGrid(containerEl);
+    this.renderPublicationCard(grid, {
+      workspaceId: room.room.workspace.id,
+      roomName: room.room.workspace.name,
+      publication: adminRoom?.publication ?? room.publication,
+      canManage: Boolean(currentUser?.isAdmin)
+    });
     const membersCard = this.createCard(grid, "People");
     this.renderMembersPanel(membersCard.body, this.rolay.getRoomMembers(room.room.workspace.id), {
       listKey: `admin-members:${room.room.workspace.id}`
@@ -15462,10 +15497,59 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       ["Room ID", room.room.workspace.id],
       ["Name", room.room.workspace.name],
       ["Invite", adminRoom?.inviteEnabled ?? room.room.inviteEnabled ? "enabled" : "disabled"],
+      ["Publication", (adminRoom?.publication ?? room.publication).enabled ? "public" : "private"],
       ["Members", String(adminRoom?.memberCount ?? room.room.memberCount)],
       ["Owners", String(adminRoom?.ownerCount ?? 0)],
       ["Viewer account", currentUser?.username ?? "unknown"]
     ]);
+  }
+  renderPublicationCard(containerEl, options) {
+    const publicationCard = this.createCard(
+      containerEl,
+      "Publication",
+      "Public rooms are readable by anyone who has the public site address. The public site is read-only and does not use private editor sync."
+    );
+    this.createInfoBlock(publicationCard.body, [
+      ["Status", options.publication.enabled ? "Public" : "Private"],
+      ["Updated", this.formatDateTime(options.publication.updatedAt) ?? "never"]
+    ]);
+    if (options.canManage) {
+      this.createSelectField(publicationCard.body, {
+        label: "Visibility",
+        value: options.publication.enabled ? "public" : "private",
+        options: [
+          ["private", "Private"],
+          ["public", "Public"]
+        ],
+        onChange: async (value) => {
+          await this.rolay.setRoomPublicationEnabled(options.workspaceId, value === "public");
+          this.requestRender();
+        }
+      });
+    }
+    if (options.publication.enabled) {
+      publicationCard.body.createDiv({
+        cls: "rolay-settings-inline-note",
+        text: "Anyone who knows the public site address can read this room without logging in. Public visitors cannot edit, upload, or send presence."
+      });
+      this.addCopyableInfoLine(
+        publicationCard.body,
+        "Public site",
+        this.rolay.getPublicSiteUrl()
+      );
+      const actions = this.createActionRow(publicationCard.body);
+      this.createActionButton(actions, "Open public site", "mod-cta", async () => {
+        window.open(this.rolay.getPublicSiteUrl(), "_blank", "noopener,noreferrer");
+      });
+      this.createActionButton(actions, "Copy public link", "", async () => {
+        await this.copyToClipboard(this.rolay.getPublicSiteUrl(), "Public site link copied.");
+      });
+      return;
+    }
+    publicationCard.body.createDiv({
+      cls: "rolay-settings-empty-state",
+      text: options.canManage ? `The room "${options.roomName}" is private. Turn on public access only if read-only open access is intended.` : `The room "${options.roomName}" is private.`
+    });
   }
   createGrid(containerEl, twoColumns = false) {
     const grid = containerEl.createDiv({
@@ -15678,7 +15762,10 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
   openDetail(mode, roomId) {
     this.resetScrollOnNextRender = true;
     this.activeDetail = { mode, roomId };
-    void this.rolay.loadRoomMembersForUi(roomId).then(() => this.requestRender());
+    void Promise.allSettled([
+      this.rolay.loadRoomMembersForUi(roomId),
+      this.rolay.refreshRoomPublication(roomId)
+    ]).then(() => this.requestRender());
     this.render();
   }
   formatDateTime(value) {
@@ -16989,7 +17076,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         membershipRole: "member",
         createdAt: "",
         memberCount: 0,
-        inviteEnabled: false
+        inviteEnabled: false,
+        publication: createDefaultRoomPublicationState(roomId)
       };
       const folderName = this.getResolvedRoomFolderName(room.workspace.id, room.workspace.name);
       const binding = this.getStoredRoomBinding(room.workspace.id);
@@ -17014,7 +17102,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         cachedMarkdownCount,
         crdtCacheLabel: this.formatRoomCrdtCacheLabel(runtime?.markdownBootstrap, markdownEntries.length, cachedMarkdownCount),
         binaryTransferLabel,
-        invite: this.roomInvites.get(room.workspace.id) ?? null
+        invite: this.roomInvites.get(room.workspace.id) ?? null,
+        publication: normalizeRoomPublicationState(room.publication, room.workspace.id)
       };
     });
   }
@@ -17341,7 +17430,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async refreshRooms(showNotice = false, logActivity = true) {
     const response = await this.apiClient.listRooms();
-    this.roomList = [...response.workspaces].sort(compareRoomsByName);
+    this.roomList = [...response.workspaces].map(normalizeRoomListItem).sort(compareRoomsByName);
     await this.reconcileLocalRoomFolders();
     this.reconcileInviteCache();
     if (logActivity) {
@@ -17561,6 +17650,57 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       throw error;
     }
   }
+  getPublicSiteUrl() {
+    const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl) || ROLAY_SERVER_URL;
+    return `${normalizedServerUrl.replace(/\/+$/, "")}/`;
+  }
+  canCurrentUserManageRoomPublication(workspaceId) {
+    const currentUser = this.getCurrentUser();
+    if (!currentUser) {
+      return false;
+    }
+    if (currentUser.isAdmin) {
+      return true;
+    }
+    return this.roomList.some((room) => {
+      return room.workspace.id === workspaceId && room.membershipRole === "owner";
+    });
+  }
+  async refreshRoomPublication(workspaceId, logActivity = false) {
+    const response = await this.apiClient.getRoomPublication(workspaceId);
+    const publication = normalizeRoomPublicationState(response.publication, workspaceId);
+    this.patchRoomPublication(workspaceId, publication);
+    if (logActivity) {
+      this.recordLog(
+        "publication",
+        `Loaded publication state for ${workspaceId}: ${publication.enabled ? "public" : "private"}.`
+      );
+    }
+    this.updateStatusBar();
+    this.requestSettingsRender();
+    return publication;
+  }
+  async setRoomPublicationEnabled(workspaceId, enabled) {
+    this.requireRoomPublicationManager(workspaceId);
+    const roomName = this.getKnownRoomName(workspaceId);
+    try {
+      const response = await this.apiClient.updateRoomPublication(workspaceId, { enabled });
+      const publication = normalizeRoomPublicationState(response.publication, workspaceId);
+      this.patchRoomPublication(workspaceId, publication);
+      this.recordLog(
+        "publication",
+        `${enabled ? "Enabled" : "Disabled"} public publication for ${workspaceId}.`
+      );
+      this.updateStatusBar();
+      new import_obsidian9.Notice(
+        enabled ? `Room is now public on the read-only site: ${roomName}` : `Room is now private again: ${roomName}`
+      );
+      this.requestSettingsRender();
+    } catch (error) {
+      this.handleError("Room publication update failed", error);
+      throw error;
+    }
+  }
   async refreshManagedUsers(showNotice = false, logActivity = true) {
     this.requireAdmin();
     const response = await this.apiClient.listManagedUsers();
@@ -17619,7 +17759,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   async refreshAdminRooms(showNotice = false, logActivity = true) {
     this.requireAdmin();
     const response = await this.apiClient.listAllRoomsAsAdmin();
-    this.adminRoomList = [...response.workspaces].sort(compareRoomsByName);
+    this.adminRoomList = [...response.workspaces].map(normalizeAdminRoomListItem).sort(compareRoomsByName);
     if (!this.adminSelectedRoomId && this.adminRoomList.length === 1) {
       this.adminSelectedRoomId = this.adminRoomList[0].workspace.id;
     } else if (this.adminSelectedRoomId && !this.adminRoomList.some((room) => room.workspace.id === this.adminSelectedRoomId)) {
@@ -18024,6 +18164,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         break;
       case "room.invite.updated":
         this.applySettingsInviteUpdate(extractInviteFromSettingsPayload(envelope.payload));
+        break;
+      case "room.publication.updated":
+        this.applySettingsRoomPublicationUpdate(extractRoomPublicationUpdatedPayload(envelope.payload));
         break;
       case "admin.user.created":
       case "admin.user.updated":
@@ -18542,6 +18685,18 @@ ${keptTail}`;
       throw this.notifyError("Only room owners can manage invite keys.");
     }
     return room;
+  }
+  requireRoomPublicationManager(workspaceId) {
+    if (this.data.session?.user?.isAdmin) {
+      return;
+    }
+    const room = this.requireRoom(workspaceId);
+    if (room.membershipRole !== "owner") {
+      throw this.notifyError("Only room owners and admins can change room publication.");
+    }
+  }
+  getKnownRoomName(workspaceId) {
+    return this.roomList.find((room) => room.workspace.id === workspaceId)?.workspace.name ?? this.adminRoomList.find((room) => room.workspace.id === workspaceId)?.workspace.name ?? this.getStoredRoomBinding(workspaceId)?.folderName ?? workspaceId;
   }
   getStoredRoomBinding(workspaceId) {
     return getRoomBindingSettings(this.data.settings, workspaceId);
@@ -19840,6 +19995,16 @@ ${keptTail}`;
     this.patchInviteEnabled(invite.workspaceId, invite.enabled);
     this.updateStatusBar();
   }
+  applySettingsRoomPublicationUpdate(update) {
+    if (!update) {
+      return;
+    }
+    this.patchRoomPublication(
+      update.workspaceId,
+      normalizeRoomPublicationState(update.publication, update.workspaceId)
+    );
+    this.updateStatusBar();
+  }
   applySettingsManagedUserUpsert(user) {
     if (!user) {
       return;
@@ -20943,6 +21108,26 @@ ${keptTail}`;
       return {
         ...room,
         inviteEnabled: enabled
+      };
+    });
+  }
+  patchRoomPublication(workspaceId, publication) {
+    this.roomList = this.roomList.map((room) => {
+      if (room.workspace.id !== workspaceId) {
+        return room;
+      }
+      return {
+        ...room,
+        publication: normalizeRoomPublicationState(publication, workspaceId)
+      };
+    });
+    this.adminRoomList = this.adminRoomList.map((room) => {
+      if (room.workspace.id !== workspaceId) {
+        return room;
+      }
+      return {
+        ...room,
+        publication: normalizeRoomPublicationState(publication, workspaceId)
       };
     });
   }
@@ -22237,6 +22422,8 @@ function inferSettingsScopeFromType(type) {
       return "auth.me";
     case "room.invite.updated":
       return "room.invite";
+    case "room.publication.updated":
+      return "room.publication";
     case "admin.user.created":
     case "admin.user.updated":
     case "admin.user.deleted":
@@ -22294,7 +22481,8 @@ function extractRoomFromSettingsPayload(payload) {
     membershipRole,
     createdAt,
     memberCount,
-    inviteEnabled
+    inviteEnabled,
+    publication: extractRoomPublicationState(candidate.publication, workspace.id) ?? void 0
   };
 }
 function extractAdminRoomFromSettingsPayload(payload) {
@@ -22368,6 +22556,32 @@ function extractAdminRoomMembersPayload(payload) {
   return {
     workspaceId: payload.workspaceId,
     members
+  };
+}
+function extractRoomPublicationUpdatedPayload(payload) {
+  if (!isRecord2(payload) || typeof payload.workspaceId !== "string") {
+    return null;
+  }
+  const publication = extractRoomPublicationState(payload.publication, payload.workspaceId);
+  if (!publication) {
+    return null;
+  }
+  return {
+    workspaceId: payload.workspaceId,
+    publication
+  };
+}
+function extractRoomPublicationState(payload, fallbackWorkspaceId) {
+  if (!isRecord2(payload)) {
+    return createDefaultRoomPublicationState(fallbackWorkspaceId);
+  }
+  const workspaceId = typeof payload.workspaceId === "string" && payload.workspaceId.trim() ? payload.workspaceId : fallbackWorkspaceId;
+  const enabled = typeof payload.enabled === "boolean" ? payload.enabled : false;
+  const updatedAt = typeof payload.updatedAt === "string" && payload.updatedAt.trim() ? payload.updatedAt : null;
+  return {
+    workspaceId,
+    enabled,
+    updatedAt
   };
 }
 function extractNotePresenceSnapshotPayload(payload) {
@@ -22461,6 +22675,28 @@ function compareRoomMembers(left, right) {
     return left.role === "owner" ? -1 : 1;
   }
   return left.user.username.localeCompare(right.user.username);
+}
+function createDefaultRoomPublicationState(workspaceId) {
+  return {
+    workspaceId,
+    enabled: false,
+    updatedAt: null
+  };
+}
+function normalizeRoomPublicationState(publication, workspaceId) {
+  return extractRoomPublicationState(publication, workspaceId) ?? createDefaultRoomPublicationState(workspaceId);
+}
+function normalizeRoomListItem(room) {
+  return {
+    ...room,
+    publication: normalizeRoomPublicationState(room.publication, room.workspace.id)
+  };
+}
+function normalizeAdminRoomListItem(room) {
+  return {
+    ...room,
+    publication: normalizeRoomPublicationState(room.publication, room.workspace.id)
+  };
 }
 function compareNotePresenceViewers(left, right) {
   const displayNameComparison = left.displayName.localeCompare(right.displayName);

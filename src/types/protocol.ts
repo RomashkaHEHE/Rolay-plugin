@@ -36,12 +36,19 @@ export interface WorkspaceResponse {
   workspace: Workspace;
 }
 
+export interface RoomPublicationState {
+  workspaceId: string;
+  enabled: boolean;
+  updatedAt: string | null;
+}
+
 export interface RoomListItem {
   workspace: Workspace;
   membershipRole: WorkspaceRole;
   createdAt: string;
   memberCount: number;
   inviteEnabled: boolean;
+  publication?: RoomPublicationState;
 }
 
 export interface AdminRoomListItem extends RoomListItem {
@@ -132,6 +139,14 @@ export interface InviteStateResponse {
 }
 
 export interface UpdateInviteStateRequest {
+  enabled: boolean;
+}
+
+export interface RoomPublicationResponse {
+  publication: RoomPublicationState;
+}
+
+export interface UpdateRoomPublicationRequest {
   enabled: boolean;
 }
 
@@ -331,6 +346,7 @@ export type SettingsEventType =
   | "room.deleted"
   | "room.membership.changed"
   | "room.invite.updated"
+  | "room.publication.updated"
   | "admin.user.created"
   | "admin.user.updated"
   | "admin.user.deleted"
@@ -342,6 +358,7 @@ export type SettingsEventScope =
   | "auth.me"
   | "rooms"
   | "room.invite"
+  | "room.publication"
   | "admin.users"
   | "admin.rooms"
   | "admin.room.members";
@@ -364,6 +381,11 @@ export interface SettingsRoomDeletedPayload {
 
 export interface SettingsInviteUpdatedPayload {
   invite: InviteState;
+}
+
+export interface SettingsRoomPublicationUpdatedPayload {
+  workspaceId: string;
+  publication: RoomPublicationState;
 }
 
 export interface SettingsRoomPayload<TRoom = RoomListItem | AdminRoomListItem> {

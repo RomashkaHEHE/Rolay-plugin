@@ -71,12 +71,29 @@ Expected client order:
 - `GET /v1/rooms/{workspaceId}/invite`
 - `PATCH /v1/rooms/{workspaceId}/invite`
 - `POST /v1/rooms/{workspaceId}/invite/regenerate`
+- `GET /v1/rooms/{workspaceId}/publication`
+- `PATCH /v1/rooms/{workspaceId}/publication`
+
+Room payloads may now also include:
+
+- `publication.enabled`
+- `publication.updatedAt`
+
+If a room payload omits `publication`, the plugin should treat that room as private.
 
 Important invite rules:
 
 - a room has one current invite key
 - enable/disable does not rotate the key
 - regenerate rotates the key and invalidates the old one
+
+Important publication rules:
+
+- rooms are private by default
+- publication is toggled per room
+- enabling publication exposes the room through the separate server-root public site
+- the public site is open read-only for anyone with the site address
+- plugin clients must not try to route public readers through private CRDT, upload, or presence flows
 
 ### Admin Management
 
@@ -135,6 +152,7 @@ The plugin currently reacts to:
 - `room.deleted`
 - `room.membership.changed`
 - `room.invite.updated`
+- `room.publication.updated`
 - `admin.user.created`
 - `admin.user.updated`
 - `admin.user.deleted`

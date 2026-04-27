@@ -16,6 +16,7 @@ The current MVP is built against the live Rolay `v1` contract and now follows th
 - explicit `Install room` flow before any files are materialized locally
 - parallel tree snapshot and SSE sync for every downloaded room
 - owner-only invite controls on each owned room
+- room-level publication controls for private/public read-only publishing
 - admin-only user list, user creation, user deletion
 - admin-only room list, member inspection, add-user-to-room, and room deletion
 - separate in-settings admin tab that appears only for logged-in admins
@@ -24,6 +25,7 @@ The current MVP is built against the live Rolay `v1` contract and now follows th
 - CRDT bootstrap for markdown files through `crdt-token` and Yjs/Hocuspocus
 - room-level markdown bootstrap through `POST /v1/workspaces/{workspaceId}/markdown/bootstrap`
 - binary/blob sync for every non-markdown file through upload/download tickets and `commit_blob_revision`
+- public-site publication status and actions in room settings
 
 ## Current Server Contract
 
@@ -37,6 +39,7 @@ The plugin treats Rolay as a layered sync system:
 - Settings/admin live UI updates use `GET /v1/events/settings`
 - Room-level note presence for markdown viewer chips and explorer badges uses `GET /v1/workspaces/{workspaceId}/note-presence/events`
 - Password change lives under `PATCH /v1/auth/me/password` and rotates the active session
+- Room publication lives under `GET/PATCH /v1/rooms/{workspaceId}/publication`
 
 Important product rules reflected in the plugin:
 
@@ -49,6 +52,7 @@ Important product rules reflected in the plugin:
 - there is no public self-registration
 - room membership is gained by invite key or admin assignment
 - invite enable/disable does not change the key; regenerate does
+- room publication is private by default and only exposes the server's separate read-only public site when enabled
 - tree sync remains server-authoritative
 - markdown note content is still the only CRDT-managed content in `v1`
 - every non-`.md` file, including `.txt`, is treated as binary/blob content

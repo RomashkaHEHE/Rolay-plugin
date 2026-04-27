@@ -49,8 +49,10 @@ import type {
   NotePresenceUpdatedPayload,
   NotePresenceViewer,
   RoomListItem,
+  RoomPublicationState,
   RoomMember,
   SettingsEventEnvelope,
+  SettingsRoomPublicationUpdatedPayload,
   SettingsStreamEvent,
   User
 } from "./types/protocol";
@@ -162,6 +164,7 @@ export interface RoomCardState {
   crdtCacheLabel: string;
   binaryTransferLabel: string;
   invite: InviteState | null;
+  publication: RoomPublicationState;
 }
 
 interface StatusSnapshot {
@@ -466,7 +469,8 @@ export default class RolayPlugin extends Plugin {
         membershipRole: "member" as const,
         createdAt: "",
         memberCount: 0,
-        inviteEnabled: false
+        inviteEnabled: false,
+        publication: createDefaultRoomPublicationState(roomId)
       };
       const folderName = this.getResolvedRoomFolderName(room.workspace.id, room.workspace.name);
       const binding = this.getStoredRoomBinding(room.workspace.id);
@@ -492,7 +496,8 @@ export default class RolayPlugin extends Plugin {
         cachedMarkdownCount,
         crdtCacheLabel: this.formatRoomCrdtCacheLabel(runtime?.markdownBootstrap, markdownEntries.length, cachedMarkdownCount),
         binaryTransferLabel,
-        invite: this.roomInvites.get(room.workspace.id) ?? null
+        invite: this.roomInvites.get(room.workspace.id) ?? null,
+        publication: normalizeRoomPublicationState(room.publication, room.workspace.id)
       };
     });
   }
@@ -880,7 +885,7 @@ export default class RolayPlugin extends Plugin {
 
   async refreshRooms(showNotice = false, logActivity = true): Promise<RoomListItem[]> {
     const response = await this.apiClient.listRooms();
-    this.roomList = [...response.workspaces].sort(compareRoomsByName);
+    this.roomList = [...response.workspaces].map(normalizeRoomListItem).sort(compareRoomsByName);
     await this.reconcileLocalRoomFolders();
     this.reconcileInviteCache();
     if (logActivity) {
@@ -1144,6 +1149,66 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
+  getPublicSiteUrl(): string {
+    const normalizedServerUrl = normalizeServerUrl(this.data.settings.serverUrl) || ROLAY_SERVER_URL;
+    return `${normalizedServerUrl.replace(/\/+$/, "")}/`;
+  }
+
+  canCurrentUserManageRoomPublication(workspaceId: string): boolean {
+    const currentUser = this.getCurrentUser();
+    if (!currentUser) {
+      return false;
+    }
+
+    if (currentUser.isAdmin) {
+      return true;
+    }
+
+    return this.roomList.some((room) => {
+      return room.workspace.id === workspaceId && room.membershipRole === "owner";
+    });
+  }
+
+  async refreshRoomPublication(workspaceId: string, logActivity = false): Promise<RoomPublicationState> {
+    const response = await this.apiClient.getRoomPublication(workspaceId);
+    const publication = normalizeRoomPublicationState(response.publication, workspaceId);
+    this.patchRoomPublication(workspaceId, publication);
+    if (logActivity) {
+      this.recordLog(
+        "publication",
+        `Loaded publication state for ${workspaceId}: ${publication.enabled ? "public" : "private"}.`
+      );
+    }
+    this.updateStatusBar();
+    this.requestSettingsRender();
+    return publication;
+  }
+
+  async setRoomPublicationEnabled(workspaceId: string, enabled: boolean): Promise<void> {
+    this.requireRoomPublicationManager(workspaceId);
+    const roomName = this.getKnownRoomName(workspaceId);
+
+    try {
+      const response = await this.apiClient.updateRoomPublication(workspaceId, { enabled });
+      const publication = normalizeRoomPublicationState(response.publication, workspaceId);
+      this.patchRoomPublication(workspaceId, publication);
+      this.recordLog(
+        "publication",
+        `${enabled ? "Enabled" : "Disabled"} public publication for ${workspaceId}.`
+      );
+      this.updateStatusBar();
+      new Notice(
+        enabled
+          ? `Room is now public on the read-only site: ${roomName}`
+          : `Room is now private again: ${roomName}`
+      );
+      this.requestSettingsRender();
+    } catch (error) {
+      this.handleError("Room publication update failed", error);
+      throw error;
+    }
+  }
+
   async refreshManagedUsers(showNotice = false, logActivity = true): Promise<ManagedUser[]> {
     this.requireAdmin();
     const response = await this.apiClient.listManagedUsers();
@@ -1209,7 +1274,7 @@ export default class RolayPlugin extends Plugin {
   async refreshAdminRooms(showNotice = false, logActivity = true): Promise<AdminRoomListItem[]> {
     this.requireAdmin();
     const response = await this.apiClient.listAllRoomsAsAdmin();
-    this.adminRoomList = [...response.workspaces].sort(compareRoomsByName);
+    this.adminRoomList = [...response.workspaces].map(normalizeAdminRoomListItem).sort(compareRoomsByName);
 
     if (!this.adminSelectedRoomId && this.adminRoomList.length === 1) {
       this.adminSelectedRoomId = this.adminRoomList[0].workspace.id;
@@ -1679,6 +1744,9 @@ export default class RolayPlugin extends Plugin {
         break;
       case "room.invite.updated":
         this.applySettingsInviteUpdate(extractInviteFromSettingsPayload(envelope.payload));
+        break;
+      case "room.publication.updated":
+        this.applySettingsRoomPublicationUpdate(extractRoomPublicationUpdatedPayload(envelope.payload));
         break;
       case "admin.user.created":
       case "admin.user.updated":
@@ -2301,6 +2369,26 @@ export default class RolayPlugin extends Plugin {
     }
 
     return room;
+  }
+
+  private requireRoomPublicationManager(workspaceId: string): void {
+    if (this.data.session?.user?.isAdmin) {
+      return;
+    }
+
+    const room = this.requireRoom(workspaceId);
+    if (room.membershipRole !== "owner") {
+      throw this.notifyError("Only room owners and admins can change room publication.");
+    }
+  }
+
+  private getKnownRoomName(workspaceId: string): string {
+    return (
+      this.roomList.find((room) => room.workspace.id === workspaceId)?.workspace.name ??
+      this.adminRoomList.find((room) => room.workspace.id === workspaceId)?.workspace.name ??
+      this.getStoredRoomBinding(workspaceId)?.folderName ??
+      workspaceId
+    );
   }
 
   private getStoredRoomBinding(workspaceId: string): RolayRoomBindingSettings | null {
@@ -3963,6 +4051,20 @@ export default class RolayPlugin extends Plugin {
     this.updateStatusBar();
   }
 
+  private applySettingsRoomPublicationUpdate(
+    update: SettingsRoomPublicationUpdatedPayload | null
+  ): void {
+    if (!update) {
+      return;
+    }
+
+    this.patchRoomPublication(
+      update.workspaceId,
+      normalizeRoomPublicationState(update.publication, update.workspaceId)
+    );
+    this.updateStatusBar();
+  }
+
   private applySettingsManagedUserUpsert(user: ManagedUser | null): void {
     if (!user) {
       return;
@@ -5410,6 +5512,29 @@ export default class RolayPlugin extends Plugin {
       return {
         ...room,
         inviteEnabled: enabled
+      };
+    });
+  }
+
+  private patchRoomPublication(workspaceId: string, publication: RoomPublicationState): void {
+    this.roomList = this.roomList.map((room) => {
+      if (room.workspace.id !== workspaceId) {
+        return room;
+      }
+
+      return {
+        ...room,
+        publication: normalizeRoomPublicationState(publication, workspaceId)
+      };
+    });
+    this.adminRoomList = this.adminRoomList.map((room) => {
+      if (room.workspace.id !== workspaceId) {
+        return room;
+      }
+
+      return {
+        ...room,
+        publication: normalizeRoomPublicationState(publication, workspaceId)
       };
     });
   }
@@ -6999,6 +7124,8 @@ function inferSettingsScopeFromType(type: string): string {
       return "auth.me";
     case "room.invite.updated":
       return "room.invite";
+    case "room.publication.updated":
+      return "room.publication";
     case "admin.user.created":
     case "admin.user.updated":
     case "admin.user.deleted":
@@ -7080,7 +7207,8 @@ function extractRoomFromSettingsPayload(payload: unknown): RoomListItem | null {
     membershipRole,
     createdAt,
     memberCount,
-    inviteEnabled
+    inviteEnabled,
+    publication: extractRoomPublicationState(candidate.publication, workspace.id) ?? undefined
   };
 }
 
@@ -7186,6 +7314,49 @@ function extractAdminRoomMembersPayload(
   return {
     workspaceId: payload.workspaceId,
     members
+  };
+}
+
+function extractRoomPublicationUpdatedPayload(
+  payload: unknown
+): SettingsRoomPublicationUpdatedPayload | null {
+  if (!isRecord(payload) || typeof payload.workspaceId !== "string") {
+    return null;
+  }
+
+  const publication = extractRoomPublicationState(payload.publication, payload.workspaceId);
+  if (!publication) {
+    return null;
+  }
+
+  return {
+    workspaceId: payload.workspaceId,
+    publication
+  };
+}
+
+function extractRoomPublicationState(
+  payload: unknown,
+  fallbackWorkspaceId: string
+): RoomPublicationState | null {
+  if (!isRecord(payload)) {
+    return createDefaultRoomPublicationState(fallbackWorkspaceId);
+  }
+
+  const workspaceId =
+    typeof payload.workspaceId === "string" && payload.workspaceId.trim()
+      ? payload.workspaceId
+      : fallbackWorkspaceId;
+  const enabled = typeof payload.enabled === "boolean" ? payload.enabled : false;
+  const updatedAt =
+    typeof payload.updatedAt === "string" && payload.updatedAt.trim()
+      ? payload.updatedAt
+      : null;
+
+  return {
+    workspaceId,
+    enabled,
+    updatedAt
   };
 }
 
@@ -7332,6 +7503,35 @@ function compareRoomMembers(left: RoomMember, right: RoomMember): number {
   }
 
   return left.user.username.localeCompare(right.user.username);
+}
+
+function createDefaultRoomPublicationState(workspaceId: string): RoomPublicationState {
+  return {
+    workspaceId,
+    enabled: false,
+    updatedAt: null
+  };
+}
+
+function normalizeRoomPublicationState(
+  publication: RoomPublicationState | null | undefined,
+  workspaceId: string
+): RoomPublicationState {
+  return extractRoomPublicationState(publication, workspaceId) ?? createDefaultRoomPublicationState(workspaceId);
+}
+
+function normalizeRoomListItem(room: RoomListItem): RoomListItem {
+  return {
+    ...room,
+    publication: normalizeRoomPublicationState(room.publication, room.workspace.id)
+  };
+}
+
+function normalizeAdminRoomListItem(room: AdminRoomListItem): AdminRoomListItem {
+  return {
+    ...room,
+    publication: normalizeRoomPublicationState(room.publication, room.workspace.id)
+  };
 }
 
 function compareNotePresenceViewers(left: NotePresenceViewer, right: NotePresenceViewer): number {

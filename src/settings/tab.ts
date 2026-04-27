@@ -9,6 +9,7 @@ import type {
   AdminRoomListItem,
   ManagedUser,
   ManagedGlobalRole,
+  RoomPublicationState,
   RoomMember,
   User,
   WorkspaceRole
@@ -135,7 +136,7 @@ export class RolaySettingTab extends PluginSettingTab {
         this.finishRender(scrollHost, renderKey, preservedScrollTop);
         return;
       } else {
-        this.renderRoomDetailView(shell, activeRoom);
+        this.renderRoomDetailView(shell, activeRoom, currentUser);
         this.finishRender(scrollHost, renderKey, preservedScrollTop);
         return;
       }
@@ -488,7 +489,7 @@ export class RolaySettingTab extends PluginSettingTab {
     }
   }
 
-  private renderRoomDetailView(containerEl: HTMLElement, room: RoomCardState): void {
+  private renderRoomDetailView(containerEl: HTMLElement, room: RoomCardState, currentUser: User | null): void {
     const pageTop = containerEl.createDiv({ cls: "rolay-settings-page-top" });
     const navRow = pageTop.createDiv({ cls: "rolay-settings-page-nav" });
     const backButton = navRow.createEl("button", {
@@ -542,6 +543,11 @@ export class RolaySettingTab extends PluginSettingTab {
       badges,
       room.room.membershipRole === "owner" ? "Owner" : "Member",
       room.room.membershipRole === "owner" ? "accent" : "muted"
+    );
+    this.createBadge(
+      badges,
+      room.publication.enabled ? "Public" : "Private",
+      room.publication.enabled ? "accent" : "muted"
     );
 
     const grid = this.createGrid(containerEl);
@@ -609,6 +615,13 @@ export class RolaySettingTab extends PluginSettingTab {
         });
       }
     }
+
+    this.renderPublicationCard(grid, {
+      workspaceId: room.room.workspace.id,
+      roomName: room.room.workspace.name,
+      publication: room.publication,
+      canManage: Boolean(currentUser?.isAdmin) || room.room.membershipRole === "owner"
+    });
 
     if (room.room.membershipRole === "owner") {
       const inviteCard = this.createCard(grid, "Invites", "Owner-only controls for the current invite key.");
@@ -934,8 +947,20 @@ export class RolaySettingTab extends PluginSettingTab {
       adminRoom?.inviteEnabled ?? room.room.inviteEnabled ? "Invite on" : "Invite off",
       adminRoom?.inviteEnabled ?? room.room.inviteEnabled ? "ready" : "muted"
     );
+    this.createBadge(
+      badges,
+      (adminRoom?.publication ?? room.publication).enabled ? "Public" : "Private",
+      (adminRoom?.publication ?? room.publication).enabled ? "accent" : "muted"
+    );
 
     const grid = this.createGrid(containerEl);
+
+    this.renderPublicationCard(grid, {
+      workspaceId: room.room.workspace.id,
+      roomName: room.room.workspace.name,
+      publication: adminRoom?.publication ?? room.publication,
+      canManage: Boolean(currentUser?.isAdmin)
+    });
 
     const membersCard = this.createCard(grid, "People");
     this.renderMembersPanel(membersCard.body, this.rolay.getRoomMembers(room.room.workspace.id), {
@@ -1002,10 +1027,74 @@ export class RolaySettingTab extends PluginSettingTab {
       ["Room ID", room.room.workspace.id],
       ["Name", room.room.workspace.name],
       ["Invite", adminRoom?.inviteEnabled ?? room.room.inviteEnabled ? "enabled" : "disabled"],
+      ["Publication", (adminRoom?.publication ?? room.publication).enabled ? "public" : "private"],
       ["Members", String(adminRoom?.memberCount ?? room.room.memberCount)],
       ["Owners", String(adminRoom?.ownerCount ?? 0)],
       ["Viewer account", currentUser?.username ?? "unknown"]
     ]);
+  }
+
+  private renderPublicationCard(
+    containerEl: HTMLElement,
+    options: {
+      workspaceId: string;
+      roomName: string;
+      publication: RoomPublicationState;
+      canManage: boolean;
+    }
+  ): void {
+    const publicationCard = this.createCard(
+      containerEl,
+      "Publication",
+      "Public rooms are readable by anyone who has the public site address. The public site is read-only and does not use private editor sync."
+    );
+
+    this.createInfoBlock(publicationCard.body, [
+      ["Status", options.publication.enabled ? "Public" : "Private"],
+      ["Updated", this.formatDateTime(options.publication.updatedAt) ?? "never"]
+    ]);
+
+    if (options.canManage) {
+      this.createSelectField(publicationCard.body, {
+        label: "Visibility",
+        value: options.publication.enabled ? "public" : "private",
+        options: [
+          ["private", "Private"],
+          ["public", "Public"]
+        ],
+        onChange: async (value) => {
+          await this.rolay.setRoomPublicationEnabled(options.workspaceId, value === "public");
+          this.requestRender();
+        }
+      });
+    }
+
+    if (options.publication.enabled) {
+      publicationCard.body.createDiv({
+        cls: "rolay-settings-inline-note",
+        text: "Anyone who knows the public site address can read this room without logging in. Public visitors cannot edit, upload, or send presence."
+      });
+      this.addCopyableInfoLine(
+        publicationCard.body,
+        "Public site",
+        this.rolay.getPublicSiteUrl()
+      );
+      const actions = this.createActionRow(publicationCard.body);
+      this.createActionButton(actions, "Open public site", "mod-cta", async () => {
+        window.open(this.rolay.getPublicSiteUrl(), "_blank", "noopener,noreferrer");
+      });
+      this.createActionButton(actions, "Copy public link", "", async () => {
+        await this.copyToClipboard(this.rolay.getPublicSiteUrl(), "Public site link copied.");
+      });
+      return;
+    }
+
+    publicationCard.body.createDiv({
+      cls: "rolay-settings-empty-state",
+      text: options.canManage
+        ? `The room "${options.roomName}" is private. Turn on public access only if read-only open access is intended.`
+        : `The room "${options.roomName}" is private.`
+    });
   }
 
   private createGrid(containerEl: HTMLElement, twoColumns = false): HTMLDivElement {
@@ -1271,7 +1360,10 @@ export class RolaySettingTab extends PluginSettingTab {
   private openDetail(mode: DetailMode, roomId: string): void {
     this.resetScrollOnNextRender = true;
     this.activeDetail = { mode, roomId };
-    void this.rolay.loadRoomMembersForUi(roomId).then(() => this.requestRender());
+    void Promise.allSettled([
+      this.rolay.loadRoomMembersForUi(roomId),
+      this.rolay.refreshRoomPublication(roomId)
+    ]).then(() => this.requestRender());
     this.render();
   }
 

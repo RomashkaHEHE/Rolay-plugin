@@ -1,10 +1,10 @@
 # Current State
 
-Last updated: 2026-04-22
+Last updated: 2026-04-27
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.5`
+- Plugin version: `1.2.6`
 - Latest notable commit in recent history before this AGENTS layer: `1a8c272` `Document presence and cursor sync behavior`
 
 ## Current Priorities
@@ -30,6 +30,7 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Binary transfers show progress in the explorer and placeholders should start at `0%`.
 - Remote markdown patches should preserve the local viewport.
 - Remote cursor rendering has extra stabilization against stale backward awareness offsets.
+- Room publication is private by default and public access is only through the separate server-root read-only site.
 
 ## Currently Active / Unfinished Work
 
@@ -46,6 +47,19 @@ Summary:
 Task file:
 
 - [AGENTS/tasks/blob-transfer-trace-cleanup.md](tasks/blob-transfer-trace-cleanup.md)
+
+### 2. Room Publication
+
+Status: `IN_PROGRESS`
+
+Summary:
+
+- Server now supports room-level publication and a public read-only site.
+- Plugin work includes payload model updates, publication endpoints, settings SSE support, and room-settings/admin UI.
+
+Task file:
+
+- [AGENTS/tasks/room-publication.md](tasks/room-publication.md)
 
 ## Idea Pipeline
 
@@ -69,8 +83,9 @@ These are important because future regressions will often land in these areas:
 - Cursor hover/inline label styling and behavior
 - Scroll-preserving remote markdown patches
 - Remote cursor jitter reduction by mirroring CodeMirror remap and rejecting short-lived stale backward offsets
-- BRAT-friendly release flow with plain semver tags like `1.2.5`
+- BRAT-friendly release flow with plain semver tags like `1.2.6`
 - Dedicated `AGENTS/ideas/*` backlog layer for candidate, discovery, and rejected ideas
+- Room publication and public-site management in room settings
 
 ## First Places To Look By Task Type
 
