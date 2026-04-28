@@ -4,7 +4,7 @@ Last updated: 2026-04-29
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.9`
+- Plugin version: `1.2.10`
 - Latest notable commit in recent history before this AGENTS layer: `1a8c272` `Document presence and cursor sync behavior`
 
 ## Current Priorities
