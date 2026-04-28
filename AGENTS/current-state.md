@@ -4,7 +4,7 @@ Last updated: 2026-04-28
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.7`
+- Plugin version: `1.2.8`
 - Latest notable commit in recent history before this AGENTS layer: `1a8c272` `Document presence and cursor sync behavior`
 
 ## Current Priorities
@@ -85,7 +85,7 @@ These are important because future regressions will often land in these areas:
 - Cursor hover/inline label styling and behavior
 - Scroll-preserving remote markdown patches
 - Remote cursor jitter reduction by mirroring CodeMirror remap and rejecting short-lived stale backward offsets
-- BRAT-friendly release flow with plain semver tags like `1.2.6`
+- BRAT-friendly release flow with plain semver tags like `1.2.8`
 - Dedicated `AGENTS/ideas/*` backlog layer for candidate, discovery, and rejected ideas
 - Room publication and public-site management in room settings
 - Persistent log auto-retention for more practical bug reports
