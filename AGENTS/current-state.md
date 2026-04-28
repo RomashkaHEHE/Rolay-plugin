@@ -25,8 +25,8 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Only `.md` files use CRDT/Yjs/Hocuspocus.
 - Every non-`.md` file, including `.txt`, is binary/blob content.
 - Default sync root is vault root (`/` in the settings UI).
-- Note presence is room-level SSE plus per-document awareness.
-- Explorer presence badges now exist both on markdown notes and on ancestor folders inside the room root.
+- Note presence is room-level SSE plus per-document awareness; public-site anonymous viewers arrive as `anonymousViewerCount` and stay separate from authenticated `viewers[]`.
+- Explorer presence badges now exist both on markdown notes and on ancestor folders inside the room root, including separate gray eye indicators for anonymous public viewers.
 - Binary transfers show progress in the explorer and placeholders should start at `0%`.
 - Remote markdown patches should preserve the local viewport.
 - Remote cursor rendering has extra stabilization against stale backward awareness offsets.

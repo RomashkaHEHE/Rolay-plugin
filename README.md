@@ -37,7 +37,7 @@ The plugin treats Rolay as a layered sync system:
 - Markdown cold-start/bootstrap now uses `POST /v1/workspaces/{workspaceId}/markdown/bootstrap`
 - Markdown realtime still uses `POST /v1/files/{entryId}/crdt-token`
 - Settings/admin live UI updates use `GET /v1/events/settings`
-- Room-level note presence for markdown viewer chips and explorer badges uses `GET /v1/workspaces/{workspaceId}/note-presence/events`
+- Room-level note presence for markdown viewer chips, anonymous public-site viewer indicators, and explorer badges uses `GET /v1/workspaces/{workspaceId}/note-presence/events`
 - Password change lives under `PATCH /v1/auth/me/password` and rotates the active session
 - Room publication lives under `GET/PATCH /v1/rooms/{workspaceId}/publication`
 

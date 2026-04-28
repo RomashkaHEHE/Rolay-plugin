@@ -1,4 +1,4 @@
-import { MarkdownView, Notice, Plugin, TFile, normalizePath, type TAbstractFile } from "obsidian";
+import { MarkdownView, Notice, Plugin, TFile, normalizePath, setIcon, type TAbstractFile } from "obsidian";
 import * as Y from "yjs";
 import { RolayApiClient, RolayApiError } from "./api/client";
 import { FileBridge } from "./obsidian/file-bridge";
@@ -73,6 +73,7 @@ interface RoomRuntimeState {
   notePresenceStream: NotePresenceEventStream | null;
   notePresenceStreamGeneration: number;
   notePresenceByEntryId: Map<string, NotePresenceViewer[]>;
+  noteAnonymousViewerCountByEntryId: Map<string, number>;
   streamStatus: WorkspaceEventStreamStatus;
   lastHandledEventId: number | null;
   snapshotRefreshHandle: number | null;
@@ -142,6 +143,15 @@ interface BinaryTransferState {
 interface ExplorerNotePresenceBadgeState {
   count: number;
   color: string;
+}
+
+interface ExplorerAnonymousPresenceBadgeState {
+  count: number;
+}
+
+interface NotePresenceDisplayState {
+  viewers: NotePresenceViewer[];
+  anonymousViewerCount: number;
 }
 
 interface ExplorerTransferBadgeState {
@@ -1648,6 +1658,7 @@ export default class RolayPlugin extends Plugin {
     runtime.notePresenceStream?.stop();
     runtime.notePresenceStream = null;
     runtime.notePresenceByEntryId.clear();
+    runtime.noteAnonymousViewerCountByEntryId.clear();
     this.scheduleExplorerLoadingDecorations();
     this.scheduleNotePresenceUiRefresh();
   }
@@ -2439,6 +2450,7 @@ export default class RolayPlugin extends Plugin {
       notePresenceStream: null,
       notePresenceStreamGeneration: 0,
       notePresenceByEntryId: new Map(),
+      noteAnonymousViewerCountByEntryId: new Map(),
       streamStatus: "stopped",
       lastHandledEventId: null,
       snapshotRefreshHandle: null,
@@ -2684,6 +2696,7 @@ export default class RolayPlugin extends Plugin {
     const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
     const transferBadges = this.getExplorerTransferBadges();
     const notePresenceBadges = this.getExplorerNotePresenceBadges();
+    const anonymousPresenceBadges = this.getExplorerAnonymousPresenceBadges();
 
     const pathElements = container.querySelectorAll<HTMLElement>("[data-path]");
     for (const element of pathElements) {
@@ -2749,6 +2762,10 @@ export default class RolayPlugin extends Plugin {
         element,
         notePresenceBadges.get(normalizedPath) ?? null
       );
+      this.updateExplorerAnonymousPresenceBadge(
+        element,
+        anonymousPresenceBadges.get(normalizedPath) ?? null
+      );
     }
   }
 
@@ -2760,8 +2777,11 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
-    const presence = file ? this.getNotePresenceForLocalPath(file.path) : [];
-    if (presence.length === 0) {
+    const presence = file ? this.getNotePresenceForLocalPath(file.path) : {
+      viewers: [],
+      anonymousViewerCount: 0
+    };
+    if (presence.viewers.length === 0 && presence.anonymousViewerCount === 0) {
       this.removeNotePresenceBar(view);
       return;
     }
@@ -2774,22 +2794,45 @@ export default class RolayPlugin extends Plugin {
     }
 
     const signature = presence
+      .viewers
       .map((viewer) => `${viewer.presenceId}:${viewer.displayName}:${viewer.color}`)
-      .join("|");
+      .join("|") + `|anonymous:${presence.anonymousViewerCount}`;
     if (bar.dataset.signature === signature) {
       return;
     }
 
     bar.dataset.signature = signature;
     bar.replaceChildren(
-      ...presence.map((viewer) => {
+      ...presence.viewers.map((viewer) => {
         const chip = document.createElement("span");
         chip.className = "rolay-note-presence-chip";
         chip.textContent = viewer.displayName;
         chip.style.setProperty("--rolay-note-presence-color", viewer.color);
         return chip;
-      })
+      }),
+      ...(presence.anonymousViewerCount > 0
+        ? [this.createAnonymousPresenceChip(presence.anonymousViewerCount)]
+        : [])
     );
+  }
+
+  private createAnonymousPresenceChip(count: number): HTMLElement {
+    const chip = document.createElement("span");
+    chip.className = "rolay-note-presence-chip rolay-note-presence-chip-anonymous";
+    chip.setAttribute(
+      "aria-label",
+      count === 1 ? "1 anonymous public viewer" : `${count} anonymous public viewers`
+    );
+
+    const icon = document.createElement("span");
+    icon.className = "rolay-note-presence-chip-icon";
+    setIcon(icon, "eye");
+
+    const label = document.createElement("span");
+    label.textContent = String(count);
+
+    chip.replaceChildren(icon, label);
+    return chip;
   }
 
   private removeNotePresenceBar(view: MarkdownView): void {
@@ -2868,6 +2911,58 @@ export default class RolayPlugin extends Plugin {
     return badges;
   }
 
+  private getExplorerAnonymousPresenceBadges(): Map<string, ExplorerAnonymousPresenceBadgeState> {
+    const aggregate = new Map<string, number>();
+    const downloadedRooms = new Map(
+      this.getDownloadedRooms().map((room) => [room.workspaceId, room] as const)
+    );
+
+    for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
+      const downloadedRoom = downloadedRooms.get(workspaceId);
+      if (!downloadedRoom) {
+        continue;
+      }
+
+      const roomRoot = normalizePath(getRoomRoot(this.data.settings.syncRoot, downloadedRoom.folderName));
+      for (const [entryId, anonymousViewerCount] of runtime.noteAnonymousViewerCountByEntryId.entries()) {
+        if (anonymousViewerCount <= 0) {
+          continue;
+        }
+
+        const entry = runtime.treeStore.getEntryById(entryId);
+        if (!entry || entry.deleted || entry.kind !== "markdown") {
+          continue;
+        }
+
+        const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path);
+        if (!localPath) {
+          continue;
+        }
+
+        const normalizedLocalPath = normalizePath(localPath);
+        this.accumulateExplorerAnonymousPresenceBadge(aggregate, normalizedLocalPath, anonymousViewerCount);
+
+        let parentPath = getParentPath(normalizedLocalPath);
+        while (parentPath) {
+          if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
+            break;
+          }
+
+          this.accumulateExplorerAnonymousPresenceBadge(aggregate, parentPath, anonymousViewerCount);
+          if (parentPath === roomRoot) {
+            break;
+          }
+
+          parentPath = getParentPath(parentPath);
+        }
+      }
+    }
+
+    return new Map(
+      [...aggregate.entries()].map(([localPath, count]) => [localPath, { count }] as const)
+    );
+  }
+
   private accumulateExplorerNotePresenceBadge(
     aggregate: Map<string, { count: number; soleColor: string | null }>,
     localPath: string,
@@ -2884,6 +2979,14 @@ export default class RolayPlugin extends Plugin {
       count: nextCount,
       soleColor: nextSoleColor
     });
+  }
+
+  private accumulateExplorerAnonymousPresenceBadge(
+    aggregate: Map<string, number>,
+    localPath: string,
+    anonymousViewerCount: number
+  ): void {
+    aggregate.set(localPath, (aggregate.get(localPath) ?? 0) + anonymousViewerCount);
   }
 
   private updateExplorerNotePresenceBadge(
@@ -2904,13 +3007,55 @@ export default class RolayPlugin extends Plugin {
     if (!badge) {
       badge = document.createElement("span");
       badge.className = "rolay-note-presence-badge";
-      titleHost.appendChild(badge);
+      const anonymousBadge = titleHost.querySelector<HTMLElement>(".rolay-note-anonymous-presence-badge");
+      if (anonymousBadge) {
+        titleHost.insertBefore(badge, anonymousBadge);
+      } else {
+        titleHost.appendChild(badge);
+      }
     }
 
     badge.style.setProperty("--rolay-note-presence-badge-color", badgeState.color);
     badge.textContent = badgeState.count <= 1 ? "" : String(badgeState.count);
     badge.classList.toggle("rolay-note-presence-badge-multi", badgeState.count > 1);
     badge.setAttribute("aria-label", badgeState.count <= 1 ? "1 viewer" : `${badgeState.count} viewers`);
+  }
+
+  private updateExplorerAnonymousPresenceBadge(
+    element: HTMLElement,
+    badgeState: ExplorerAnonymousPresenceBadgeState | null
+  ): void {
+    const titleHost = this.findExplorerTitleHost(element);
+    if (!titleHost) {
+      return;
+    }
+
+    let badge = titleHost.querySelector<HTMLElement>(".rolay-note-anonymous-presence-badge");
+    if (!badgeState || badgeState.count <= 0) {
+      badge?.remove();
+      return;
+    }
+
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "rolay-note-anonymous-presence-badge";
+      titleHost.appendChild(badge);
+    }
+
+    const icon = document.createElement("span");
+    icon.className = "rolay-note-anonymous-presence-badge-icon";
+    setIcon(icon, "eye");
+
+    const label = document.createElement("span");
+    label.textContent = String(badgeState.count);
+
+    badge.replaceChildren(icon, label);
+    badge.setAttribute(
+      "aria-label",
+      badgeState.count === 1
+        ? "1 anonymous public viewer"
+        : `${badgeState.count} anonymous public viewers`
+    );
   }
 
   private getExplorerTransferBadges(): Map<string, ExplorerTransferBadgeState> {
@@ -2976,9 +3121,11 @@ export default class RolayPlugin extends Plugin {
     if (!badge) {
       badge = document.createElement("span");
       badge.className = "rolay-transfer-progress-badge";
-      const notePresenceBadge = titleHost.querySelector<HTMLElement>(".rolay-note-presence-badge");
-      if (notePresenceBadge) {
-        titleHost.insertBefore(badge, notePresenceBadge);
+      const presenceBadge = titleHost.querySelector<HTMLElement>(
+        ".rolay-note-presence-badge, .rolay-note-anonymous-presence-badge"
+      );
+      if (presenceBadge) {
+        titleHost.insertBefore(badge, presenceBadge);
       } else {
         titleHost.appendChild(badge);
       }
@@ -3104,28 +3251,36 @@ export default class RolayPlugin extends Plugin {
     return statuses;
   }
 
-  private getNotePresenceForLocalPath(localPath: string): NotePresenceViewer[] {
+  private getNotePresenceForLocalPath(localPath: string): NotePresenceDisplayState {
     const room = this.resolveDownloadedRoomByLocalPath(localPath);
     if (!room) {
-      return [];
+      return createEmptyNotePresenceDisplayState();
     }
 
     const serverPath = toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName);
     if (!serverPath) {
-      return [];
+      return createEmptyNotePresenceDisplayState();
     }
 
     const entry = this.getRoomStore(room.workspaceId)?.getEntryByPath(serverPath);
     if (!entry || entry.deleted || entry.kind !== "markdown") {
-      return [];
+      return createEmptyNotePresenceDisplayState();
     }
 
     return this.getNotePresenceForEntry(room.workspaceId, entry.id);
   }
 
-  private getNotePresenceForEntry(workspaceId: string, entryId: string): NotePresenceViewer[] {
-    const viewers = this.roomRuntime.get(workspaceId)?.notePresenceByEntryId.get(entryId) ?? [];
-    return [...viewers];
+  private getNotePresenceForEntry(workspaceId: string, entryId: string): NotePresenceDisplayState {
+    const runtime = this.roomRuntime.get(workspaceId);
+    if (!runtime) {
+      return createEmptyNotePresenceDisplayState();
+    }
+
+    const viewers = runtime.notePresenceByEntryId.get(entryId) ?? [];
+    return {
+      viewers: [...viewers],
+      anonymousViewerCount: runtime.noteAnonymousViewerCountByEntryId.get(entryId) ?? 0
+    };
   }
 
   private applyNotePresenceSnapshot(workspaceId: string, payload: unknown): void {
@@ -3136,12 +3291,15 @@ export default class RolayPlugin extends Plugin {
 
     const runtime = this.ensureRoomRuntime(workspaceId);
     runtime.notePresenceByEntryId.clear();
+    runtime.noteAnonymousViewerCountByEntryId.clear();
     for (const note of snapshot.notes) {
-      if (note.viewers.length === 0) {
-        continue;
+      if (note.viewers.length > 0) {
+        runtime.notePresenceByEntryId.set(note.entryId, note.viewers);
       }
 
-      runtime.notePresenceByEntryId.set(note.entryId, note.viewers);
+      if (note.anonymousViewerCount > 0) {
+        runtime.noteAnonymousViewerCountByEntryId.set(note.entryId, note.anonymousViewerCount);
+      }
     }
 
     this.scheduleExplorerLoadingDecorations();
@@ -3159,6 +3317,12 @@ export default class RolayPlugin extends Plugin {
       runtime.notePresenceByEntryId.delete(update.entryId);
     } else {
       runtime.notePresenceByEntryId.set(update.entryId, update.viewers);
+    }
+
+    if (update.anonymousViewerCount <= 0) {
+      runtime.noteAnonymousViewerCountByEntryId.delete(update.entryId);
+    } else {
+      runtime.noteAnonymousViewerCountByEntryId.set(update.entryId, update.anonymousViewerCount);
     }
 
     this.scheduleExplorerLoadingDecorations();
@@ -7393,7 +7557,8 @@ function extractNotePresenceUpdatedPayload(payload: unknown): NotePresenceUpdate
   return {
     workspaceId: payload.workspaceId,
     entryId: payload.entryId,
-    viewers
+    viewers,
+    anonymousViewerCount: extractAnonymousViewerCount(payload.anonymousViewerCount)
   };
 }
 
@@ -7411,7 +7576,8 @@ function extractNotePresenceSnapshotNote(
 
   return {
     entryId: payload.entryId,
-    viewers
+    viewers,
+    anonymousViewerCount: extractAnonymousViewerCount(payload.anonymousViewerCount)
   };
 }
 
@@ -7433,6 +7599,21 @@ function extractNotePresenceViewer(payload: unknown): NotePresenceViewer | null 
     displayName: payload.displayName,
     color: payload.color,
     hasSelection: payload.hasSelection
+  };
+}
+
+function extractAnonymousViewerCount(value: unknown): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return 0;
+  }
+
+  return Math.trunc(value);
+}
+
+function createEmptyNotePresenceDisplayState(): NotePresenceDisplayState {
+  return {
+    viewers: [],
+    anonymousViewerCount: 0
   };
 }
 

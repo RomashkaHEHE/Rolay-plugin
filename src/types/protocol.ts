@@ -420,6 +420,7 @@ export interface NotePresenceViewer {
 export interface NotePresenceSnapshotNote {
   entryId: string;
   viewers: NotePresenceViewer[];
+  anonymousViewerCount: number;
 }
 
 export interface NotePresenceSnapshotPayload {
@@ -431,6 +432,7 @@ export interface NotePresenceUpdatedPayload {
   workspaceId: string;
   entryId: string;
   viewers: NotePresenceViewer[];
+  anonymousViewerCount: number;
 }
 
 export type NotePresenceStreamEvent<TPayload = unknown> = WorkspaceEvent<TPayload>;

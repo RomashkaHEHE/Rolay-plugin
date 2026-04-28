@@ -176,6 +176,7 @@ Important behavior:
 - presence is keyed by `workspaceId` + `entryId`
 - the same `userId` may appear multiple times via distinct `presenceId` values
 - `selection` is optional; viewer presence still counts without a caret/selection
+- `anonymousViewerCount` is optional and defaults to `0`; it represents read-only public-site visitors and is not mixed into `viewers[]`
 
 Snapshot payload:
 
@@ -188,18 +189,21 @@ Snapshot payload:
     - `displayName`
     - `color`
     - `hasSelection`
+  - `anonymousViewerCount`
 
 Incremental update payload:
 
 - `workspaceId`
 - `entryId`
 - `viewers[]`
+- `anonymousViewerCount`
 
 The plugin uses this stream for two UI surfaces:
 
 - viewer chips above the currently opened markdown note
 - per-note presence badges in the file explorer
 - aggregated ancestor-folder badges in the explorer inside the downloaded room root
+- separate gray eye indicators for anonymous public-site viewers
 
 ### Markdown CRDT Bootstrap
 
