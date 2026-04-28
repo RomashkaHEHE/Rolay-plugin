@@ -16907,6 +16907,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.persistHandle = null;
     this.isUnloading = false;
     this.explorerDecorationHandle = null;
+    this.explorerDecorationFrame = null;
+    this.explorerToggleRefreshHandle = null;
     this.notePresenceUiHandle = null;
     this.roomList = [];
     this.adminRoomList = [];
@@ -17043,6 +17045,16 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         this.scheduleNotePresenceUiRefresh();
       })
     );
+    this.registerDomEvent(this.app.workspace.containerEl, "click", (event) => {
+      if (this.isExplorerFolderInteractionTarget(event.target)) {
+        this.refreshExplorerDecorationsAfterFolderToggle();
+      }
+    }, true);
+    this.registerDomEvent(this.app.workspace.containerEl, "keydown", (event) => {
+      if ((event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "Enter" || event.key === " ") && this.isExplorerFolderInteractionTarget(event.target)) {
+        this.refreshExplorerDecorationsAfterFolderToggle();
+      }
+    }, true);
     this.registerEvent(
       this.app.vault.on("create", (file) => {
         void this.handleVaultCreate(file);
@@ -17071,6 +17083,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       }
       if (this.explorerDecorationHandle !== null) {
         window.clearTimeout(this.explorerDecorationHandle);
+      }
+      if (this.explorerDecorationFrame !== null) {
+        window.cancelAnimationFrame(this.explorerDecorationFrame);
+      }
+      if (this.explorerToggleRefreshHandle !== null) {
+        window.clearTimeout(this.explorerToggleRefreshHandle);
       }
       if (this.notePresenceUiHandle !== null) {
         window.clearTimeout(this.notePresenceUiHandle);
@@ -19073,6 +19091,29 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       this.refreshExplorerLoadingDecorations();
     }, 80);
   }
+  scheduleImmediateExplorerLoadingDecorations() {
+    if (this.explorerDecorationHandle !== null) {
+      window.clearTimeout(this.explorerDecorationHandle);
+      this.explorerDecorationHandle = null;
+    }
+    if (this.explorerDecorationFrame !== null) {
+      return;
+    }
+    this.explorerDecorationFrame = window.requestAnimationFrame(() => {
+      this.explorerDecorationFrame = null;
+      this.refreshExplorerLoadingDecorations();
+    });
+  }
+  refreshExplorerDecorationsAfterFolderToggle() {
+    this.scheduleImmediateExplorerLoadingDecorations();
+    if (this.explorerToggleRefreshHandle !== null) {
+      return;
+    }
+    this.explorerToggleRefreshHandle = window.setTimeout(() => {
+      this.explorerToggleRefreshHandle = null;
+      this.scheduleImmediateExplorerLoadingDecorations();
+    }, 32);
+  }
   scheduleNotePresenceUiRefresh() {
     if (this.notePresenceUiHandle !== null) {
       return;
@@ -19347,6 +19388,18 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   isElementVisiblyRendered(element2) {
     return element2.getClientRects().length > 0;
+  }
+  isExplorerFolderInteractionTarget(target) {
+    if (!(target instanceof HTMLElement)) {
+      return false;
+    }
+    const folderElement = target.closest(".nav-folder, .nav-folder-title");
+    if (!folderElement) {
+      return false;
+    }
+    return Boolean(
+      folderElement.closest(".nav-files-container") || folderElement.closest('.workspace-leaf-content[data-type="file-explorer"]')
+    );
   }
   updateExplorerNotePresenceBadge(element2, badgeState) {
     const titleHost = this.findExplorerTitleHost(element2);

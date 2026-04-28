@@ -1,10 +1,10 @@
 # Current State
 
-Last updated: 2026-04-28
+Last updated: 2026-04-29
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.8`
+- Plugin version: `1.2.9`
 - Latest notable commit in recent history before this AGENTS layer: `1a8c272` `Document presence and cursor sync behavior`
 
 ## Current Priorities
@@ -27,6 +27,7 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Default sync root is vault root (`/` in the settings UI).
 - Note presence is room-level SSE plus per-document awareness; public-site anonymous viewers arrive as `anonymousViewerCount` and stay separate from authenticated `viewers[]`.
 - Explorer presence badges use minimal-visible-parent aggregation: a note shows its own badge when visible, otherwise the badge rolls up only to the deepest visible collapsed parent inside the room root. Anonymous public viewers remain separate gray eye indicators and follow the same roll-up rule.
+- Explorer folder expand/collapse interactions must refresh presence/transfer decorations immediately; do not rely only on the slower general decoration debounce for visible-parent recalculation.
 - Red downloading/protected explorer paths and yellow uploading paths should always show a `0-100%` badge. Binary transfers use byte progress, remote placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll up child progress.
 - Local delete operations keep a short pending-delete guard so stale snapshots cannot resurrect files while multi-file delete operations are still settling.
 - Persistent `rolay-sync.log` is intentionally short-lived: entries older than 48 hours are removed, and noisy files are capped to a compact recent tail.
@@ -95,6 +96,7 @@ These are important because future regressions will often land in these areas:
 - Pending-delete guard against stale snapshot resurrection during bulk local deletes
 - Deferred/staggered startup sync so preload still runs without blocking Obsidian startup
 - Hard per-room Disconnect semantics for active preload/blob work
+- Immediate explorer decoration refresh after folder expand/collapse
 
 ## First Places To Look By Task Type
 

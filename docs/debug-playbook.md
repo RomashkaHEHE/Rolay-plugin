@@ -78,10 +78,15 @@ Check:
    - `renderNotePresenceChipsForView`
    - `getExplorerNotePresenceBadges`
    - minimal-visible-parent explorer aggregation logic for note presence
+   - immediate explorer folder interaction refresh for expand/collapse state
 4. [src/realtime/crdt-session.ts](../src/realtime/crdt-session.ts):
    - `publishLocalViewerPresence`
    - `clearLocalPresence`
 5. [src/sync/note-presence-stream.ts](../src/sync/note-presence-stream.ts)
+
+Useful expectation:
+
+- expanding or collapsing a folder should move presence/anonymous/transfer badges to the new minimal visible parent on the next animation frame, not after the slower sync debounce
 
 ### Binary file path appears but bytes do not
 

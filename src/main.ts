@@ -243,6 +243,8 @@ export default class RolayPlugin extends Plugin {
   private persistHandle: number | null = null;
   private isUnloading = false;
   private explorerDecorationHandle: number | null = null;
+  private explorerDecorationFrame: number | null = null;
+  private explorerToggleRefreshHandle: number | null = null;
   private notePresenceUiHandle: number | null = null;
   private statusBarEl!: HTMLElement;
   private roomList: RoomListItem[] = [];
@@ -388,6 +390,19 @@ export default class RolayPlugin extends Plugin {
         this.scheduleNotePresenceUiRefresh();
       })
     );
+    this.registerDomEvent(this.app.workspace.containerEl, "click", (event) => {
+      if (this.isExplorerFolderInteractionTarget(event.target)) {
+        this.refreshExplorerDecorationsAfterFolderToggle();
+      }
+    }, true);
+    this.registerDomEvent(this.app.workspace.containerEl, "keydown", (event) => {
+      if (
+        (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "Enter" || event.key === " ") &&
+        this.isExplorerFolderInteractionTarget(event.target)
+      ) {
+        this.refreshExplorerDecorationsAfterFolderToggle();
+      }
+    }, true);
     this.registerEvent(
       this.app.vault.on("create", (file) => {
         void this.handleVaultCreate(file);
@@ -418,6 +433,14 @@ export default class RolayPlugin extends Plugin {
 
       if (this.explorerDecorationHandle !== null) {
         window.clearTimeout(this.explorerDecorationHandle);
+      }
+
+      if (this.explorerDecorationFrame !== null) {
+        window.cancelAnimationFrame(this.explorerDecorationFrame);
+      }
+
+      if (this.explorerToggleRefreshHandle !== null) {
+        window.clearTimeout(this.explorerToggleRefreshHandle);
       }
 
       if (this.notePresenceUiHandle !== null) {
@@ -2821,6 +2844,38 @@ export default class RolayPlugin extends Plugin {
     }, 80);
   }
 
+  private scheduleImmediateExplorerLoadingDecorations(): void {
+    if (this.explorerDecorationHandle !== null) {
+      window.clearTimeout(this.explorerDecorationHandle);
+      this.explorerDecorationHandle = null;
+    }
+
+    if (this.explorerDecorationFrame !== null) {
+      return;
+    }
+
+    this.explorerDecorationFrame = window.requestAnimationFrame(() => {
+      this.explorerDecorationFrame = null;
+      this.refreshExplorerLoadingDecorations();
+    });
+  }
+
+  private refreshExplorerDecorationsAfterFolderToggle(): void {
+    this.scheduleImmediateExplorerLoadingDecorations();
+
+    if (this.explorerToggleRefreshHandle !== null) {
+      return;
+    }
+
+    // Obsidian usually toggles the explorer DOM synchronously, but one trailing
+    // frame catches theme/plugin delayed class changes without returning to the
+    // slower general sync debounce.
+    this.explorerToggleRefreshHandle = window.setTimeout(() => {
+      this.explorerToggleRefreshHandle = null;
+      this.scheduleImmediateExplorerLoadingDecorations();
+    }, 32);
+  }
+
   private scheduleNotePresenceUiRefresh(): void {
     if (this.notePresenceUiHandle !== null) {
       return;
@@ -3187,6 +3242,22 @@ export default class RolayPlugin extends Plugin {
 
   private isElementVisiblyRendered(element: HTMLElement): boolean {
     return element.getClientRects().length > 0;
+  }
+
+  private isExplorerFolderInteractionTarget(target: EventTarget | null): boolean {
+    if (!(target instanceof HTMLElement)) {
+      return false;
+    }
+
+    const folderElement = target.closest<HTMLElement>(".nav-folder, .nav-folder-title");
+    if (!folderElement) {
+      return false;
+    }
+
+    return Boolean(
+      folderElement.closest(".nav-files-container") ||
+      folderElement.closest('.workspace-leaf-content[data-type="file-explorer"]')
+    );
   }
 
   private updateExplorerNotePresenceBadge(
