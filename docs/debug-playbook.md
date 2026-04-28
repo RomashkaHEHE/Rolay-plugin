@@ -23,7 +23,8 @@ Check:
 
 1. `settings.roomBindings` in `data.json`
 2. `rooms/info` and `startup/info` lines in `rolay-sync.log`
-3. [src/main.ts](../src/main.ts) room recovery helpers:
+3. whether startup logs show deferred/staggered room resume after workspace layout readiness
+4. [src/main.ts](../src/main.ts) room recovery helpers:
    - `getDownloadedRooms`
    - `getDownloadedFolderName`
    - `reconcileLocalRoomFolders`
@@ -76,7 +77,7 @@ Check:
    - `applyNotePresenceUpdate`
    - `renderNotePresenceChipsForView`
    - `getExplorerNotePresenceBadges`
-   - ancestor-folder aggregation logic for note presence
+   - minimal-visible-parent explorer aggregation logic for note presence
 4. [src/realtime/crdt-session.ts](../src/realtime/crdt-session.ts):
    - `publishLocalViewerPresence`
    - `clearLocalPresence`
@@ -100,6 +101,24 @@ Useful expectation:
 
 - a remote binary placeholder should immediately count as `loading` in the explorer
 - any red downloading/protected explorer path or yellow uploading path should have a `0-100%` badge. Active binary transfers use byte progress, remote placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll child progress up.
+
+### Disconnect does not stop room activity
+
+Check:
+
+1. [src/main.ts](../src/main.ts):
+   - `disconnectRoom`
+   - `stopRoomEventStream`
+   - `cancelRoomBinaryTransfers`
+   - `isRoomSyncActive`
+2. [src/obsidian/file-bridge.ts](../src/obsidian/file-bridge.ts):
+   - `applySnapshot`
+
+Useful expectation:
+
+- disconnect affects only the selected room/workspace
+- active binary uploads/downloads for that workspace are aborted
+- late snapshot/bootstrap/download work should not materialize files after room status becomes `stopped`
 
 ### Binary transfer restarts from zero after app restart
 

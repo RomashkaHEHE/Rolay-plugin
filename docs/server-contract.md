@@ -202,7 +202,7 @@ The plugin uses this stream for two UI surfaces:
 
 - viewer chips above the currently opened markdown note
 - per-note presence badges in the file explorer
-- aggregated ancestor-folder badges in the explorer inside the downloaded room root
+- minimal-visible-parent badges in the explorer inside the downloaded room root
 - separate gray eye indicators for anonymous public-site viewers
 
 ### Markdown CRDT Bootstrap

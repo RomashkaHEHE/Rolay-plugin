@@ -31,6 +31,7 @@ interface FileBridgeConfig {
   getFolderName: (workspaceId: string) => string | null;
   getDownloadedRooms: () => DownloadedRoomContext[];
   getEntryByPath: (workspaceId: string, path: string) => FileEntry | null;
+  isWorkspaceSyncActive: (workspaceId: string) => boolean;
   hasPendingCreate: (workspaceId: string, path: string) => boolean;
   hasPendingDelete: (workspaceId: string, path: string) => boolean;
   hasPendingBinaryWrite: (localPath: string) => boolean;
@@ -59,6 +60,7 @@ export class FileBridge {
   private readonly getFolderName: (workspaceId: string) => string | null;
   private readonly getDownloadedRooms: () => DownloadedRoomContext[];
   private readonly getEntryByPath: (workspaceId: string, path: string) => FileEntry | null;
+  private readonly isWorkspaceSyncActive: (workspaceId: string) => boolean;
   private readonly hasPendingCreate: (workspaceId: string, path: string) => boolean;
   private readonly hasPendingDelete: (workspaceId: string, path: string) => boolean;
   private readonly hasPendingBinaryWrite: (localPath: string) => boolean;
@@ -89,6 +91,7 @@ export class FileBridge {
     this.getFolderName = config.getFolderName;
     this.getDownloadedRooms = config.getDownloadedRooms;
     this.getEntryByPath = config.getEntryByPath;
+    this.isWorkspaceSyncActive = config.isWorkspaceSyncActive;
     this.hasPendingCreate = config.hasPendingCreate;
     this.hasPendingDelete = config.hasPendingDelete;
     this.hasPendingBinaryWrite = config.hasPendingBinaryWrite;
@@ -105,7 +108,7 @@ export class FileBridge {
 
   async applySnapshot(snapshot: TreeSnapshotResponse, previousEntries: FileEntry[]): Promise<void> {
     const folderName = this.getFolderName(snapshot.workspace.id);
-    if (!folderName) {
+    if (!folderName || !this.isWorkspaceSyncActive(snapshot.workspace.id)) {
       return;
     }
 
@@ -130,6 +133,10 @@ export class FileBridge {
       });
 
     for (const entry of renamedEntries) {
+      if (!this.isWorkspaceSyncActive(snapshot.workspace.id)) {
+        return;
+      }
+
       const previous = previousById.get(entry.id);
       if (previous) {
         await this.safeApply(`rename local ${previous.path} -> ${entry.path}`, async () => {
@@ -144,6 +151,10 @@ export class FileBridge {
       .sort(compareEntriesForMaterialization);
 
     for (const entry of activeEntries) {
+      if (!this.isWorkspaceSyncActive(snapshot.workspace.id)) {
+        return;
+      }
+
       await this.safeApply(`materialize ${entry.path}`, async () => {
         await this.ensureLocalEntry(snapshot.workspace.id, folderName, entry);
       });
@@ -167,6 +178,10 @@ export class FileBridge {
     });
 
     for (const entry of deletedEntries.sort(compareEntriesForDeletion)) {
+      if (!this.isWorkspaceSyncActive(snapshot.workspace.id)) {
+        return;
+      }
+
       await this.safeApply(`trash ${entry.path}`, async () => {
         await this.trashLocalEntry(folderName, entry.path);
       });

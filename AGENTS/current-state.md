@@ -26,10 +26,12 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Every non-`.md` file, including `.txt`, is binary/blob content.
 - Default sync root is vault root (`/` in the settings UI).
 - Note presence is room-level SSE plus per-document awareness; public-site anonymous viewers arrive as `anonymousViewerCount` and stay separate from authenticated `viewers[]`.
-- Explorer presence badges now exist both on markdown notes and on ancestor folders inside the room root, including separate gray eye indicators for anonymous public viewers.
+- Explorer presence badges use minimal-visible-parent aggregation: a note shows its own badge when visible, otherwise the badge rolls up only to the deepest visible collapsed parent inside the room root. Anonymous public viewers remain separate gray eye indicators and follow the same roll-up rule.
 - Red downloading/protected explorer paths and yellow uploading paths should always show a `0-100%` badge. Binary transfers use byte progress, remote placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll up child progress.
 - Local delete operations keep a short pending-delete guard so stale snapshots cannot resurrect files while multi-file delete operations are still settling.
 - Persistent `rolay-sync.log` is intentionally short-lived: entries older than 48 hours are removed, and noisy files are capped to a compact recent tail.
+- Startup sync is deferred until after Obsidian workspace layout is ready; downloaded rooms then resume with a small stagger so auth/snapshot/preload work does not block the plugin loading screen.
+- Room Disconnect is a hard per-room pause: it stops room SSE/presence, cancels scheduled snapshot/background markdown work, aborts active binary transfers for that workspace, invalidates in-flight upload tokens, and ignores late snapshot/bootstrap/download results without affecting other connected rooms.
 - Remote markdown patches should preserve the local viewport.
 - Remote cursor rendering has extra stabilization against stale backward awareness offsets.
 - Room publication is private by default and public access is only through the separate server-root read-only site.
@@ -80,7 +82,7 @@ These are important because future regressions will often land in these areas:
 
 - Explorer binary transfer percent badges for upload/download
 - Immediate `0%` red state for remote binary placeholders
-- Aggregated folder presence badges in explorer
+- Minimal-visible-parent presence badges in explorer
 - Viewer chips above notes
 - Cursor hover/inline label styling and behavior
 - Scroll-preserving remote markdown patches
@@ -91,6 +93,8 @@ These are important because future regressions will often land in these areas:
 - Persistent log auto-retention for more practical bug reports
 - Mandatory explorer progress badges for red/yellow sync states
 - Pending-delete guard against stale snapshot resurrection during bulk local deletes
+- Deferred/staggered startup sync so preload still runs without blocking Obsidian startup
+- Hard per-room Disconnect semantics for active preload/blob work
 
 ## First Places To Look By Task Type
 

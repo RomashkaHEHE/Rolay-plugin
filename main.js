@@ -10359,6 +10359,7 @@ var _FileBridge = class _FileBridge {
     this.getFolderName = config.getFolderName;
     this.getDownloadedRooms = config.getDownloadedRooms;
     this.getEntryByPath = config.getEntryByPath;
+    this.isWorkspaceSyncActive = config.isWorkspaceSyncActive;
     this.hasPendingCreate = config.hasPendingCreate;
     this.hasPendingDelete = config.hasPendingDelete;
     this.hasPendingBinaryWrite = config.hasPendingBinaryWrite;
@@ -10374,7 +10375,7 @@ var _FileBridge = class _FileBridge {
   }
   async applySnapshot(snapshot, previousEntries) {
     const folderName = this.getFolderName(snapshot.workspace.id);
-    if (!folderName) {
+    if (!folderName || !this.isWorkspaceSyncActive(snapshot.workspace.id)) {
       return;
     }
     const roomRoot = this.getRoomRoot(folderName);
@@ -10391,6 +10392,9 @@ var _FileBridge = class _FileBridge {
       return previous && !previous.deleted && previous.path !== entry.path;
     });
     for (const entry of renamedEntries) {
+      if (!this.isWorkspaceSyncActive(snapshot.workspace.id)) {
+        return;
+      }
       const previous = previousById.get(entry.id);
       if (previous) {
         await this.safeApply(`rename local ${previous.path} -> ${entry.path}`, async () => {
@@ -10400,6 +10404,9 @@ var _FileBridge = class _FileBridge {
     }
     const activeEntries = snapshot.entries.filter((entry) => !entry.deleted).filter((entry) => !this.hasPendingDelete(snapshot.workspace.id, entry.path)).sort(compareEntriesForMaterialization);
     for (const entry of activeEntries) {
+      if (!this.isWorkspaceSyncActive(snapshot.workspace.id)) {
+        return;
+      }
       await this.safeApply(`materialize ${entry.path}`, async () => {
         await this.ensureLocalEntry(snapshot.workspace.id, folderName, entry);
       });
@@ -10418,6 +10425,9 @@ var _FileBridge = class _FileBridge {
       return !next || next.deleted;
     });
     for (const entry of deletedEntries.sort(compareEntriesForDeletion)) {
+      if (!this.isWorkspaceSyncActive(snapshot.workspace.id)) {
+        return;
+      }
       await this.safeApply(`trash ${entry.path}`, async () => {
         await this.trashLocalEntry(folderName, entry.path);
       });
@@ -16912,6 +16922,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.settingsEventCursor = null;
     this.settingsEventStreamStatus = "stopped";
     this.settingsStreamRecoveryInFlight = false;
+    this.startupBootstrapHandle = null;
+    this.startupRoomResumeHandles = /* @__PURE__ */ new Set();
     this.profileDraftDisplayName = "";
     this.passwordChangeDraft = {
       currentPassword: "",
@@ -16992,6 +17004,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       getFolderName: (workspaceId) => this.getDownloadedFolderName(workspaceId),
       getDownloadedRooms: () => this.getDownloadedRooms(),
       getEntryByPath: (workspaceId, path) => this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null,
+      isWorkspaceSyncActive: (workspaceId) => this.isRoomSyncActive(workspaceId),
       hasPendingCreate: (workspaceId, path) => this.hasPendingLocalCreate(workspaceId, path),
       hasPendingDelete: (workspaceId, path) => this.hasPendingLocalDelete(workspaceId, path),
       hasPendingBinaryWrite: (localPath) => (0, import_obsidian9.normalizePath)(localPath) in this.data.pendingBinaryWrites,
@@ -17065,6 +17078,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       if (this.logFlushHandle !== null) {
         window.clearTimeout(this.logFlushHandle);
       }
+      this.clearDeferredStartupWork();
       for (const runtime of this.roomRuntime.values()) {
         if (runtime.snapshotRefreshHandle !== null) {
           window.clearTimeout(runtime.snapshotRefreshHandle);
@@ -17088,10 +17102,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       this.binarySyncPathsByToken.clear();
     });
     this.recordLog("plugin", "Rolay plugin loaded.");
-    await this.bootstrapSync("startup");
+    this.scheduleStartupBootstrap("startup");
   }
   async onunload() {
     this.isUnloading = true;
+    this.clearDeferredStartupWork();
     this.stopSettingsEventStream();
     this.stopAllRoomEventStreams();
     await this.crdtManager.disconnect();
@@ -17333,7 +17348,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       downloaded: Boolean(binding?.downloaded)
     });
   }
-  async loginWithSettings(showNotice = true) {
+  async loginWithSettings(showNotice = true, resumeRooms = true) {
     const { username, password } = this.data.settings;
     if (!username || !password) {
       throw this.notifyError("Username and password are required before login.");
@@ -17346,7 +17361,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       });
       await this.applySessionUser(response.user);
       await this.refreshPostAuthState();
-      await this.resumeDownloadedRooms("login");
+      if (resumeRooms) {
+        await this.resumeDownloadedRooms("login");
+      }
       this.recordLog("auth", `Logged in as ${response.user.username}.`);
       if (showNotice) {
         new import_obsidian9.Notice(`Rolay login successful for ${response.user.username}.`);
@@ -17578,7 +17595,14 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async connectRoom(workspaceId, showNotice = true, reason = "manual-connect") {
     const room = this.requireDownloadedRoom(workspaceId);
+    const runtime = this.ensureRoomRuntime(room.workspace.id);
+    runtime.streamStatus = "connecting";
+    this.updateStatusBar();
+    this.scheduleExplorerLoadingDecorations();
     await this.refreshRoomSnapshot(room.workspace.id, reason);
+    if (!this.isRoomSyncActive(room.workspace.id)) {
+      return;
+    }
     await this.startRoomEventStream(room.workspace.id);
     this.scheduleSnapshotRefresh(room.workspace.id, "post-connect-binary-followup");
     this.scheduleBackgroundMarkdownRefresh(
@@ -17598,6 +17622,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   async disconnectRoom(workspaceId, showNotice = true) {
     const room = this.requireDownloadedRoom(workspaceId);
     this.stopRoomEventStream(room.workspace.id);
+    await this.cancelRoomBinaryTransfers(room.workspace.id, "disconnect");
     const activeFile = this.app.workspace.getActiveFile();
     if (activeFile && this.isLocalPathInDownloadedRoom(activeFile.path, room.workspace.id)) {
       await this.crdtManager.goOffline();
@@ -17914,6 +17939,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async refreshRoomSnapshot(workspaceId, reason = "manual") {
     const runtime = this.ensureRoomRuntime(workspaceId);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     if (runtime.snapshotRefreshInFlight) {
       runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
       return;
@@ -17938,23 +17966,35 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       runtime.snapshotRefreshInFlight = false;
       const queuedReason = runtime.snapshotRefreshQueuedReason;
       runtime.snapshotRefreshQueuedReason = null;
-      if (queuedReason) {
+      if (queuedReason && this.isRoomSyncActive(workspaceId)) {
         this.scheduleSnapshotRefresh(workspaceId, queuedReason);
       }
     }
   }
   async performRoomSnapshotRefresh(workspaceId, reason) {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     if (!this.hasUsableSessionTokens() && this.canAttemptAuth()) {
       await this.ensureAuthenticated(true);
+    }
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
     }
     const room = this.requireDownloadedRoom(workspaceId);
     const runtime = this.ensureRoomRuntime(room.workspace.id);
     const previousEntries = runtime.treeStore.getEntries();
     const snapshot = await this.apiClient.getWorkspaceTree(room.workspace.id);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     runtime.treeStore.applySnapshot(snapshot);
     this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
     this.confirmSnapshotPendingDeletes(room.workspace.id, snapshot.entries);
     await this.fileBridge.applySnapshot(snapshot, previousEntries);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     this.scheduleExplorerLoadingDecorations();
     this.setRoomSyncState(room.workspace.id, {
       lastCursor: snapshot.cursor,
@@ -17965,7 +18005,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
     );
     await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     await this.syncBinaryEntriesFromSnapshot(room.workspace.id, snapshot.entries, reason);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     this.scheduleBackgroundMarkdownRefresh(
       room.workspace.id,
       "post-snapshot-background-refresh",
@@ -17997,6 +18043,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.stopRoomEventStream(room.workspace.id);
     const generation = runtime.eventStreamGeneration + 1;
     runtime.eventStreamGeneration = generation;
+    runtime.streamStatus = "connecting";
+    this.updateStatusBar();
+    this.scheduleExplorerLoadingDecorations();
     const roomSync = getRoomSyncState(this.data.sync, room.workspace.id);
     const treeCursor = runtime.treeStore.getCursor();
     if (treeCursor === null && roomSync.lastCursor === null) {
@@ -18275,18 +18324,46 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       return;
     }
     try {
-      await this.ensureAuthenticated(true);
+      await this.ensureAuthenticated(true, !reason.includes("startup"));
       await this.resumeDownloadedRooms(reason);
     } catch (error) {
       this.handleError("Startup sync failed", error, false);
     }
   }
-  async ensureAuthenticated(silent = false) {
+  scheduleStartupBootstrap(reason) {
+    this.app.workspace.onLayoutReady(() => {
+      if (this.isUnloading || this.startupBootstrapHandle !== null) {
+        return;
+      }
+      this.recordLog(
+        "startup",
+        `Deferring ${reason} sync bootstrap until after the Obsidian workspace finishes opening.`
+      );
+      this.startupBootstrapHandle = window.setTimeout(() => {
+        this.startupBootstrapHandle = null;
+        if (this.isUnloading) {
+          return;
+        }
+        void this.bootstrapSync(`${reason}-deferred`);
+      }, _RolayPlugin.STARTUP_BOOTSTRAP_DELAY_MS);
+    });
+  }
+  clearDeferredStartupWork() {
+    if (this.startupBootstrapHandle !== null) {
+      window.clearTimeout(this.startupBootstrapHandle);
+      this.startupBootstrapHandle = null;
+    }
+    for (const handle of this.startupRoomResumeHandles) {
+      window.clearTimeout(handle);
+    }
+    this.startupRoomResumeHandles.clear();
+  }
+  async ensureAuthenticated(silent = false, resumeRoomsAfterLogin = true) {
     if (this.data.session?.refreshToken) {
       await this.refreshSession(!silent);
       return;
     }
-    await this.loginWithSettings(!silent);
+    await this.loginWithSettings(!silent, resumeRoomsAfterLogin);
   }
   canAttemptAuth() {
     const { serverUrl, username, password } = this.data.settings;
@@ -18446,6 +18523,29 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       this.recordLog("startup", `No downloaded rooms to resume (${reason}).`);
       return;
     }
+    if (reason.includes("startup")) {
+      this.recordLog(
+        "startup",
+        `Scheduling ${downloadedRooms.length} downloaded room(s) for staggered resume (${reason}).`
+      );
+      downloadedRooms.forEach((room, index) => {
+        const handle = window.setTimeout(() => {
+          this.startupRoomResumeHandles.delete(handle);
+          if (this.isUnloading) {
+            return;
+          }
+          const runtime = this.roomRuntime.get(room.workspaceId);
+          if (runtime && runtime.streamStatus !== "stopped") {
+            return;
+          }
+          void this.connectRoom(room.workspaceId, false, reason).catch((error) => {
+            this.handleError(`Startup room resume failed (${room.workspaceId})`, error, false);
+          });
+        }, index * _RolayPlugin.STARTUP_ROOM_CONNECT_STAGGER_MS);
+        this.startupRoomResumeHandles.add(handle);
+      });
+      return;
+    }
     for (const room of downloadedRooms) {
       await this.connectRoom(room.workspaceId, false, reason);
     }
@@ -18475,6 +18575,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   scheduleSnapshotRefresh(workspaceId, reason = "event-stream") {
     const runtime = this.ensureRoomRuntime(workspaceId);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     if (runtime.snapshotRefreshInFlight) {
       runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
       return;
@@ -18501,6 +18604,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   scheduleBackgroundMarkdownRefresh(workspaceId, reason, delayMs = _RolayPlugin.ROOM_MARKDOWN_REFRESH_INTERVAL_MS, replaceExisting = false) {
     const runtime = this.ensureRoomRuntime(workspaceId);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     if (runtime.backgroundMarkdownRefreshHandle !== null) {
       if (!replaceExisting) {
         return;
@@ -18993,10 +19099,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     const loadingPaths = this.getLoadingExplorerPaths();
     const uploadingPaths = this.getUploadingExplorerPaths();
     const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
+    const pathElements = [...container.querySelectorAll("[data-path]")];
+    const visibleExplorerPaths = this.getVisibleExplorerPathSet(pathElements);
     const transferBadges = this.getExplorerTransferBadges();
-    const notePresenceBadges = this.getExplorerNotePresenceBadges();
-    const anonymousPresenceBadges = this.getExplorerAnonymousPresenceBadges();
-    const pathElements = container.querySelectorAll("[data-path]");
+    const notePresenceBadges = this.getExplorerNotePresenceBadges(visibleExplorerPaths);
+    const anonymousPresenceBadges = this.getExplorerAnonymousPresenceBadges(visibleExplorerPaths);
     for (const element2 of pathElements) {
       element2.classList.remove(
         "rolay-loading-path",
@@ -19117,7 +19224,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     const container = view.containerEl;
     return container.querySelector(".inline-title") ?? container.querySelector(".view-content .inline-title");
   }
-  getExplorerNotePresenceBadges() {
+  getExplorerNotePresenceBadges(visibleExplorerPaths) {
     const aggregate = /* @__PURE__ */ new Map();
     const downloadedRooms = new Map(
       this.getDownloadedRooms().map((room) => [room.workspaceId, room])
@@ -19141,18 +19248,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
           continue;
         }
         const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
-        this.accumulateExplorerNotePresenceBadge(aggregate, normalizedLocalPath, viewers);
-        let parentPath = getParentPath2(normalizedLocalPath);
-        while (parentPath) {
-          if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
-            break;
-          }
-          this.accumulateExplorerNotePresenceBadge(aggregate, parentPath, viewers);
-          if (parentPath === roomRoot) {
-            break;
-          }
-          parentPath = getParentPath2(parentPath);
-        }
+        this.accumulateExplorerNotePresenceBadge(
+          aggregate,
+          this.getMinimalVisibleExplorerPresencePath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
+          viewers
+        );
       }
     }
     const badges = /* @__PURE__ */ new Map();
@@ -19164,7 +19264,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
     return badges;
   }
-  getExplorerAnonymousPresenceBadges() {
+  getExplorerAnonymousPresenceBadges(visibleExplorerPaths) {
     const aggregate = /* @__PURE__ */ new Map();
     const downloadedRooms = new Map(
       this.getDownloadedRooms().map((room) => [room.workspaceId, room])
@@ -19188,18 +19288,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
           continue;
         }
         const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
-        this.accumulateExplorerAnonymousPresenceBadge(aggregate, normalizedLocalPath, anonymousViewerCount);
-        let parentPath = getParentPath2(normalizedLocalPath);
-        while (parentPath) {
-          if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
-            break;
-          }
-          this.accumulateExplorerAnonymousPresenceBadge(aggregate, parentPath, anonymousViewerCount);
-          if (parentPath === roomRoot) {
-            break;
-          }
-          parentPath = getParentPath2(parentPath);
-        }
+        this.accumulateExplorerAnonymousPresenceBadge(
+          aggregate,
+          this.getMinimalVisibleExplorerPresencePath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
+          anonymousViewerCount
+        );
       }
     }
     return new Map(
@@ -19217,6 +19310,43 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   accumulateExplorerAnonymousPresenceBadge(aggregate, localPath, anonymousViewerCount) {
     aggregate.set(localPath, (aggregate.get(localPath) ?? 0) + anonymousViewerCount);
+  }
+  getVisibleExplorerPathSet(pathElements) {
+    const visiblePaths = /* @__PURE__ */ new Set();
+    for (const element2 of pathElements) {
+      const dataPath = element2.getAttribute("data-path");
+      if (!dataPath || !this.isExplorerDecorationElement(element2) || !this.isElementVisiblyRendered(element2)) {
+        continue;
+      }
+      visiblePaths.add((0, import_obsidian9.normalizePath)(dataPath));
+    }
+    return visiblePaths;
+  }
+  getMinimalVisibleExplorerPresencePath(localPath, roomRoot, visibleExplorerPaths) {
+    const normalizedRoomRoot = (0, import_obsidian9.normalizePath)(roomRoot);
+    let candidate = (0, import_obsidian9.normalizePath)(localPath);
+    while (candidate) {
+      if ((candidate === normalizedRoomRoot || candidate.startsWith(`${normalizedRoomRoot}/`)) && visibleExplorerPaths.has(candidate)) {
+        return candidate;
+      }
+      if (candidate === normalizedRoomRoot) {
+        break;
+      }
+      const parentPath = getParentPath2(candidate);
+      if (!parentPath || parentPath === candidate) {
+        break;
+      }
+      candidate = parentPath;
+    }
+    return visibleExplorerPaths.has(normalizedRoomRoot) ? normalizedRoomRoot : (0, import_obsidian9.normalizePath)(localPath);
+  }
+  isExplorerDecorationElement(element2) {
+    return Boolean(
+      element2.closest(".nav-files-container") || element2.closest('.workspace-leaf-content[data-type="file-explorer"]') || element2.classList.contains("nav-file") || element2.classList.contains("nav-folder") || element2.classList.contains("nav-file-title") || element2.classList.contains("nav-folder-title") || element2.classList.contains("tree-item-self")
+    );
+  }
+  isElementVisiblyRendered(element2) {
+    return element2.getClientRects().length > 0;
   }
   updateExplorerNotePresenceBadge(element2, badgeState) {
     const titleHost = this.findExplorerTitleHost(element2);
@@ -19882,6 +20012,27 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
     this.clearBinaryTransferState(normalizedLocalPath);
   }
+  async cancelRoomBinaryTransfers(workspaceId, reason) {
+    for (const localPath of [...this.binarySyncTokens.keys()]) {
+      const room = this.resolveDownloadedRoomByLocalPath(localPath);
+      if (room?.workspaceId !== workspaceId) {
+        continue;
+      }
+      this.invalidateBinarySyncToken(localPath);
+      this.pendingBinarySyncReruns.delete((0, import_obsidian9.normalizePath)(localPath));
+    }
+    const transfers = this.getBinaryTransfersForWorkspace(workspaceId);
+    if (transfers.length === 0) {
+      return;
+    }
+    this.recordLog(
+      "blob",
+      `[${workspaceId}] Canceling ${transfers.length} active binary transfer(s) because room sync was disconnected.`
+    );
+    await Promise.all(
+      transfers.map((transfer) => this.cancelBinaryTransferForLocalPath(transfer.localPath, reason))
+    );
+  }
   findDownloadingBinaryPathAtOrBelow(localPath) {
     const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
     for (const transfer of this.binaryTransferState.values()) {
@@ -20247,6 +20398,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       return false;
     }
     return toServerPathForRoom(localPath, this.data.settings.syncRoot, folderName) !== null;
+  }
+  isRoomSyncActive(workspaceId) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    return Boolean(
+      !this.isUnloading && runtime && runtime.streamStatus !== "stopped" && this.getStoredRoomBinding(workspaceId)?.downloaded
+    );
   }
   isFolderNameUsedByAnotherRoom(workspaceId, folderName) {
     for (const room of this.roomList) {
@@ -21078,7 +21235,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     );
   }
   async fetchMarkdownTargetsFromBootstrap(workspaceId, targets, reason, updateLocks) {
-    if (targets.length === 0) {
+    if (targets.length === 0 || !this.isRoomSyncActive(workspaceId)) {
       return;
     }
     const targetsByEntryId = new Map(
@@ -21088,6 +21245,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       entryIds: [...targetsByEntryId.keys()],
       includeState: false
     });
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     if (metadataResponse.encoding !== "base64") {
       throw new Error(`Unsupported markdown bootstrap encoding: ${metadataResponse.encoding}`);
     }
@@ -21106,6 +21266,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         entryIds: batch.map((entry) => entry.id),
         includeState: true
       });
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
       if (response.encoding !== "base64") {
         throw new Error(`Unsupported markdown bootstrap encoding: ${response.encoding}`);
       }
@@ -21116,6 +21279,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         response.documents.map((document2) => [document2.entryId, document2])
       );
       for (const entry of batch) {
+        if (!this.isRoomSyncActive(workspaceId)) {
+          return;
+        }
         const target = targetsByEntryId.get(entry.id);
         const document2 = responseByEntryId.get(entry.id);
         if (!target || !document2?.state) {
@@ -21551,6 +21717,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     });
   }
   async queueCreateFolder(workspaceId, path) {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      this.recordLog("ops", `[${workspaceId}] Ignored local folder create ${path} because the room is disconnected.`);
+      return;
+    }
     this.registerPendingLocalCreate(workspaceId, path);
     let confirmedServerCreate = false;
     try {
@@ -21578,6 +21748,15 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     await this.syncMarkdownCreate(workspaceId, path, localPath, localContent, 0);
   }
   async syncMarkdownCreate(workspaceId, path, localPath, localContent = "", conflictDepth = 0) {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      await this.rememberPendingMarkdownCreate(
+        workspaceId,
+        localPath,
+        path,
+        new Error("Room is disconnected; markdown create will retry after reconnect.")
+      );
+      return;
+    }
     this.registerPendingLocalCreate(workspaceId, path);
     let confirmedServerCreate = false;
     try {
@@ -21825,6 +22004,16 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async queueBinaryWrite(workspaceId, serverPath, localContent, existingEntry) {
     const localPath = (0, import_obsidian9.normalizePath)(this.fileBridge.toLocalPath(workspaceId, serverPath) ?? serverPath);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      this.rememberPendingBinaryWrite(
+        workspaceId,
+        localPath,
+        serverPath,
+        existingEntry?.id ?? null,
+        new Error("Room is disconnected; binary write will retry after reconnect.")
+      );
+      return;
+    }
     if (this.binarySyncTokens.has(localPath)) {
       this.pendingBinarySyncReruns.add(localPath);
       this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
@@ -21861,6 +22050,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     let finalEntryId = initialEntryId;
     let createdPlaceholderEntry = null;
     try {
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
       const currentLocalPath = this.getBinarySyncPathForToken(token);
       if (!currentLocalPath) {
         return;
@@ -21900,6 +22092,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
             },
             `local binary placeholder ${currentServerPath}`
           );
+          if (!this.isRoomSyncActive(workspaceId)) {
+            return;
+          }
           const appliedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
           if (appliedEntry) {
             this.optimisticUpsertRoomEntry(workspaceId, appliedEntry);
@@ -21929,6 +22124,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         }
         if (!entry) {
           await this.refreshRoomSnapshot(workspaceId, "binary-placeholder-create");
+          if (!this.isRoomSyncActive(workspaceId)) {
+            return;
+          }
           entry = this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
           if (entry && entry.kind === "binary") {
             createdPlaceholderEntry = entry;
@@ -21992,6 +22190,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         sizeBytes,
         mimeType
       });
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
       this.traceBlob(
         `[${workspaceId}] upload-ticket response entryId=${entry.id} localPath=${desiredLocalPath} serverPath=${desiredServerPath} status=${ticket._meta.status} requestId=${ticket._meta.requestId ?? "-"} alreadyExists=${ticket.alreadyExists} uploadId=${ticket.uploadId} uploadedBytes=${ticket.uploadedBytes} sizeBytes=${ticket.sizeBytes} hash=${ticket.hash}`
       );
@@ -22059,6 +22260,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
               abortController.signal,
               currentOffset === 0 && nextChunkEnd === totalUploadBytes ? ticket.upload : void 0
             );
+            if (!this.isRoomSyncActive(workspaceId)) {
+              return;
+            }
           } catch (error) {
             const expectedOffset = extractBlobOffsetMismatchExpectedOffset(error, totalUploadBytes);
             if (expectedOffset !== null) {
@@ -22145,6 +22349,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       this.traceBlob(
         `[${workspaceId}] commit_blob_revision request entryId=${entry.id} localPath=${desiredLocalPath} hash=${commitHash} sizeBytes=${totalUploadBytes} entryVersion=${entry.entryVersion} path=${entry.path}`
       );
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
       const commitResponse = await this.operationsQueue.enqueue(
         workspaceId,
         {
@@ -22160,6 +22367,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         },
         `commit blob revision ${desiredServerPath}`
       );
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
       const committedEntry = commitResponse.results.find((result) => result.status === "applied")?.entry ?? null;
       if (committedEntry) {
         this.optimisticUpsertRoomEntry(workspaceId, committedEntry);
@@ -22328,6 +22538,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
   }
   async syncBinaryEntriesFromSnapshot(workspaceId, entries, reason) {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     for (const entry of entries) {
       if (entry.kind === "binary" && entry.deleted) {
         this.clearPersistedBinaryCacheEntry(entry.id);
@@ -22343,6 +22556,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       { length: Math.min(_RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY, queue.length) },
       async () => {
         while (queue.length > 0) {
+          if (!this.isRoomSyncActive(workspaceId)) {
+            return;
+          }
           const entry = queue.shift();
           if (!entry) {
             return;
@@ -22365,6 +22581,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
   }
   async ensureBinaryEntryDownloaded(workspaceId, entry, reason) {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     if (entry.deleted || entry.kind !== "binary" || !entry.blob) {
       return;
     }
@@ -22418,6 +22637,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         `[${workspaceId}] download-ticket request entryId=${entry.id} localPath=${localPath} serverPath=${entry.path} expectedHash=${remoteHash} expectedSizeBytes=${remoteSize}`
       );
       const ticket = await this.apiClient.createBlobDownloadTicket(entry.id);
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
       this.traceBlob(
         `[${workspaceId}] download-ticket response entryId=${entry.id} localPath=${localPath} serverPath=${entry.path} status=${ticket._meta.status} requestId=${ticket._meta.requestId ?? "-"} hash=${ticket.hash} sizeBytes=${ticket.sizeBytes} contentUrl=${ticket.contentUrl ?? "-"} rangeSupported=${ticket.rangeSupported === true}`
       );
@@ -22505,6 +22727,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
           },
           transfer.abortController?.signal
         );
+        if (!this.isRoomSyncActive(workspaceId)) {
+          return;
+        }
         this.traceBlob(
           `[${workspaceId}] blob content response entryId=${entry.id} localPath=${localPath} transport=${download.transport} status=${download.status} requestId=${download.requestId ?? "-"} contentLength=${download.contentLength ?? -1} contentRange=${download.contentRange ?? "-"} acceptRanges=${download.acceptRanges ?? "-"} blobHash=${download.hash ?? "-"}`
         );
@@ -22551,7 +22776,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       if (this.isUnloading) {
         return;
       }
-      this.updateBinaryTransferState(localPath, {
+      this.maybeUpdateBinaryTransferState(localPath, {
         status: "failed",
         lastError: error instanceof Error ? error.message : String(error),
         abortController: null
@@ -22559,6 +22784,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
   }
   async applyDownloadedBinary(workspaceId, entry, localPath, partPath, downloadMeta, reason) {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     const downloadData = await this.readBinaryTransferPart(partPath);
     if (!downloadData) {
       throw new Error(`Downloaded binary part for ${entry.path} is missing.`);
@@ -22573,6 +22801,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       );
     }
     const computedHash = await sha256Hash(downloadData);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
     this.traceBlob(
       `[${workspaceId}] download finalize entryId=${entry.id} localPath=${localPath} partPath=${partPath} computedHash=${computedHash} expectedHash=${effectiveHash ?? "-"} sizeBytes=${downloadData.byteLength}`
     );
@@ -22675,6 +22906,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     throw new Error(`No free conflict-safe binary path is available for ${desiredServerPath}.`);
   }
   async queueRenameOrMove(workspaceId, entry, newPath, type) {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      this.recordLog(
+        "ops",
+        `[${workspaceId}] Ignored local ${type} ${entry.path} -> ${newPath} because the room is disconnected.`
+      );
+      return;
+    }
     this.optimisticUpsertRoomEntry(workspaceId, {
       ...entry,
       path: newPath
@@ -22704,6 +22942,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
   }
   async queueDeleteEntry(workspaceId, entry) {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      this.recordLog("ops", `[${workspaceId}] Ignored local delete ${entry.path} because the room is disconnected.`);
+      return;
+    }
     this.registerPendingLocalDelete(workspaceId, entry.path);
     this.optimisticDeleteRoomEntry(workspaceId, entry.id);
     try {
@@ -22818,6 +23060,8 @@ _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = 8;
 _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = 512 * 1024;
 _RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY = 2;
 _RolayPlugin.PENDING_DELETE_GUARD_MS = 6e4;
+_RolayPlugin.STARTUP_BOOTSTRAP_DELAY_MS = 1500;
+_RolayPlugin.STARTUP_ROOM_CONNECT_STAGGER_MS = 900;
 var RolayPlugin = _RolayPlugin;
 function normalizeSettingsEventEnvelope(event) {
   const rawData = isRecord2(event.data) ? event.data : {};

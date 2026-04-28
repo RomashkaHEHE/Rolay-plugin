@@ -223,6 +223,8 @@ export default class RolayPlugin extends Plugin {
   private static readonly MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = 512 * 1024;
   private static readonly BINARY_DOWNLOAD_CONCURRENCY = 2;
   private static readonly PENDING_DELETE_GUARD_MS = 60_000;
+  private static readonly STARTUP_BOOTSTRAP_DELAY_MS = 1_500;
+  private static readonly STARTUP_ROOM_CONNECT_STAGGER_MS = 900;
   private data!: RolayPluginData;
   private apiClient!: RolayApiClient;
   private crdtManager!: CrdtSessionManager;
@@ -258,6 +260,8 @@ export default class RolayPlugin extends Plugin {
   private settingsEventCursor: number | null = null;
   private settingsEventStreamStatus: WorkspaceEventStreamStatus = "stopped";
   private settingsStreamRecoveryInFlight = false;
+  private startupBootstrapHandle: number | null = null;
+  private readonly startupRoomResumeHandles = new Set<number>();
   private profileDraftDisplayName = "";
   private passwordChangeDraft: PasswordChangeDraft = {
     currentPassword: "",
@@ -341,6 +345,7 @@ export default class RolayPlugin extends Plugin {
       getFolderName: (workspaceId) => this.getDownloadedFolderName(workspaceId),
       getDownloadedRooms: () => this.getDownloadedRooms(),
       getEntryByPath: (workspaceId, path) => this.getRoomStore(workspaceId)?.getEntryByPath(path) ?? null,
+      isWorkspaceSyncActive: (workspaceId) => this.isRoomSyncActive(workspaceId),
       hasPendingCreate: (workspaceId, path) => this.hasPendingLocalCreate(workspaceId, path),
       hasPendingDelete: (workspaceId, path) => this.hasPendingLocalDelete(workspaceId, path),
       hasPendingBinaryWrite: (localPath) => normalizePath(localPath) in this.data.pendingBinaryWrites,
@@ -423,6 +428,8 @@ export default class RolayPlugin extends Plugin {
         window.clearTimeout(this.logFlushHandle);
       }
 
+      this.clearDeferredStartupWork();
+
       for (const runtime of this.roomRuntime.values()) {
         if (runtime.snapshotRefreshHandle !== null) {
           window.clearTimeout(runtime.snapshotRefreshHandle);
@@ -450,11 +457,12 @@ export default class RolayPlugin extends Plugin {
 
     this.recordLog("plugin", "Rolay plugin loaded.");
 
-    await this.bootstrapSync("startup");
+    this.scheduleStartupBootstrap("startup");
   }
 
   override async onunload(): Promise<void> {
     this.isUnloading = true;
+    this.clearDeferredStartupWork();
     this.stopSettingsEventStream();
     this.stopAllRoomEventStreams();
     await this.crdtManager.disconnect();
@@ -746,7 +754,7 @@ export default class RolayPlugin extends Plugin {
     });
   }
 
-  async loginWithSettings(showNotice = true): Promise<void> {
+  async loginWithSettings(showNotice = true, resumeRooms = true): Promise<void> {
     const { username, password } = this.data.settings;
 
     if (!username || !password) {
@@ -762,7 +770,9 @@ export default class RolayPlugin extends Plugin {
 
       await this.applySessionUser(response.user);
       await this.refreshPostAuthState();
-      await this.resumeDownloadedRooms("login");
+      if (resumeRooms) {
+        await this.resumeDownloadedRooms("login");
+      }
       this.recordLog("auth", `Logged in as ${response.user.username}.`);
       if (showNotice) {
         new Notice(`Rolay login successful for ${response.user.username}.`);
@@ -1031,7 +1041,15 @@ export default class RolayPlugin extends Plugin {
     reason = "manual-connect"
   ): Promise<void> {
     const room = this.requireDownloadedRoom(workspaceId);
+    const runtime = this.ensureRoomRuntime(room.workspace.id);
+    runtime.streamStatus = "connecting";
+    this.updateStatusBar();
+    this.scheduleExplorerLoadingDecorations();
     await this.refreshRoomSnapshot(room.workspace.id, reason);
+    if (!this.isRoomSyncActive(room.workspace.id)) {
+      return;
+    }
+
     await this.startRoomEventStream(room.workspace.id);
     this.scheduleSnapshotRefresh(room.workspace.id, "post-connect-binary-followup");
     this.scheduleBackgroundMarkdownRefresh(
@@ -1054,6 +1072,7 @@ export default class RolayPlugin extends Plugin {
   async disconnectRoom(workspaceId: string, showNotice = true): Promise<void> {
     const room = this.requireDownloadedRoom(workspaceId);
     this.stopRoomEventStream(room.workspace.id);
+    await this.cancelRoomBinaryTransfers(room.workspace.id, "disconnect");
 
     const activeFile = this.app.workspace.getActiveFile();
     if (activeFile && this.isLocalPathInDownloadedRoom(activeFile.path, room.workspace.id)) {
@@ -1432,6 +1451,10 @@ export default class RolayPlugin extends Plugin {
 
   async refreshRoomSnapshot(workspaceId: string, reason = "manual"): Promise<void> {
     const runtime = this.ensureRoomRuntime(workspaceId);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     if (runtime.snapshotRefreshInFlight) {
       runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
       return;
@@ -1458,25 +1481,40 @@ export default class RolayPlugin extends Plugin {
       runtime.snapshotRefreshInFlight = false;
       const queuedReason = runtime.snapshotRefreshQueuedReason;
       runtime.snapshotRefreshQueuedReason = null;
-      if (queuedReason) {
+      if (queuedReason && this.isRoomSyncActive(workspaceId)) {
         this.scheduleSnapshotRefresh(workspaceId, queuedReason);
       }
     }
   }
 
   private async performRoomSnapshotRefresh(workspaceId: string, reason: string): Promise<void> {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     if (!this.hasUsableSessionTokens() && this.canAttemptAuth()) {
       await this.ensureAuthenticated(true);
+    }
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
     }
 
     const room = this.requireDownloadedRoom(workspaceId);
     const runtime = this.ensureRoomRuntime(room.workspace.id);
     const previousEntries = runtime.treeStore.getEntries();
     const snapshot = await this.apiClient.getWorkspaceTree(room.workspace.id);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     runtime.treeStore.applySnapshot(snapshot);
     this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
     this.confirmSnapshotPendingDeletes(room.workspace.id, snapshot.entries);
     await this.fileBridge.applySnapshot(snapshot, previousEntries);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     this.scheduleExplorerLoadingDecorations();
     this.setRoomSyncState(room.workspace.id, {
       lastCursor: snapshot.cursor,
@@ -1487,7 +1525,15 @@ export default class RolayPlugin extends Plugin {
       `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
     );
     await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     await this.syncBinaryEntriesFromSnapshot(room.workspace.id, snapshot.entries, reason);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     this.scheduleBackgroundMarkdownRefresh(
       room.workspace.id,
       "post-snapshot-background-refresh",
@@ -1527,6 +1573,9 @@ export default class RolayPlugin extends Plugin {
     this.stopRoomEventStream(room.workspace.id);
     const generation = runtime.eventStreamGeneration + 1;
     runtime.eventStreamGeneration = generation;
+    runtime.streamStatus = "connecting";
+    this.updateStatusBar();
+    this.scheduleExplorerLoadingDecorations();
 
     const roomSync = getRoomSyncState(this.data.sync, room.workspace.id);
     const treeCursor = runtime.treeStore.getCursor();
@@ -1840,20 +1889,53 @@ export default class RolayPlugin extends Plugin {
     }
 
     try {
-      await this.ensureAuthenticated(true);
+      await this.ensureAuthenticated(true, !reason.includes("startup"));
       await this.resumeDownloadedRooms(reason);
     } catch (error) {
       this.handleError("Startup sync failed", error, false);
     }
   }
 
-  private async ensureAuthenticated(silent = false): Promise<void> {
+  private scheduleStartupBootstrap(reason: string): void {
+    this.app.workspace.onLayoutReady(() => {
+      if (this.isUnloading || this.startupBootstrapHandle !== null) {
+        return;
+      }
+
+      this.recordLog(
+        "startup",
+        `Deferring ${reason} sync bootstrap until after the Obsidian workspace finishes opening.`
+      );
+      this.startupBootstrapHandle = window.setTimeout(() => {
+        this.startupBootstrapHandle = null;
+        if (this.isUnloading) {
+          return;
+        }
+
+        void this.bootstrapSync(`${reason}-deferred`);
+      }, RolayPlugin.STARTUP_BOOTSTRAP_DELAY_MS);
+    });
+  }
+
+  private clearDeferredStartupWork(): void {
+    if (this.startupBootstrapHandle !== null) {
+      window.clearTimeout(this.startupBootstrapHandle);
+      this.startupBootstrapHandle = null;
+    }
+
+    for (const handle of this.startupRoomResumeHandles) {
+      window.clearTimeout(handle);
+    }
+    this.startupRoomResumeHandles.clear();
+  }
+
+  private async ensureAuthenticated(silent = false, resumeRoomsAfterLogin = true): Promise<void> {
     if (this.data.session?.refreshToken) {
       await this.refreshSession(!silent);
       return;
     }
 
-    await this.loginWithSettings(!silent);
+    await this.loginWithSettings(!silent, resumeRoomsAfterLogin);
   }
 
   private canAttemptAuth(): boolean {
@@ -2037,6 +2119,32 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
+    if (reason.includes("startup")) {
+      this.recordLog(
+        "startup",
+        `Scheduling ${downloadedRooms.length} downloaded room(s) for staggered resume (${reason}).`
+      );
+      downloadedRooms.forEach((room, index) => {
+        const handle = window.setTimeout(() => {
+          this.startupRoomResumeHandles.delete(handle);
+          if (this.isUnloading) {
+            return;
+          }
+
+          const runtime = this.roomRuntime.get(room.workspaceId);
+          if (runtime && runtime.streamStatus !== "stopped") {
+            return;
+          }
+
+          void this.connectRoom(room.workspaceId, false, reason).catch((error) => {
+            this.handleError(`Startup room resume failed (${room.workspaceId})`, error, false);
+          });
+        }, index * RolayPlugin.STARTUP_ROOM_CONNECT_STAGGER_MS);
+        this.startupRoomResumeHandles.add(handle);
+      });
+      return;
+    }
+
     for (const room of downloadedRooms) {
       await this.connectRoom(room.workspaceId, false, reason);
     }
@@ -2074,6 +2182,10 @@ export default class RolayPlugin extends Plugin {
 
   private scheduleSnapshotRefresh(workspaceId: string, reason = "event-stream"): void {
     const runtime = this.ensureRoomRuntime(workspaceId);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     if (runtime.snapshotRefreshInFlight) {
       runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
       return;
@@ -2111,6 +2223,10 @@ export default class RolayPlugin extends Plugin {
     replaceExisting = false
   ): void {
     const runtime = this.ensureRoomRuntime(workspaceId);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     if (runtime.backgroundMarkdownRefreshHandle !== null) {
       if (!replaceExisting) {
         return;
@@ -2736,11 +2852,12 @@ export default class RolayPlugin extends Plugin {
     const loadingPaths = this.getLoadingExplorerPaths();
     const uploadingPaths = this.getUploadingExplorerPaths();
     const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
+    const pathElements = [...container.querySelectorAll<HTMLElement>("[data-path]")];
+    const visibleExplorerPaths = this.getVisibleExplorerPathSet(pathElements);
     const transferBadges = this.getExplorerTransferBadges();
-    const notePresenceBadges = this.getExplorerNotePresenceBadges();
-    const anonymousPresenceBadges = this.getExplorerAnonymousPresenceBadges();
+    const notePresenceBadges = this.getExplorerNotePresenceBadges(visibleExplorerPaths);
+    const anonymousPresenceBadges = this.getExplorerAnonymousPresenceBadges(visibleExplorerPaths);
 
-    const pathElements = container.querySelectorAll<HTMLElement>("[data-path]");
     for (const element of pathElements) {
       element.classList.remove(
         "rolay-loading-path",
@@ -2889,7 +3006,9 @@ export default class RolayPlugin extends Plugin {
     );
   }
 
-  private getExplorerNotePresenceBadges(): Map<string, ExplorerNotePresenceBadgeState> {
+  private getExplorerNotePresenceBadges(
+    visibleExplorerPaths: Set<string>
+  ): Map<string, ExplorerNotePresenceBadgeState> {
     const aggregate = new Map<string, { count: number; soleColor: string | null }>();
     const downloadedRooms = new Map(
       this.getDownloadedRooms().map((room) => [room.workspaceId, room] as const)
@@ -2918,25 +3037,11 @@ export default class RolayPlugin extends Plugin {
         }
 
         const normalizedLocalPath = normalizePath(localPath);
-        this.accumulateExplorerNotePresenceBadge(aggregate, normalizedLocalPath, viewers);
-
-        let parentPath = getParentPath(normalizedLocalPath);
-        while (parentPath) {
-          // Presence rolls up through room-local ancestor folders so explorer
-          // folders show "how many people are somewhere inside here", but it
-          // must stop at the downloaded room root and never leak into unrelated
-          // vault paths above that root.
-          if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
-            break;
-          }
-
-          this.accumulateExplorerNotePresenceBadge(aggregate, parentPath, viewers);
-          if (parentPath === roomRoot) {
-            break;
-          }
-
-          parentPath = getParentPath(parentPath);
-        }
+        this.accumulateExplorerNotePresenceBadge(
+          aggregate,
+          this.getMinimalVisibleExplorerPresencePath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
+          viewers
+        );
       }
     }
 
@@ -2953,7 +3058,9 @@ export default class RolayPlugin extends Plugin {
     return badges;
   }
 
-  private getExplorerAnonymousPresenceBadges(): Map<string, ExplorerAnonymousPresenceBadgeState> {
+  private getExplorerAnonymousPresenceBadges(
+    visibleExplorerPaths: Set<string>
+  ): Map<string, ExplorerAnonymousPresenceBadgeState> {
     const aggregate = new Map<string, number>();
     const downloadedRooms = new Map(
       this.getDownloadedRooms().map((room) => [room.workspaceId, room] as const)
@@ -2982,21 +3089,11 @@ export default class RolayPlugin extends Plugin {
         }
 
         const normalizedLocalPath = normalizePath(localPath);
-        this.accumulateExplorerAnonymousPresenceBadge(aggregate, normalizedLocalPath, anonymousViewerCount);
-
-        let parentPath = getParentPath(normalizedLocalPath);
-        while (parentPath) {
-          if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
-            break;
-          }
-
-          this.accumulateExplorerAnonymousPresenceBadge(aggregate, parentPath, anonymousViewerCount);
-          if (parentPath === roomRoot) {
-            break;
-          }
-
-          parentPath = getParentPath(parentPath);
-        }
+        this.accumulateExplorerAnonymousPresenceBadge(
+          aggregate,
+          this.getMinimalVisibleExplorerPresencePath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
+          anonymousViewerCount
+        );
       }
     }
 
@@ -3029,6 +3126,67 @@ export default class RolayPlugin extends Plugin {
     anonymousViewerCount: number
   ): void {
     aggregate.set(localPath, (aggregate.get(localPath) ?? 0) + anonymousViewerCount);
+  }
+
+  private getVisibleExplorerPathSet(pathElements: HTMLElement[]): Set<string> {
+    const visiblePaths = new Set<string>();
+    for (const element of pathElements) {
+      const dataPath = element.getAttribute("data-path");
+      if (!dataPath || !this.isExplorerDecorationElement(element) || !this.isElementVisiblyRendered(element)) {
+        continue;
+      }
+
+      visiblePaths.add(normalizePath(dataPath));
+    }
+
+    return visiblePaths;
+  }
+
+  private getMinimalVisibleExplorerPresencePath(
+    localPath: string,
+    roomRoot: string,
+    visibleExplorerPaths: Set<string>
+  ): string {
+    const normalizedRoomRoot = normalizePath(roomRoot);
+    let candidate = normalizePath(localPath);
+
+    while (candidate) {
+      if (
+        (candidate === normalizedRoomRoot || candidate.startsWith(`${normalizedRoomRoot}/`)) &&
+        visibleExplorerPaths.has(candidate)
+      ) {
+        return candidate;
+      }
+
+      if (candidate === normalizedRoomRoot) {
+        break;
+      }
+
+      const parentPath = getParentPath(candidate);
+      if (!parentPath || parentPath === candidate) {
+        break;
+      }
+
+      candidate = parentPath;
+    }
+
+    return visibleExplorerPaths.has(normalizedRoomRoot) ? normalizedRoomRoot : normalizePath(localPath);
+  }
+
+  private isExplorerDecorationElement(element: HTMLElement): boolean {
+    return Boolean(
+      element.closest(".nav-files-container") ||
+      element.closest('.workspace-leaf-content[data-type="file-explorer"]') ||
+      element.classList.contains("nav-file") ||
+      element.classList.contains("nav-folder") ||
+      element.classList.contains("nav-file-title") ||
+      element.classList.contains("nav-folder-title") ||
+      element.classList.contains("tree-item-self")
+    );
+  }
+
+  private isElementVisiblyRendered(element: HTMLElement): boolean {
+    return element.getClientRects().length > 0;
   }
 
   private updateExplorerNotePresenceBadge(
@@ -3889,6 +4047,31 @@ export default class RolayPlugin extends Plugin {
     this.clearBinaryTransferState(normalizedLocalPath);
   }
 
+  private async cancelRoomBinaryTransfers(workspaceId: string, reason: string): Promise<void> {
+    for (const localPath of [...this.binarySyncTokens.keys()]) {
+      const room = this.resolveDownloadedRoomByLocalPath(localPath);
+      if (room?.workspaceId !== workspaceId) {
+        continue;
+      }
+
+      this.invalidateBinarySyncToken(localPath);
+      this.pendingBinarySyncReruns.delete(normalizePath(localPath));
+    }
+
+    const transfers = this.getBinaryTransfersForWorkspace(workspaceId);
+    if (transfers.length === 0) {
+      return;
+    }
+
+    this.recordLog(
+      "blob",
+      `[${workspaceId}] Canceling ${transfers.length} active binary transfer(s) because room sync was disconnected.`
+    );
+    await Promise.all(
+      transfers.map((transfer) => this.cancelBinaryTransferForLocalPath(transfer.localPath, reason))
+    );
+  }
+
   private findDownloadingBinaryPathAtOrBelow(localPath: string): { workspaceId: string; localPath: string } | null {
     const normalizedLocalPath = normalizePath(localPath);
     for (const transfer of this.binaryTransferState.values()) {
@@ -4344,6 +4527,16 @@ export default class RolayPlugin extends Plugin {
     }
 
     return toServerPathForRoom(localPath, this.data.settings.syncRoot, folderName) !== null;
+  }
+
+  private isRoomSyncActive(workspaceId: string): boolean {
+    const runtime = this.roomRuntime.get(workspaceId);
+    return Boolean(
+      !this.isUnloading &&
+      runtime &&
+      runtime.streamStatus !== "stopped" &&
+      this.getStoredRoomBinding(workspaceId)?.downloaded
+    );
   }
 
   private isFolderNameUsedByAnotherRoom(workspaceId: string, folderName: string): boolean {
@@ -5424,7 +5617,7 @@ export default class RolayPlugin extends Plugin {
     reason: string,
     updateLocks: boolean
   ): Promise<void> {
-    if (targets.length === 0) {
+    if (targets.length === 0 || !this.isRoomSyncActive(workspaceId)) {
       return;
     }
 
@@ -5435,6 +5628,9 @@ export default class RolayPlugin extends Plugin {
       entryIds: [...targetsByEntryId.keys()],
       includeState: false
     });
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
 
     if (metadataResponse.encoding !== "base64") {
       throw new Error(`Unsupported markdown bootstrap encoding: ${metadataResponse.encoding}`);
@@ -5459,6 +5655,9 @@ export default class RolayPlugin extends Plugin {
         entryIds: batch.map((entry) => entry.id),
         includeState: true
       });
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
 
       if (response.encoding !== "base64") {
         throw new Error(`Unsupported markdown bootstrap encoding: ${response.encoding}`);
@@ -5473,6 +5672,10 @@ export default class RolayPlugin extends Plugin {
       );
 
       for (const entry of batch) {
+        if (!this.isRoomSyncActive(workspaceId)) {
+          return;
+        }
+
         const target = targetsByEntryId.get(entry.id);
         const document = responseByEntryId.get(entry.id);
         if (!target || !document?.state) {
@@ -6031,6 +6234,11 @@ export default class RolayPlugin extends Plugin {
   }
 
   private async queueCreateFolder(workspaceId: string, path: string): Promise<void> {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      this.recordLog("ops", `[${workspaceId}] Ignored local folder create ${path} because the room is disconnected.`);
+      return;
+    }
+
     this.registerPendingLocalCreate(workspaceId, path);
     let confirmedServerCreate = false;
     try {
@@ -6071,6 +6279,16 @@ export default class RolayPlugin extends Plugin {
     localContent = "",
     conflictDepth = 0
   ): Promise<void> {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      await this.rememberPendingMarkdownCreate(
+        workspaceId,
+        localPath,
+        path,
+        new Error("Room is disconnected; markdown create will retry after reconnect.")
+      );
+      return;
+    }
+
     this.registerPendingLocalCreate(workspaceId, path);
     let confirmedServerCreate = false;
     try {
@@ -6374,6 +6592,17 @@ export default class RolayPlugin extends Plugin {
     existingEntry: FileEntry | null
   ): Promise<void> {
     const localPath = normalizePath(this.fileBridge.toLocalPath(workspaceId, serverPath) ?? serverPath);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      this.rememberPendingBinaryWrite(
+        workspaceId,
+        localPath,
+        serverPath,
+        existingEntry?.id ?? null,
+        new Error("Room is disconnected; binary write will retry after reconnect.")
+      );
+      return;
+    }
+
     if (this.binarySyncTokens.has(localPath)) {
       this.pendingBinarySyncReruns.add(localPath);
       this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
@@ -6427,6 +6656,10 @@ export default class RolayPlugin extends Plugin {
     let createdPlaceholderEntry: FileEntry | null = null;
 
     try {
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
+
       const currentLocalPath = this.getBinarySyncPathForToken(token);
       if (!currentLocalPath) {
         return;
@@ -6480,6 +6713,10 @@ export default class RolayPlugin extends Plugin {
             },
             `local binary placeholder ${currentServerPath}`
           );
+          if (!this.isRoomSyncActive(workspaceId)) {
+            return;
+          }
+
           const appliedEntry = response.results.find((result) => result.status === "applied")?.entry ?? null;
           if (appliedEntry) {
             this.optimisticUpsertRoomEntry(workspaceId, appliedEntry);
@@ -6515,6 +6752,10 @@ export default class RolayPlugin extends Plugin {
 
         if (!entry) {
           await this.refreshRoomSnapshot(workspaceId, "binary-placeholder-create");
+          if (!this.isRoomSyncActive(workspaceId)) {
+            return;
+          }
+
           entry = this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
           if (entry && entry.kind === "binary") {
             createdPlaceholderEntry = entry;
@@ -6591,6 +6832,10 @@ export default class RolayPlugin extends Plugin {
         sizeBytes,
         mimeType
       });
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
+
       this.traceBlob(
         `[${workspaceId}] upload-ticket response entryId=${entry.id} localPath=${desiredLocalPath} serverPath=${desiredServerPath} ` +
         `status=${ticket._meta.status} requestId=${ticket._meta.requestId ?? "-"} alreadyExists=${ticket.alreadyExists} ` +
@@ -6671,6 +6916,9 @@ export default class RolayPlugin extends Plugin {
               abortController.signal,
               currentOffset === 0 && nextChunkEnd === totalUploadBytes ? ticket.upload : undefined
             );
+            if (!this.isRoomSyncActive(workspaceId)) {
+              return;
+            }
           } catch (error) {
             const expectedOffset = extractBlobOffsetMismatchExpectedOffset(error, totalUploadBytes);
             if (expectedOffset !== null) {
@@ -6773,6 +7021,10 @@ export default class RolayPlugin extends Plugin {
         `[${workspaceId}] commit_blob_revision request entryId=${entry.id} localPath=${desiredLocalPath} hash=${commitHash} ` +
         `sizeBytes=${totalUploadBytes} entryVersion=${entry.entryVersion} path=${entry.path}`
       );
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
+
       const commitResponse = await this.operationsQueue.enqueue(
         workspaceId,
         {
@@ -6788,6 +7040,9 @@ export default class RolayPlugin extends Plugin {
         },
         `commit blob revision ${desiredServerPath}`
       );
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
 
       const committedEntry = commitResponse.results.find((result) => result.status === "applied")?.entry ?? null;
       if (committedEntry) {
@@ -6999,6 +7254,10 @@ export default class RolayPlugin extends Plugin {
     entries: FileEntry[],
     reason: string
   ): Promise<void> {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     for (const entry of entries) {
       if (entry.kind === "binary" && entry.deleted) {
         this.clearPersistedBinaryCacheEntry(entry.id);
@@ -7016,6 +7275,10 @@ export default class RolayPlugin extends Plugin {
       { length: Math.min(RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY, queue.length) },
       async () => {
         while (queue.length > 0) {
+          if (!this.isRoomSyncActive(workspaceId)) {
+            return;
+          }
+
           const entry = queue.shift();
           if (!entry) {
             return;
@@ -7046,6 +7309,10 @@ export default class RolayPlugin extends Plugin {
     entry: FileEntry,
     reason: string
   ): Promise<void> {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     // Only entries with a committed blob revision are downloadable. A
     // placeholder without entry.blob exists in the tree but should not yet
     // overwrite local bytes or flip the UI to "finished".
@@ -7121,6 +7388,10 @@ export default class RolayPlugin extends Plugin {
         `expectedHash=${remoteHash} expectedSizeBytes=${remoteSize}`
       );
       const ticket = await this.apiClient.createBlobDownloadTicket(entry.id);
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
+
       this.traceBlob(
         `[${workspaceId}] download-ticket response entryId=${entry.id} localPath=${localPath} serverPath=${entry.path} ` +
         `status=${ticket._meta.status} requestId=${ticket._meta.requestId ?? "-"} hash=${ticket.hash} sizeBytes=${ticket.sizeBytes} ` +
@@ -7220,6 +7491,10 @@ export default class RolayPlugin extends Plugin {
           },
           transfer.abortController?.signal
         );
+        if (!this.isRoomSyncActive(workspaceId)) {
+          return;
+        }
+
         this.traceBlob(
           `[${workspaceId}] blob content response entryId=${entry.id} localPath=${localPath} transport=${download.transport} ` +
           `status=${download.status} requestId=${download.requestId ?? "-"} contentLength=${download.contentLength ?? -1} ` +
@@ -7273,7 +7548,7 @@ export default class RolayPlugin extends Plugin {
         return;
       }
 
-      this.updateBinaryTransferState(localPath, {
+      this.maybeUpdateBinaryTransferState(localPath, {
         status: "failed",
         lastError: error instanceof Error ? error.message : String(error),
         abortController: null
@@ -7289,6 +7564,10 @@ export default class RolayPlugin extends Plugin {
     downloadMeta: { hash: string; sizeBytes: number; mimeType: string | null },
     reason: string
   ): Promise<void> {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     const downloadData = await this.readBinaryTransferPart(partPath);
     if (!downloadData) {
       throw new Error(`Downloaded binary part for ${entry.path} is missing.`);
@@ -7306,6 +7585,10 @@ export default class RolayPlugin extends Plugin {
     }
 
     const computedHash = await sha256Hash(downloadData);
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
     this.traceBlob(
       `[${workspaceId}] download finalize entryId=${entry.id} localPath=${localPath} partPath=${partPath} ` +
       `computedHash=${computedHash} expectedHash=${effectiveHash ?? "-"} sizeBytes=${downloadData.byteLength}`
@@ -7440,6 +7723,14 @@ export default class RolayPlugin extends Plugin {
     newPath: string,
     type: "rename_entry" | "move_entry"
   ): Promise<void> {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      this.recordLog(
+        "ops",
+        `[${workspaceId}] Ignored local ${type} ${entry.path} -> ${newPath} because the room is disconnected.`
+      );
+      return;
+    }
+
     this.optimisticUpsertRoomEntry(workspaceId, {
       ...entry,
       path: newPath
@@ -7474,6 +7765,11 @@ export default class RolayPlugin extends Plugin {
   }
 
   private async queueDeleteEntry(workspaceId: string, entry: FileEntry): Promise<void> {
+    if (!this.isRoomSyncActive(workspaceId)) {
+      this.recordLog("ops", `[${workspaceId}] Ignored local delete ${entry.path} because the room is disconnected.`);
+      return;
+    }
+
     this.registerPendingLocalDelete(workspaceId, entry.path);
     this.optimisticDeleteRoomEntry(workspaceId, entry.id);
 

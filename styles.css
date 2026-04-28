@@ -556,7 +556,7 @@
 .rolay-note-presence-chip {
   background: color-mix(in srgb, var(--rolay-note-presence-color) 18%, transparent);
   border: 1px solid color-mix(in srgb, var(--rolay-note-presence-color) 34%, var(--background-modifier-border));
-  border-radius: 8px;
+  border-radius: 5px;
   color: var(--text-normal);
   align-items: center;
   display: inline-flex;
