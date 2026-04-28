@@ -1,10 +1,10 @@
 # Current State
 
-Last updated: 2026-04-27
+Last updated: 2026-04-28
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.6`
+- Plugin version: `1.2.7`
 - Latest notable commit in recent history before this AGENTS layer: `1a8c272` `Document presence and cursor sync behavior`
 
 ## Current Priorities
@@ -27,7 +27,9 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Default sync root is vault root (`/` in the settings UI).
 - Note presence is room-level SSE plus per-document awareness; public-site anonymous viewers arrive as `anonymousViewerCount` and stay separate from authenticated `viewers[]`.
 - Explorer presence badges now exist both on markdown notes and on ancestor folders inside the room root, including separate gray eye indicators for anonymous public viewers.
-- Binary transfers show progress in the explorer and placeholders should start at `0%`.
+- Red downloading/protected explorer paths and yellow uploading paths should always show a `0-100%` badge. Binary transfers use byte progress, remote placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll up child progress.
+- Local delete operations keep a short pending-delete guard so stale snapshots cannot resurrect files while multi-file delete operations are still settling.
+- Persistent `rolay-sync.log` is intentionally short-lived: entries older than 48 hours are removed, and noisy files are capped to a compact recent tail.
 - Remote markdown patches should preserve the local viewport.
 - Remote cursor rendering has extra stabilization against stale backward awareness offsets.
 - Room publication is private by default and public access is only through the separate server-root read-only site.
@@ -86,6 +88,9 @@ These are important because future regressions will often land in these areas:
 - BRAT-friendly release flow with plain semver tags like `1.2.6`
 - Dedicated `AGENTS/ideas/*` backlog layer for candidate, discovery, and rejected ideas
 - Room publication and public-site management in room settings
+- Persistent log auto-retention for more practical bug reports
+- Mandatory explorer progress badges for red/yellow sync states
+- Pending-delete guard against stale snapshot resurrection during bulk local deletes
 
 ## First Places To Look By Task Type
 

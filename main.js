@@ -10398,7 +10398,7 @@ var _FileBridge = class _FileBridge {
         });
       }
     }
-    const activeEntries = snapshot.entries.filter((entry) => !entry.deleted).sort(compareEntriesForMaterialization);
+    const activeEntries = snapshot.entries.filter((entry) => !entry.deleted).filter((entry) => !this.hasPendingDelete(snapshot.workspace.id, entry.path)).sort(compareEntriesForMaterialization);
     for (const entry of activeEntries) {
       await this.safeApply(`materialize ${entry.path}`, async () => {
         await this.ensureLocalEntry(snapshot.workspace.id, folderName, entry);
@@ -16049,6 +16049,10 @@ var WorkspaceEventStream = class {
       if (this.stopped || isAbortError(error)) {
         return;
       }
+      if (isSoftStreamCloseError(error)) {
+        this.scheduleReconnect();
+        return;
+      }
       const normalizedError = error instanceof Error ? error : new Error(String(error));
       this.handlers.onStatusChange?.("error");
       this.handlers.onError?.(normalizedError);
@@ -16163,6 +16167,17 @@ var WorkspaceEventStream = class {
 };
 function isAbortError(error) {
   return error instanceof DOMException && error.name === "AbortError" || error instanceof Error && error.name === "AbortError";
+}
+function isSoftStreamCloseError(error) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const code = error.code;
+  if (code === "ECONNRESET" || code === "ERR_STREAM_PREMATURE_CLOSE" || code === "UND_ERR_SOCKET") {
+    return true;
+  }
+  const message = error.message.trim().toLowerCase();
+  return message === "aborted" || message.includes("premature close") || message.includes("socket hang up");
 }
 function isNodeResponse(response) {
   return typeof response.setEncoding === "function";
@@ -16337,6 +16352,10 @@ var SettingsEventStream = class {
       if (this.stopped || isAbortError2(error)) {
         return;
       }
+      if (isSoftStreamCloseError2(error)) {
+        this.scheduleReconnect();
+        return;
+      }
       const normalizedError = error instanceof Error ? error : new Error(String(error));
       this.handlers.onStatusChange?.("error");
       this.handlers.onError?.(normalizedError);
@@ -16460,6 +16479,17 @@ var SettingsEventStream = class {
 function isAbortError2(error) {
   return error instanceof DOMException && error.name === "AbortError" || error instanceof Error && error.name === "AbortError";
 }
+function isSoftStreamCloseError2(error) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const code = error.code;
+  if (code === "ECONNRESET" || code === "ERR_STREAM_PREMATURE_CLOSE" || code === "UND_ERR_SOCKET") {
+    return true;
+  }
+  const message = error.message.trim().toLowerCase();
+  return message === "aborted" || message.includes("premature close") || message.includes("socket hang up");
+}
 function isNodeResponse2(response) {
   return typeof response.setEncoding === "function";
 }
@@ -16573,6 +16603,10 @@ var NotePresenceEventStream = class {
       if (this.stopped || isAbortError3(error)) {
         return;
       }
+      if (isSoftStreamCloseError3(error)) {
+        this.scheduleReconnect();
+        return;
+      }
       const normalizedError = error instanceof Error ? error : new Error(String(error));
       this.handlers.onStatusChange?.("error");
       this.handlers.onError?.(normalizedError);
@@ -16682,6 +16716,17 @@ var NotePresenceEventStream = class {
 };
 function isAbortError3(error) {
   return error instanceof DOMException && error.name === "AbortError" || error instanceof Error && error.name === "AbortError";
+}
+function isSoftStreamCloseError3(error) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+  const code = error.code;
+  if (code === "ECONNRESET" || code === "ERR_STREAM_PREMATURE_CLOSE" || code === "UND_ERR_SOCKET") {
+    return true;
+  }
+  const message = error.message.trim().toLowerCase();
+  return message === "aborted" || message.includes("premature close") || message.includes("socket hang up");
 }
 function isNodeResponse3(response) {
   return typeof response.setEncoding === "function";
@@ -16842,7 +16887,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.roomRuntime = /* @__PURE__ */ new Map();
     this.roomInvites = /* @__PURE__ */ new Map();
     this.pendingLocalCreates = /* @__PURE__ */ new Map();
-    this.pendingLocalDeletes = /* @__PURE__ */ new Set();
+    this.pendingLocalDeletes = /* @__PURE__ */ new Map();
     this.binaryTransferState = /* @__PURE__ */ new Map();
     this.binarySyncTokens = /* @__PURE__ */ new Map();
     this.binarySyncPathsByToken = /* @__PURE__ */ new Map();
@@ -16893,6 +16938,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   async onload() {
     this.isUnloading = false;
     this.data = mergePluginData(await this.loadData());
+    this.data.logs = trimRecentLogEntries(this.data.logs, Date.now(), _RolayPlugin.LOG_FILE_RETENTION_MS, 100);
     this.restorePersistedBinaryTransfers();
     this.resetProfileDraft();
     this.apiClient = new RolayApiClient({
@@ -17907,6 +17953,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     const snapshot = await this.apiClient.getWorkspaceTree(room.workspace.id);
     runtime.treeStore.applySnapshot(snapshot);
     this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
+    this.confirmSnapshotPendingDeletes(room.workspace.id, snapshot.entries);
     await this.fileBridge.applySnapshot(snapshot, previousEntries);
     this.scheduleExplorerLoadingDecorations();
     this.setRoomSyncState(room.workspace.id, {
@@ -18484,11 +18531,25 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     try {
       await this.refreshClosedRoomMarkdownContent(workspaceId, reason);
     } catch (error) {
-      this.recordLog(
-        "crdt",
-        `[${workspaceId}] Background markdown refresh failed: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
-      );
+      const message = getErrorMessage(error);
+      if (isStaleMarkdownBootstrapError(error)) {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Background markdown refresh saw a stale markdown entry; refreshing snapshot before retry.`
+        );
+        this.scheduleSnapshotRefresh(workspaceId, "markdown-bootstrap-stale-entry");
+      } else if (isRetryableBackgroundMarkdownError(error)) {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Background markdown refresh will retry after transient failure: ${message}`
+        );
+      } else {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Background markdown refresh failed: ${message}`,
+          "error"
+        );
+      }
     } finally {
       runtime.backgroundMarkdownRefreshInFlight = false;
       const currentRuntime = this.roomRuntime.get(workspaceId);
@@ -18506,7 +18567,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       scope,
       message
     };
-    this.data.logs = [...this.data.logs.slice(-99), entry];
+    this.data.logs = [
+      ...trimRecentLogEntries(this.data.logs, Date.now(), _RolayPlugin.LOG_FILE_RETENTION_MS, 99),
+      entry
+    ];
     this.pendingLogLines.push(formatPersistentLogLine(entry));
     this.schedulePersist();
     this.scheduleLogFlush();
@@ -18615,14 +18679,21 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async trimPersistentLogFileIfNeeded(logFilePath) {
     const stat = await this.app.vault.adapter.stat(logFilePath);
-    if (!stat || stat.size <= _RolayPlugin.MAX_LOG_FILE_BYTES) {
+    if (!stat || stat.size <= 0) {
       return;
     }
     const fileContents = await this.app.vault.adapter.read(logFilePath);
-    const keptTail = fileContents.slice(-Math.floor(_RolayPlugin.MAX_LOG_FILE_BYTES / 2));
-    const trimmedContents = `... trimmed older Rolay log lines ...
-${keptTail}`;
-    await this.app.vault.adapter.write(logFilePath, trimmedContents);
+    const nowMs = Date.now();
+    const trimmedByAge = trimPersistentLogByAge(fileContents, _RolayPlugin.LOG_FILE_RETENTION_MS, nowMs);
+    const trimmedBySize = trimPersistentLogBySize(
+      trimmedByAge,
+      _RolayPlugin.MAX_LOG_FILE_BYTES,
+      _RolayPlugin.LOG_FILE_TRIM_TARGET_BYTES,
+      nowMs
+    );
+    if (trimmedBySize !== fileContents) {
+      await this.app.vault.adapter.write(logFilePath, trimmedBySize);
+    }
   }
   async getAdapterFileSize(path) {
     try {
@@ -18751,6 +18822,8 @@ ${keptTail}`;
         completedTargets: 0,
         totalBytes: 0,
         completedBytes: 0,
+        documentBytesByEntryId: /* @__PURE__ */ new Map(),
+        completedEntryIds: /* @__PURE__ */ new Set(),
         hydratedTargets: 0,
         lockedLocalPaths: /* @__PURE__ */ new Set(),
         lastRunAt: null,
@@ -19197,29 +19270,207 @@ ${keptTail}`;
     );
   }
   getExplorerTransferBadges() {
-    const badges = /* @__PURE__ */ new Map();
+    const aggregate = /* @__PURE__ */ new Map();
+    const exactTransferPaths = /* @__PURE__ */ new Set();
     for (const transfer of this.binaryTransferState.values()) {
       const activeUpload = transfer.kind === "upload" && (transfer.status === "preparing" || transfer.status === "uploading" || transfer.status === "canceling" || transfer.status === "committing");
       const activeDownload = transfer.kind === "download" && (transfer.status === "preparing" || transfer.status === "downloading");
       if (!activeUpload && !activeDownload) {
         continue;
       }
-      badges.set((0, import_obsidian9.normalizePath)(transfer.localPath), {
-        label: this.formatBinaryTransferPercentLabel(transfer),
-        kind: transfer.kind
-      });
+      exactTransferPaths.add((0, import_obsidian9.normalizePath)(transfer.localPath));
+      this.addExplorerTransferProgress(
+        aggregate,
+        transfer.localPath,
+        transfer.kind,
+        Math.max(0, transfer.bytesDone),
+        Math.max(0, transfer.bytesTotal)
+      );
     }
     for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
       const normalizedPath = (0, import_obsidian9.normalizePath)(placeholderPath);
-      if (badges.has(normalizedPath)) {
+      if (exactTransferPaths.has(normalizedPath)) {
         continue;
       }
-      badges.set(normalizedPath, {
-        label: "0%",
-        kind: "download"
-      });
+      exactTransferPaths.add(normalizedPath);
+      const entry = this.resolveEntryByLocalPath(normalizedPath);
+      this.addExplorerTransferProgress(
+        aggregate,
+        normalizedPath,
+        "download",
+        0,
+        entry?.blob?.sizeBytes ?? 1
+      );
     }
-    return badges;
+    for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
+      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
+        const normalizedPath = (0, import_obsidian9.normalizePath)(lockedPath);
+        if (this.isExplorerPathUploading(normalizedPath) || exactTransferPaths.has(normalizedPath)) {
+          continue;
+        }
+        const progress = this.getMarkdownLockProgress(workspaceId, normalizedPath);
+        this.addExplorerTransferProgress(
+          aggregate,
+          normalizedPath,
+          "download",
+          progress.completedBytes,
+          progress.totalBytes
+        );
+      }
+    }
+    for (const pendingCreate of Object.values(this.data.pendingMarkdownCreates)) {
+      const normalizedPath = (0, import_obsidian9.normalizePath)(pendingCreate.localPath);
+      if (exactTransferPaths.has(normalizedPath)) {
+        continue;
+      }
+      exactTransferPaths.add(normalizedPath);
+      this.addExplorerTransferProgress(
+        aggregate,
+        normalizedPath,
+        "upload",
+        0,
+        this.getLocalFileSizeOrOne(normalizedPath)
+      );
+    }
+    for (const pendingMerge of Object.values(this.data.pendingMarkdownMerges)) {
+      const normalizedPath = (0, import_obsidian9.normalizePath)(pendingMerge.localPath);
+      if (exactTransferPaths.has(normalizedPath)) {
+        continue;
+      }
+      exactTransferPaths.add(normalizedPath);
+      this.addExplorerTransferProgress(
+        aggregate,
+        normalizedPath,
+        "upload",
+        0,
+        this.getLocalFileSizeOrOne(normalizedPath)
+      );
+    }
+    for (const pendingWrite of Object.values(this.data.pendingBinaryWrites)) {
+      const normalizedPath = (0, import_obsidian9.normalizePath)(pendingWrite.localPath);
+      if (exactTransferPaths.has(normalizedPath)) {
+        continue;
+      }
+      exactTransferPaths.add(normalizedPath);
+      this.addExplorerTransferProgress(
+        aggregate,
+        normalizedPath,
+        "upload",
+        0,
+        this.getLocalFileSizeOrOne(normalizedPath)
+      );
+    }
+    return new Map(
+      [...aggregate.entries()].map(([localPath, state]) => [
+        localPath,
+        {
+          label: this.formatExplorerTransferAggregatePercentLabel(state),
+          kind: state.kind
+        }
+      ])
+    );
+  }
+  addExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes) {
+    const normalizedPath = (0, import_obsidian9.normalizePath)(localPath);
+    this.mergeExplorerTransferProgress(aggregate, normalizedPath, kind, completedBytes, totalBytes);
+    const room = this.resolveDownloadedRoomByLocalPath(normalizedPath);
+    if (!room) {
+      return;
+    }
+    const roomRoot = (0, import_obsidian9.normalizePath)(getRoomRoot(this.data.settings.syncRoot, room.folderName));
+    let parentPath = getParentPath2(normalizedPath);
+    while (parentPath) {
+      if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
+        break;
+      }
+      this.mergeExplorerTransferProgress(aggregate, parentPath, kind, completedBytes, totalBytes);
+      if (parentPath === roomRoot) {
+        break;
+      }
+      parentPath = getParentPath2(parentPath);
+    }
+  }
+  mergeExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes) {
+    const normalizedTotalBytes = Math.max(1, Math.trunc(totalBytes));
+    const normalizedCompletedBytes = Math.max(
+      0,
+      Math.min(Math.trunc(completedBytes), normalizedTotalBytes)
+    );
+    const existing = aggregate.get(localPath);
+    if (!existing) {
+      aggregate.set(localPath, {
+        kind,
+        completedBytes: normalizedCompletedBytes,
+        totalBytes: normalizedTotalBytes,
+        itemCount: 1
+      });
+      return;
+    }
+    aggregate.set(localPath, {
+      kind: existing.kind === "download" || kind === "download" ? "download" : "upload",
+      completedBytes: existing.completedBytes + normalizedCompletedBytes,
+      totalBytes: existing.totalBytes + normalizedTotalBytes,
+      itemCount: existing.itemCount + 1
+    });
+  }
+  formatExplorerTransferAggregatePercentLabel(state) {
+    if (state.totalBytes <= 0) {
+      return "0%";
+    }
+    const percent = Math.round(state.completedBytes / state.totalBytes * 100);
+    return `${Math.max(0, Math.min(100, percent))}%`;
+  }
+  getMarkdownLockProgress(workspaceId, localPath) {
+    const runtime = this.roomRuntime.get(workspaceId);
+    const room = this.getDownloadedRooms().find((entry2) => entry2.workspaceId === workspaceId);
+    if (!runtime || !room) {
+      return {
+        completedBytes: 0,
+        totalBytes: 1
+      };
+    }
+    const serverPath = toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName);
+    const entry = serverPath ? runtime.treeStore.getEntryByPath(serverPath) : null;
+    if (!entry) {
+      return {
+        completedBytes: 0,
+        totalBytes: 1
+      };
+    }
+    const totalBytes = Math.max(
+      1,
+      runtime.markdownBootstrap.documentBytesByEntryId.get(entry.id) ?? 1
+    );
+    const completed = runtime.markdownBootstrap.completedEntryIds.has(entry.id) || this.hasPersistedCrdtCache(entry.id);
+    return {
+      completedBytes: completed ? totalBytes : 0,
+      totalBytes
+    };
+  }
+  getLocalFileSizeOrOne(localPath) {
+    const file = this.app.vault.getAbstractFileByPath(localPath);
+    if (file instanceof import_obsidian9.TFile && Number.isFinite(file.stat.size) && file.stat.size > 0) {
+      return file.stat.size;
+    }
+    return 1;
+  }
+  isExplorerPathUploading(localPath) {
+    const normalizedPath = (0, import_obsidian9.normalizePath)(localPath);
+    if (normalizedPath in this.data.pendingMarkdownCreates) {
+      return true;
+    }
+    if (normalizedPath in this.data.pendingBinaryWrites) {
+      return true;
+    }
+    if (Object.values(this.data.pendingMarkdownMerges).some((entry) => {
+      return (0, import_obsidian9.normalizePath)(entry.localPath) === normalizedPath;
+    })) {
+      return true;
+    }
+    const transfer = this.binaryTransferState.get(normalizedPath);
+    return Boolean(
+      transfer && transfer.kind === "upload" && (transfer.status === "preparing" || transfer.status === "uploading" || transfer.status === "canceling" || transfer.status === "committing")
+    );
   }
   updateExplorerTransferBadge(element2, badgeState) {
     const titleHost = this.findExplorerTitleHost(element2);
@@ -19254,19 +19505,14 @@ ${keptTail}`;
   findExplorerTitleHost(element2) {
     return element2.querySelector(".nav-file-title-content") ?? element2.querySelector(".tree-item-inner");
   }
-  formatBinaryTransferPercentLabel(transfer) {
-    const totalBytes = Math.max(0, transfer.bytesTotal);
-    const doneBytes = Math.min(Math.max(0, transfer.bytesDone), totalBytes);
-    if (totalBytes <= 0) {
-      return transfer.status === "committing" ? "100%" : "0%";
-    }
-    return `${Math.max(0, Math.min(100, Math.round(doneBytes / totalBytes * 100)))}%`;
-  }
   getLoadingExplorerPaths() {
     const loadingPaths = /* @__PURE__ */ new Set();
+    const uploadingPaths = this.getUploadingExplorerPaths();
     for (const runtime of this.roomRuntime.values()) {
       for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
-        loadingPaths.add(lockedPath);
+        if (!uploadingPaths.has(lockedPath)) {
+          loadingPaths.add(lockedPath);
+        }
       }
     }
     for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
@@ -19827,13 +20073,29 @@ ${keptTail}`;
     return false;
   }
   registerPendingLocalDelete(workspaceId, path) {
-    this.pendingLocalDeletes.add(this.buildPendingRoomPathKey(workspaceId, path));
+    this.pendingLocalDeletes.set(this.buildPendingRoomPathKey(workspaceId, path), Date.now());
   }
   clearPendingLocalDelete(workspaceId, path) {
     this.pendingLocalDeletes.delete(this.buildPendingRoomPathKey(workspaceId, path));
   }
   hasPendingLocalDelete(workspaceId, path) {
-    return this.pendingLocalDeletes.has(this.buildPendingRoomPathKey(workspaceId, path));
+    const prefix = `${workspaceId}::`;
+    const normalizedPath = (0, import_obsidian9.normalizePath)(path);
+    const now = Date.now();
+    for (const [key, createdAt] of [...this.pendingLocalDeletes.entries()]) {
+      if (now - createdAt > _RolayPlugin.PENDING_DELETE_GUARD_MS) {
+        this.pendingLocalDeletes.delete(key);
+        continue;
+      }
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      const pendingPath = key.slice(prefix.length);
+      if (normalizedPath === pendingPath || normalizedPath.startsWith(`${pendingPath}/`)) {
+        return true;
+      }
+    }
+    return false;
   }
   clearPendingRoomPathsForWorkspace(workspaceId) {
     const prefix = `${workspaceId}::`;
@@ -19842,7 +20104,7 @@ ${keptTail}`;
         this.pendingLocalCreates.delete(key);
       }
     }
-    for (const key of [...this.pendingLocalDeletes]) {
+    for (const key of [...this.pendingLocalDeletes.keys()]) {
       if (key.startsWith(prefix)) {
         this.pendingLocalDeletes.delete(key);
       }
@@ -19874,6 +20136,22 @@ ${keptTail}`;
         continue;
       }
       this.clearPendingLocalCreate(workspaceId, entry.path);
+    }
+  }
+  confirmSnapshotPendingDeletes(workspaceId, entries) {
+    const prefix = `${workspaceId}::`;
+    const activePaths = entries.filter((entry) => !entry.deleted).map((entry) => (0, import_obsidian9.normalizePath)(entry.path));
+    for (const key of [...this.pendingLocalDeletes.keys()]) {
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+      const pendingPath = key.slice(prefix.length);
+      const stillActive = activePaths.some((activePath) => {
+        return activePath === pendingPath || activePath.startsWith(`${pendingPath}/`);
+      });
+      if (!stillActive) {
+        this.pendingLocalDeletes.delete(key);
+      }
     }
   }
   buildRemoteObservedPathKey(workspaceId, localPath) {
@@ -20972,6 +21250,8 @@ ${keptTail}`;
     runtime.markdownBootstrap.completedTargets = 0;
     runtime.markdownBootstrap.totalBytes = 0;
     runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.documentBytesByEntryId.clear();
+    runtime.markdownBootstrap.completedEntryIds.clear();
     runtime.markdownBootstrap.hydratedTargets = 0;
     runtime.markdownBootstrap.lastError = null;
     this.scheduleExplorerLoadingDecorations();
@@ -21004,6 +21284,8 @@ ${keptTail}`;
     runtime.markdownBootstrap.completedTargets = 0;
     runtime.markdownBootstrap.totalBytes = 0;
     runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.documentBytesByEntryId.clear();
+    runtime.markdownBootstrap.completedEntryIds.clear();
     runtime.markdownBootstrap.hydratedTargets = 0;
     runtime.markdownBootstrap.lastRunAt = (/* @__PURE__ */ new Date()).toISOString();
     runtime.markdownBootstrap.lastError = null;
@@ -21031,6 +21313,12 @@ ${keptTail}`;
       const metadataByEntryId = new Map(
         metadataResponse.documents.map((document2) => [document2.entryId, document2])
       );
+      for (const document2 of metadataResponse.documents) {
+        runtime.markdownBootstrap.documentBytesByEntryId.set(
+          document2.entryId,
+          Math.max(0, document2.encodedBytes)
+        );
+      }
       const knownEntries = markdownEntries.filter((entry) => metadataByEntryId.has(entry.id));
       const metadataMissingCount = markdownEntries.length - knownEntries.length;
       runtime.markdownBootstrap.totalTargets = metadataResponse.documentCount > 0 ? metadataResponse.documentCount : metadataResponse.documents.length;
@@ -21088,6 +21376,7 @@ ${keptTail}`;
             0,
             document2.encodedBytes ?? metadataDocument.encodedBytes
           );
+          runtime.markdownBootstrap.completedEntryIds.add(entry.id);
           if (activeFilePath && localPath === activeFilePath) {
             await this.bindActiveMarkdownToCrdt();
           }
@@ -21121,7 +21410,18 @@ ${keptTail}`;
       if (runtime.markdownBootstrap.runToken !== runToken) {
         return;
       }
-      const message = error instanceof Error ? error.message : String(error);
+      const message = getErrorMessage(error);
+      if (isStaleMarkdownBootstrapError(error)) {
+        runtime.markdownBootstrap.lastError = null;
+        runtime.markdownBootstrap.status = "idle";
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] HTTP markdown bootstrap saw a stale markdown entry; refreshing snapshot before retry.`
+        );
+        this.scheduleSnapshotRefresh(workspaceId, "markdown-bootstrap-stale-entry");
+        this.updateStatusBar();
+        return;
+      }
       runtime.markdownBootstrap.lastError = message;
       runtime.markdownBootstrap.status = "error";
       this.recordLog(
@@ -22432,10 +22732,9 @@ ${keptTail}`;
         this.clearPersistedBinaryCacheEntry(entry.id);
       }
     } catch (error) {
+      this.clearPendingLocalDelete(workspaceId, entry.path);
       this.scheduleSnapshotRefresh(workspaceId, "delete-recovery");
       throw error;
-    } finally {
-      this.clearPendingLocalDelete(workspaceId, entry.path);
     }
   }
   findAvailableMarkdownConflictPath(workspaceId, desiredServerPath) {
@@ -22506,7 +22805,9 @@ _RolayPlugin.ENABLE_BLOB_TRANSFER_TRACE = true;
 _RolayPlugin.BINARY_TRANSFER_PARTS_FOLDER = "transfers";
 _RolayPlugin.BINARY_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
 _RolayPlugin.MAX_BINARY_UPLOAD_OFFSET_RECOVERY_ATTEMPTS = 8;
-_RolayPlugin.MAX_LOG_FILE_BYTES = 512 * 1024;
+_RolayPlugin.LOG_FILE_RETENTION_MS = 48 * 60 * 60 * 1e3;
+_RolayPlugin.MAX_LOG_FILE_BYTES = 256 * 1024;
+_RolayPlugin.LOG_FILE_TRIM_TARGET_BYTES = 192 * 1024;
 _RolayPlugin.LOG_FILE_NAME = "rolay-sync.log";
 _RolayPlugin.PENDING_CREATE_CONFIRMATION_TTL_MS = 6e4;
 _RolayPlugin.RECENT_REMOTE_PATH_TTL_MS = 3e4;
@@ -22516,6 +22817,7 @@ _RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS = 1200;
 _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = 8;
 _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = 512 * 1024;
 _RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY = 2;
+_RolayPlugin.PENDING_DELETE_GUARD_MS = 6e4;
 var RolayPlugin = _RolayPlugin;
 function normalizeSettingsEventEnvelope(event) {
   const rawData = isRecord2(event.data) ? event.data : {};
@@ -22901,6 +23203,20 @@ function formatBlobHashMismatchDetails(error) {
   }
   return parts.join(", ");
 }
+function getErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function isStaleMarkdownBootstrapError(error) {
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes("markdown entry not found");
+}
+function isRetryableBackgroundMarkdownError(error) {
+  if (error instanceof RolayApiError && [408, 429, 500, 502, 503, 504].includes(error.status)) {
+    return true;
+  }
+  const message = getErrorMessage(error);
+  return message.includes("ERR_CONTENT_LENGTH_MISMATCH") || message.includes("ERR_NETWORK_IO_SUSPENDED") || message.includes("Failed to fetch") || message.includes("NetworkError");
+}
 function clampTransferBytes(value, totalBytes) {
   if (!Number.isFinite(value) || value <= 0) {
     return 0;
@@ -22938,6 +23254,93 @@ function formatPersistentLogLine(entry) {
   const sanitizedMessage = entry.message.replace(/\r?\n/g, " ");
   return `[${entry.at}] ${entry.scope}/${entry.level}: ${sanitizedMessage}
 `;
+}
+function trimRecentLogEntries(entries, nowMs, retentionMs, maxEntries) {
+  const cutoffMs = nowMs - retentionMs;
+  return entries.filter((entry) => {
+    const timestampMs = Date.parse(entry.at);
+    return Number.isFinite(timestampMs) && timestampMs >= cutoffMs;
+  }).slice(-maxEntries);
+}
+function trimPersistentLogByAge(contents, retentionMs, nowMs) {
+  if (!contents) {
+    return contents;
+  }
+  const cutoffMs = nowMs - retentionMs;
+  const lines = splitPersistentLogLines(contents);
+  const keptLines = [];
+  let droppedLineCount = 0;
+  for (const line of lines) {
+    const timestampMs = parsePersistentLogTimestampMs(line);
+    if (timestampMs === null) {
+      if (line.includes("trimmed older Rolay log lines")) {
+        droppedLineCount += 1;
+        continue;
+      }
+      keptLines.push(line);
+      continue;
+    }
+    if (timestampMs >= cutoffMs) {
+      keptLines.push(line);
+    } else {
+      droppedLineCount += 1;
+    }
+  }
+  if (droppedLineCount === 0) {
+    return contents;
+  }
+  const retentionHours = Math.round(retentionMs / (60 * 60 * 1e3));
+  return formatPersistentLogTrimLine(
+    nowMs,
+    `Trimmed ${droppedLineCount} Rolay log line(s) older than ${retentionHours} hours.`
+  ) + keptLines.join("");
+}
+function trimPersistentLogBySize(contents, maxBytes, targetBytes, nowMs) {
+  if (!contents || getTextByteLength(contents) <= maxBytes) {
+    return contents;
+  }
+  const marker = formatPersistentLogTrimLine(
+    nowMs,
+    `Trimmed persistent Rolay log to the newest ${formatByteCount(targetBytes)} because it exceeded ${formatByteCount(
+      maxBytes
+    )}.`
+  );
+  const lines = splitPersistentLogLines(contents);
+  const keptLines = [];
+  let keptBytes = getTextByteLength(marker);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    const lineBytes = getTextByteLength(line);
+    if (keptBytes + lineBytes > targetBytes && keptLines.length > 0) {
+      break;
+    }
+    if (keptBytes + lineBytes <= targetBytes) {
+      keptLines.push(line);
+      keptBytes += lineBytes;
+    }
+  }
+  if (keptLines.length === 0) {
+    return marker;
+  }
+  return marker + keptLines.reverse().join("");
+}
+function splitPersistentLogLines(contents) {
+  return contents.match(/[^\r\n]*(?:\r?\n|$)/g)?.filter((line) => line.length > 0) ?? [];
+}
+function parsePersistentLogTimestampMs(line) {
+  const match2 = /^\[([^\]]+)\]/.exec(line);
+  if (!match2) {
+    return null;
+  }
+  const timestampMs = Date.parse(match2[1]);
+  return Number.isFinite(timestampMs) ? timestampMs : null;
+}
+function formatPersistentLogTrimLine(nowMs, message) {
+  return `[${new Date(nowMs).toISOString()}] plugin/info: ${message}
+`;
+}
+function getTextByteLength(text2) {
+  return new TextEncoder().encode(text2).byteLength;
 }
 function getFileName(path) {
   const separatorIndex = path.lastIndexOf("/");

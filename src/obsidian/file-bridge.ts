@@ -140,6 +140,7 @@ export class FileBridge {
 
     const activeEntries = snapshot.entries
       .filter((entry) => !entry.deleted)
+      .filter((entry) => !this.hasPendingDelete(snapshot.workspace.id, entry.path))
       .sort(compareEntriesForMaterialization);
 
     for (const entry of activeEntries) {

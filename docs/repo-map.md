@@ -276,8 +276,8 @@ Look at:
 
 Useful UI clue:
 
-- explorer progress badges are derived from `binaryTransferState`
-- a freshly materialized remote placeholder should already show `0%` download progress before the first ticket/content request completes
+- explorer progress badges are mandatory for red/yellow sync states and are derived from `binaryTransferState`, remote binary placeholders, markdown bootstrap lock metadata, and pending local upload records
+- a freshly materialized remote placeholder should already show `0%` download progress before the first ticket/content request completes, and folder badges should roll up child transfer progress
 
 Important current constraint:
 
@@ -307,6 +307,8 @@ Useful runtime artifacts:
   `.obsidian/plugins/rolay/data.json`
 - runtime log:
   `.obsidian/plugins/rolay/rolay-sync.log`
+
+The runtime log is auto-trimmed: entries older than 48 hours are removed, and very noisy logs are capped to a compact recent tail.
 
 When debugging, the log is usually the fastest way to determine whether a failure is:
 

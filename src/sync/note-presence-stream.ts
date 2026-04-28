@@ -70,6 +70,11 @@ export class NotePresenceEventStream {
         return;
       }
 
+      if (isSoftStreamCloseError(error)) {
+        this.scheduleReconnect();
+        return;
+      }
+
       const normalizedError = error instanceof Error ? error : new Error(String(error));
       this.handlers.onStatusChange?.("error");
       this.handlers.onError?.(normalizedError);
@@ -208,6 +213,24 @@ function isAbortError(error: unknown): boolean {
     (error instanceof DOMException && error.name === "AbortError") ||
     (error instanceof Error && error.name === "AbortError")
   );
+}
+
+function isSoftStreamCloseError(error: unknown): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  const code = (error as { code?: unknown }).code;
+  if (
+    code === "ECONNRESET" ||
+    code === "ERR_STREAM_PREMATURE_CLOSE" ||
+    code === "UND_ERR_SOCKET"
+  ) {
+    return true;
+  }
+
+  const message = error.message.trim().toLowerCase();
+  return message === "aborted" || message.includes("premature close") || message.includes("socket hang up");
 }
 
 function isNodeResponse(response: Response | IncomingMessage): response is IncomingMessage {

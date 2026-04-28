@@ -92,6 +92,8 @@ interface RoomMarkdownBootstrapState {
   completedTargets: number;
   totalBytes: number;
   completedBytes: number;
+  documentBytesByEntryId: Map<string, number>;
+  completedEntryIds: Set<string>;
   hydratedTargets: number;
   lockedLocalPaths: Set<string>;
   lastRunAt: string | null;
@@ -159,6 +161,13 @@ interface ExplorerTransferBadgeState {
   kind: BinaryTransferKind;
 }
 
+interface ExplorerTransferBadgeAggregate {
+  kind: BinaryTransferKind;
+  completedBytes: number;
+  totalBytes: number;
+  itemCount: number;
+}
+
 export interface RoomCardState {
   room: RoomListItem;
   folderName: string;
@@ -201,7 +210,9 @@ export default class RolayPlugin extends Plugin {
   private static readonly BINARY_TRANSFER_PARTS_FOLDER = "transfers";
   private static readonly BINARY_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
   private static readonly MAX_BINARY_UPLOAD_OFFSET_RECOVERY_ATTEMPTS = 8;
-  private static readonly MAX_LOG_FILE_BYTES = 512 * 1024;
+  private static readonly LOG_FILE_RETENTION_MS = 48 * 60 * 60 * 1000;
+  private static readonly MAX_LOG_FILE_BYTES = 256 * 1024;
+  private static readonly LOG_FILE_TRIM_TARGET_BYTES = 192 * 1024;
   private static readonly LOG_FILE_NAME = "rolay-sync.log";
   private static readonly PENDING_CREATE_CONFIRMATION_TTL_MS = 60_000;
   private static readonly RECENT_REMOTE_PATH_TTL_MS = 30_000;
@@ -211,6 +222,7 @@ export default class RolayPlugin extends Plugin {
   private static readonly MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = 8;
   private static readonly MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = 512 * 1024;
   private static readonly BINARY_DOWNLOAD_CONCURRENCY = 2;
+  private static readonly PENDING_DELETE_GUARD_MS = 60_000;
   private data!: RolayPluginData;
   private apiClient!: RolayApiClient;
   private crdtManager!: CrdtSessionManager;
@@ -219,7 +231,7 @@ export default class RolayPlugin extends Plugin {
   private readonly roomRuntime = new Map<string, RoomRuntimeState>();
   private readonly roomInvites = new Map<string, InviteState>();
   private readonly pendingLocalCreates = new Map<string, number>();
-  private readonly pendingLocalDeletes = new Set<string>();
+  private readonly pendingLocalDeletes = new Map<string, number>();
   private readonly binaryTransferState = new Map<string, BinaryTransferState>();
   private readonly binarySyncTokens = new Map<string, string>();
   private readonly binarySyncPathsByToken = new Map<string, string>();
@@ -272,6 +284,7 @@ export default class RolayPlugin extends Plugin {
   override async onload(): Promise<void> {
     this.isUnloading = false;
     this.data = mergePluginData(await this.loadData());
+    this.data.logs = trimRecentLogEntries(this.data.logs, Date.now(), RolayPlugin.LOG_FILE_RETENTION_MS, 100);
     this.restorePersistedBinaryTransfers();
     this.resetProfileDraft();
     this.apiClient = new RolayApiClient({
@@ -1462,6 +1475,7 @@ export default class RolayPlugin extends Plugin {
     const snapshot = await this.apiClient.getWorkspaceTree(room.workspace.id);
     runtime.treeStore.applySnapshot(snapshot);
     this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
+    this.confirmSnapshotPendingDeletes(room.workspace.id, snapshot.entries);
     await this.fileBridge.applySnapshot(snapshot, previousEntries);
     this.scheduleExplorerLoadingDecorations();
     this.setRoomSyncState(room.workspace.id, {
@@ -2133,11 +2147,25 @@ export default class RolayPlugin extends Plugin {
     try {
       await this.refreshClosedRoomMarkdownContent(workspaceId, reason);
     } catch (error) {
-      this.recordLog(
-        "crdt",
-        `[${workspaceId}] Background markdown refresh failed: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
-      );
+      const message = getErrorMessage(error);
+      if (isStaleMarkdownBootstrapError(error)) {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Background markdown refresh saw a stale markdown entry; refreshing snapshot before retry.`
+        );
+        this.scheduleSnapshotRefresh(workspaceId, "markdown-bootstrap-stale-entry");
+      } else if (isRetryableBackgroundMarkdownError(error)) {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Background markdown refresh will retry after transient failure: ${message}`
+        );
+      } else {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Background markdown refresh failed: ${message}`,
+          "error"
+        );
+      }
     } finally {
       runtime.backgroundMarkdownRefreshInFlight = false;
 
@@ -2159,7 +2187,10 @@ export default class RolayPlugin extends Plugin {
       message
     };
 
-    this.data.logs = [...this.data.logs.slice(-99), entry];
+    this.data.logs = [
+      ...trimRecentLogEntries(this.data.logs, Date.now(), RolayPlugin.LOG_FILE_RETENTION_MS, 99),
+      entry
+    ];
     this.pendingLogLines.push(formatPersistentLogLine(entry));
     this.schedulePersist();
     this.scheduleLogFlush();
@@ -2292,14 +2323,23 @@ export default class RolayPlugin extends Plugin {
 
   private async trimPersistentLogFileIfNeeded(logFilePath: string): Promise<void> {
     const stat = await this.app.vault.adapter.stat(logFilePath);
-    if (!stat || stat.size <= RolayPlugin.MAX_LOG_FILE_BYTES) {
+    if (!stat || stat.size <= 0) {
       return;
     }
 
     const fileContents = await this.app.vault.adapter.read(logFilePath);
-    const keptTail = fileContents.slice(-Math.floor(RolayPlugin.MAX_LOG_FILE_BYTES / 2));
-    const trimmedContents = `... trimmed older Rolay log lines ...\n${keptTail}`;
-    await this.app.vault.adapter.write(logFilePath, trimmedContents);
+    const nowMs = Date.now();
+    const trimmedByAge = trimPersistentLogByAge(fileContents, RolayPlugin.LOG_FILE_RETENTION_MS, nowMs);
+    const trimmedBySize = trimPersistentLogBySize(
+      trimmedByAge,
+      RolayPlugin.MAX_LOG_FILE_BYTES,
+      RolayPlugin.LOG_FILE_TRIM_TARGET_BYTES,
+      nowMs
+    );
+
+    if (trimmedBySize !== fileContents) {
+      await this.app.vault.adapter.write(logFilePath, trimmedBySize);
+    }
   }
 
   private async getAdapterFileSize(path: string): Promise<number> {
@@ -2466,6 +2506,8 @@ export default class RolayPlugin extends Plugin {
         completedTargets: 0,
         totalBytes: 0,
         completedBytes: 0,
+        documentBytesByEntryId: new Map(),
+        completedEntryIds: new Set(),
         hydratedTargets: 0,
         lockedLocalPaths: new Set<string>(),
         lastRunAt: null,
@@ -3059,7 +3101,8 @@ export default class RolayPlugin extends Plugin {
   }
 
   private getExplorerTransferBadges(): Map<string, ExplorerTransferBadgeState> {
-    const badges = new Map<string, ExplorerTransferBadgeState>();
+    const aggregate = new Map<string, ExplorerTransferBadgeAggregate>();
+    const exactTransferPaths = new Set<string>();
 
     for (const transfer of this.binaryTransferState.values()) {
       const activeUpload =
@@ -3078,15 +3121,19 @@ export default class RolayPlugin extends Plugin {
         continue;
       }
 
-      badges.set(normalizePath(transfer.localPath), {
-        label: this.formatBinaryTransferPercentLabel(transfer),
-        kind: transfer.kind
-      });
+      exactTransferPaths.add(normalizePath(transfer.localPath));
+      this.addExplorerTransferProgress(
+        aggregate,
+        transfer.localPath,
+        transfer.kind,
+        Math.max(0, transfer.bytesDone),
+        Math.max(0, transfer.bytesTotal)
+      );
     }
 
     for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
       const normalizedPath = normalizePath(placeholderPath);
-      if (badges.has(normalizedPath)) {
+      if (exactTransferPaths.has(normalizedPath)) {
         continue;
       }
 
@@ -3094,13 +3141,236 @@ export default class RolayPlugin extends Plugin {
       // moment before the actual blob ticket/download starts. Showing `0%`
       // immediately keeps the explorer honest instead of flashing "normal"
       // and only later turning into a red downloading file.
-      badges.set(normalizedPath, {
-        label: "0%",
-        kind: "download"
-      });
+      exactTransferPaths.add(normalizedPath);
+      const entry = this.resolveEntryByLocalPath(normalizedPath);
+      this.addExplorerTransferProgress(
+        aggregate,
+        normalizedPath,
+        "download",
+        0,
+        entry?.blob?.sizeBytes ?? 1
+      );
     }
 
-    return badges;
+    for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
+      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
+        const normalizedPath = normalizePath(lockedPath);
+        if (this.isExplorerPathUploading(normalizedPath) || exactTransferPaths.has(normalizedPath)) {
+          continue;
+        }
+
+        const progress = this.getMarkdownLockProgress(workspaceId, normalizedPath);
+        this.addExplorerTransferProgress(
+          aggregate,
+          normalizedPath,
+          "download",
+          progress.completedBytes,
+          progress.totalBytes
+        );
+      }
+    }
+
+    for (const pendingCreate of Object.values(this.data.pendingMarkdownCreates)) {
+      const normalizedPath = normalizePath(pendingCreate.localPath);
+      if (exactTransferPaths.has(normalizedPath)) {
+        continue;
+      }
+
+      exactTransferPaths.add(normalizedPath);
+      this.addExplorerTransferProgress(
+        aggregate,
+        normalizedPath,
+        "upload",
+        0,
+        this.getLocalFileSizeOrOne(normalizedPath)
+      );
+    }
+
+    for (const pendingMerge of Object.values(this.data.pendingMarkdownMerges)) {
+      const normalizedPath = normalizePath(pendingMerge.localPath);
+      if (exactTransferPaths.has(normalizedPath)) {
+        continue;
+      }
+
+      exactTransferPaths.add(normalizedPath);
+      this.addExplorerTransferProgress(
+        aggregate,
+        normalizedPath,
+        "upload",
+        0,
+        this.getLocalFileSizeOrOne(normalizedPath)
+      );
+    }
+
+    for (const pendingWrite of Object.values(this.data.pendingBinaryWrites)) {
+      const normalizedPath = normalizePath(pendingWrite.localPath);
+      if (exactTransferPaths.has(normalizedPath)) {
+        continue;
+      }
+
+      exactTransferPaths.add(normalizedPath);
+      this.addExplorerTransferProgress(
+        aggregate,
+        normalizedPath,
+        "upload",
+        0,
+        this.getLocalFileSizeOrOne(normalizedPath)
+      );
+    }
+
+    return new Map(
+      [...aggregate.entries()].map(([localPath, state]) => [
+        localPath,
+        {
+          label: this.formatExplorerTransferAggregatePercentLabel(state),
+          kind: state.kind
+        }
+      ] as const)
+    );
+  }
+
+  private addExplorerTransferProgress(
+    aggregate: Map<string, ExplorerTransferBadgeAggregate>,
+    localPath: string,
+    kind: BinaryTransferKind,
+    completedBytes: number,
+    totalBytes: number
+  ): void {
+    const normalizedPath = normalizePath(localPath);
+    this.mergeExplorerTransferProgress(aggregate, normalizedPath, kind, completedBytes, totalBytes);
+
+    const room = this.resolveDownloadedRoomByLocalPath(normalizedPath);
+    if (!room) {
+      return;
+    }
+
+    const roomRoot = normalizePath(getRoomRoot(this.data.settings.syncRoot, room.folderName));
+    let parentPath = getParentPath(normalizedPath);
+    while (parentPath) {
+      if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
+        break;
+      }
+
+      this.mergeExplorerTransferProgress(aggregate, parentPath, kind, completedBytes, totalBytes);
+      if (parentPath === roomRoot) {
+        break;
+      }
+
+      parentPath = getParentPath(parentPath);
+    }
+  }
+
+  private mergeExplorerTransferProgress(
+    aggregate: Map<string, ExplorerTransferBadgeAggregate>,
+    localPath: string,
+    kind: BinaryTransferKind,
+    completedBytes: number,
+    totalBytes: number
+  ): void {
+    const normalizedTotalBytes = Math.max(1, Math.trunc(totalBytes));
+    const normalizedCompletedBytes = Math.max(
+      0,
+      Math.min(Math.trunc(completedBytes), normalizedTotalBytes)
+    );
+    const existing = aggregate.get(localPath);
+    if (!existing) {
+      aggregate.set(localPath, {
+        kind,
+        completedBytes: normalizedCompletedBytes,
+        totalBytes: normalizedTotalBytes,
+        itemCount: 1
+      });
+      return;
+    }
+
+    aggregate.set(localPath, {
+      kind: existing.kind === "download" || kind === "download" ? "download" : "upload",
+      completedBytes: existing.completedBytes + normalizedCompletedBytes,
+      totalBytes: existing.totalBytes + normalizedTotalBytes,
+      itemCount: existing.itemCount + 1
+    });
+  }
+
+  private formatExplorerTransferAggregatePercentLabel(state: ExplorerTransferBadgeAggregate): string {
+    if (state.totalBytes <= 0) {
+      return "0%";
+    }
+
+    const percent = Math.round((state.completedBytes / state.totalBytes) * 100);
+    return `${Math.max(0, Math.min(100, percent))}%`;
+  }
+
+  private getMarkdownLockProgress(
+    workspaceId: string,
+    localPath: string
+  ): { completedBytes: number; totalBytes: number } {
+    const runtime = this.roomRuntime.get(workspaceId);
+    const room = this.getDownloadedRooms().find((entry) => entry.workspaceId === workspaceId);
+    if (!runtime || !room) {
+      return {
+        completedBytes: 0,
+        totalBytes: 1
+      };
+    }
+
+    const serverPath = toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName);
+    const entry = serverPath ? runtime.treeStore.getEntryByPath(serverPath) : null;
+    if (!entry) {
+      return {
+        completedBytes: 0,
+        totalBytes: 1
+      };
+    }
+
+    const totalBytes = Math.max(
+      1,
+      runtime.markdownBootstrap.documentBytesByEntryId.get(entry.id) ?? 1
+    );
+    const completed = runtime.markdownBootstrap.completedEntryIds.has(entry.id) || this.hasPersistedCrdtCache(entry.id);
+    return {
+      completedBytes: completed ? totalBytes : 0,
+      totalBytes
+    };
+  }
+
+  private getLocalFileSizeOrOne(localPath: string): number {
+    const file = this.app.vault.getAbstractFileByPath(localPath);
+    if (file instanceof TFile && Number.isFinite(file.stat.size) && file.stat.size > 0) {
+      return file.stat.size;
+    }
+
+    return 1;
+  }
+
+  private isExplorerPathUploading(localPath: string): boolean {
+    const normalizedPath = normalizePath(localPath);
+    if (normalizedPath in this.data.pendingMarkdownCreates) {
+      return true;
+    }
+
+    if (normalizedPath in this.data.pendingBinaryWrites) {
+      return true;
+    }
+
+    if (
+      Object.values(this.data.pendingMarkdownMerges).some((entry) => {
+        return normalizePath(entry.localPath) === normalizedPath;
+      })
+    ) {
+      return true;
+    }
+
+    const transfer = this.binaryTransferState.get(normalizedPath);
+    return Boolean(
+      transfer &&
+      transfer.kind === "upload" &&
+      (
+        transfer.status === "preparing" ||
+        transfer.status === "uploading" ||
+        transfer.status === "canceling" ||
+        transfer.status === "committing"
+      )
+    );
   }
 
   private updateExplorerTransferBadge(
@@ -3149,22 +3419,15 @@ export default class RolayPlugin extends Plugin {
     );
   }
 
-  private formatBinaryTransferPercentLabel(transfer: BinaryTransferState): string {
-    const totalBytes = Math.max(0, transfer.bytesTotal);
-    const doneBytes = Math.min(Math.max(0, transfer.bytesDone), totalBytes);
-    if (totalBytes <= 0) {
-      return transfer.status === "committing" ? "100%" : "0%";
-    }
-
-    return `${Math.max(0, Math.min(100, Math.round((doneBytes / totalBytes) * 100)))}%`;
-  }
-
   private getLoadingExplorerPaths(): Set<string> {
     const loadingPaths = new Set<string>();
+    const uploadingPaths = this.getUploadingExplorerPaths();
 
     for (const runtime of this.roomRuntime.values()) {
       for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
-        loadingPaths.add(lockedPath);
+        if (!uploadingPaths.has(lockedPath)) {
+          loadingPaths.add(lockedPath);
+        }
       }
     }
 
@@ -3860,7 +4123,7 @@ export default class RolayPlugin extends Plugin {
   }
 
   private registerPendingLocalDelete(workspaceId: string, path: string): void {
-    this.pendingLocalDeletes.add(this.buildPendingRoomPathKey(workspaceId, path));
+    this.pendingLocalDeletes.set(this.buildPendingRoomPathKey(workspaceId, path), Date.now());
   }
 
   private clearPendingLocalDelete(workspaceId: string, path: string): void {
@@ -3868,7 +4131,27 @@ export default class RolayPlugin extends Plugin {
   }
 
   private hasPendingLocalDelete(workspaceId: string, path: string): boolean {
-    return this.pendingLocalDeletes.has(this.buildPendingRoomPathKey(workspaceId, path));
+    const prefix = `${workspaceId}::`;
+    const normalizedPath = normalizePath(path);
+    const now = Date.now();
+
+    for (const [key, createdAt] of [...this.pendingLocalDeletes.entries()]) {
+      if (now - createdAt > RolayPlugin.PENDING_DELETE_GUARD_MS) {
+        this.pendingLocalDeletes.delete(key);
+        continue;
+      }
+
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+
+      const pendingPath = key.slice(prefix.length);
+      if (normalizedPath === pendingPath || normalizedPath.startsWith(`${pendingPath}/`)) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private clearPendingRoomPathsForWorkspace(workspaceId: string): void {
@@ -3879,7 +4162,7 @@ export default class RolayPlugin extends Plugin {
       }
     }
 
-    for (const key of [...this.pendingLocalDeletes]) {
+    for (const key of [...this.pendingLocalDeletes.keys()]) {
       if (key.startsWith(prefix)) {
         this.pendingLocalDeletes.delete(key);
       }
@@ -3919,6 +4202,27 @@ export default class RolayPlugin extends Plugin {
       }
 
       this.clearPendingLocalCreate(workspaceId, entry.path);
+    }
+  }
+
+  private confirmSnapshotPendingDeletes(workspaceId: string, entries: FileEntry[]): void {
+    const prefix = `${workspaceId}::`;
+    const activePaths = entries
+      .filter((entry) => !entry.deleted)
+      .map((entry) => normalizePath(entry.path));
+
+    for (const key of [...this.pendingLocalDeletes.keys()]) {
+      if (!key.startsWith(prefix)) {
+        continue;
+      }
+
+      const pendingPath = key.slice(prefix.length);
+      const stillActive = activePaths.some((activePath) => {
+        return activePath === pendingPath || activePath.startsWith(`${pendingPath}/`);
+      });
+      if (!stillActive) {
+        this.pendingLocalDeletes.delete(key);
+      }
     }
   }
 
@@ -5347,6 +5651,8 @@ export default class RolayPlugin extends Plugin {
     runtime.markdownBootstrap.completedTargets = 0;
     runtime.markdownBootstrap.totalBytes = 0;
     runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.documentBytesByEntryId.clear();
+    runtime.markdownBootstrap.completedEntryIds.clear();
     runtime.markdownBootstrap.hydratedTargets = 0;
     runtime.markdownBootstrap.lastError = null;
     this.scheduleExplorerLoadingDecorations();
@@ -5392,6 +5698,8 @@ export default class RolayPlugin extends Plugin {
     runtime.markdownBootstrap.completedTargets = 0;
     runtime.markdownBootstrap.totalBytes = 0;
     runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.documentBytesByEntryId.clear();
+    runtime.markdownBootstrap.completedEntryIds.clear();
     runtime.markdownBootstrap.hydratedTargets = 0;
     runtime.markdownBootstrap.lastRunAt = new Date().toISOString();
     runtime.markdownBootstrap.lastError = null;
@@ -5424,6 +5732,12 @@ export default class RolayPlugin extends Plugin {
       const metadataByEntryId = new Map(
         metadataResponse.documents.map((document) => [document.entryId, document])
       );
+      for (const document of metadataResponse.documents) {
+        runtime.markdownBootstrap.documentBytesByEntryId.set(
+          document.entryId,
+          Math.max(0, document.encodedBytes)
+        );
+      }
       const knownEntries = markdownEntries.filter((entry) => metadataByEntryId.has(entry.id));
       const metadataMissingCount = markdownEntries.length - knownEntries.length;
       runtime.markdownBootstrap.totalTargets = metadataResponse.documentCount > 0
@@ -5497,6 +5811,7 @@ export default class RolayPlugin extends Plugin {
             0,
             document.encodedBytes ?? metadataDocument.encodedBytes
           );
+          runtime.markdownBootstrap.completedEntryIds.add(entry.id);
 
           if (activeFilePath && localPath === activeFilePath) {
             await this.bindActiveMarkdownToCrdt();
@@ -5538,7 +5853,19 @@ export default class RolayPlugin extends Plugin {
         return;
       }
 
-      const message = error instanceof Error ? error.message : String(error);
+      const message = getErrorMessage(error);
+      if (isStaleMarkdownBootstrapError(error)) {
+        runtime.markdownBootstrap.lastError = null;
+        runtime.markdownBootstrap.status = "idle";
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] HTTP markdown bootstrap saw a stale markdown entry; refreshing snapshot before retry.`
+        );
+        this.scheduleSnapshotRefresh(workspaceId, "markdown-bootstrap-stale-entry");
+        this.updateStatusBar();
+        return;
+      }
+
       runtime.markdownBootstrap.lastError = message;
       runtime.markdownBootstrap.status = "error";
       this.recordLog(
@@ -7178,10 +7505,9 @@ export default class RolayPlugin extends Plugin {
         this.clearPersistedBinaryCacheEntry(entry.id);
       }
     } catch (error) {
+      this.clearPendingLocalDelete(workspaceId, entry.path);
       this.scheduleSnapshotRefresh(workspaceId, "delete-recovery");
       throw error;
-    } finally {
-      this.clearPendingLocalDelete(workspaceId, entry.path);
     }
   }
 
@@ -7802,6 +8128,29 @@ function formatBlobHashMismatchDetails(error: unknown): string | null {
   return parts.join(", ");
 }
 
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function isStaleMarkdownBootstrapError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  return message.includes("markdown entry not found");
+}
+
+function isRetryableBackgroundMarkdownError(error: unknown): boolean {
+  if (error instanceof RolayApiError && [408, 429, 500, 502, 503, 504].includes(error.status)) {
+    return true;
+  }
+
+  const message = getErrorMessage(error);
+  return (
+    message.includes("ERR_CONTENT_LENGTH_MISMATCH") ||
+    message.includes("ERR_NETWORK_IO_SUSPENDED") ||
+    message.includes("Failed to fetch") ||
+    message.includes("NetworkError")
+  );
+}
+
 function clampTransferBytes(value: number, totalBytes: number): number {
   if (!Number.isFinite(value) || value <= 0) {
     return 0;
@@ -7848,6 +8197,120 @@ function compareCrdtCacheEntries(left: RolayCrdtCacheEntry, right: RolayCrdtCach
 function formatPersistentLogLine(entry: RolayLogEntry): string {
   const sanitizedMessage = entry.message.replace(/\r?\n/g, " ");
   return `[${entry.at}] ${entry.scope}/${entry.level}: ${sanitizedMessage}\n`;
+}
+
+function trimRecentLogEntries(
+  entries: RolayLogEntry[],
+  nowMs: number,
+  retentionMs: number,
+  maxEntries: number
+): RolayLogEntry[] {
+  const cutoffMs = nowMs - retentionMs;
+  return entries
+    .filter((entry) => {
+      const timestampMs = Date.parse(entry.at);
+      return Number.isFinite(timestampMs) && timestampMs >= cutoffMs;
+    })
+    .slice(-maxEntries);
+}
+
+function trimPersistentLogByAge(contents: string, retentionMs: number, nowMs: number): string {
+  if (!contents) {
+    return contents;
+  }
+
+  const cutoffMs = nowMs - retentionMs;
+  const lines = splitPersistentLogLines(contents);
+  const keptLines: string[] = [];
+  let droppedLineCount = 0;
+
+  for (const line of lines) {
+    const timestampMs = parsePersistentLogTimestampMs(line);
+    if (timestampMs === null) {
+      if (line.includes("trimmed older Rolay log lines")) {
+        droppedLineCount += 1;
+        continue;
+      }
+
+      keptLines.push(line);
+      continue;
+    }
+
+    if (timestampMs >= cutoffMs) {
+      keptLines.push(line);
+    } else {
+      droppedLineCount += 1;
+    }
+  }
+
+  if (droppedLineCount === 0) {
+    return contents;
+  }
+
+  const retentionHours = Math.round(retentionMs / (60 * 60 * 1000));
+  return (
+    formatPersistentLogTrimLine(
+      nowMs,
+      `Trimmed ${droppedLineCount} Rolay log line(s) older than ${retentionHours} hours.`
+    ) + keptLines.join("")
+  );
+}
+
+function trimPersistentLogBySize(contents: string, maxBytes: number, targetBytes: number, nowMs: number): string {
+  if (!contents || getTextByteLength(contents) <= maxBytes) {
+    return contents;
+  }
+
+  const marker = formatPersistentLogTrimLine(
+    nowMs,
+    `Trimmed persistent Rolay log to the newest ${formatByteCount(targetBytes)} because it exceeded ${formatByteCount(
+      maxBytes
+    )}.`
+  );
+  const lines = splitPersistentLogLines(contents);
+  const keptLines: string[] = [];
+  let keptBytes = getTextByteLength(marker);
+
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index];
+    const lineBytes = getTextByteLength(line);
+    if (keptBytes + lineBytes > targetBytes && keptLines.length > 0) {
+      break;
+    }
+
+    if (keptBytes + lineBytes <= targetBytes) {
+      keptLines.push(line);
+      keptBytes += lineBytes;
+    }
+  }
+
+  if (keptLines.length === 0) {
+    return marker;
+  }
+
+  return marker + keptLines.reverse().join("");
+}
+
+function splitPersistentLogLines(contents: string): string[] {
+  return contents.match(/[^\r\n]*(?:\r?\n|$)/g)?.filter((line) => line.length > 0) ?? [];
+}
+
+function parsePersistentLogTimestampMs(line: string): number | null {
+  const match = /^\[([^\]]+)\]/.exec(line);
+  if (!match) {
+    return null;
+  }
+
+  const timestampMs = Date.parse(match[1]);
+  return Number.isFinite(timestampMs) ? timestampMs : null;
+}
+
+function formatPersistentLogTrimLine(nowMs: number, message: string): string {
+  return `[${new Date(nowMs).toISOString()}] plugin/info: ${message}\n`;
+}
+
+function getTextByteLength(text: string): number {
+  return new TextEncoder().encode(text).byteLength;
 }
 
 function getFileName(path: string): string {

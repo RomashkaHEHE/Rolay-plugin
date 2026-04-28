@@ -7,6 +7,8 @@ This file is a fast triage guide for common runtime failures.
 - `.obsidian/plugins/rolay/data.json`
 - `.obsidian/plugins/rolay/rolay-sync.log`
 
+`rolay-sync.log` is intentionally short-lived: the plugin removes lines older than 48 hours and also caps the file to a compact recent tail when tracing is noisy.
+
 Those two files usually tell you:
 
 - whether persisted state is correct
@@ -97,7 +99,7 @@ Check:
 Useful expectation:
 
 - a remote binary placeholder should immediately count as `loading` in the explorer
-- explorer transfer percent badges should come from `binaryTransferState` or from a placeholder-derived `0%` download badge
+- any red downloading/protected explorer path or yellow uploading path should have a `0-100%` badge. Active binary transfers use byte progress, remote placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll child progress up.
 
 ### Binary transfer restarts from zero after app restart
 
