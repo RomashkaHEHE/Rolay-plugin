@@ -13443,6 +13443,9 @@ var CrdtSessionManager = class {
     }
     return this.activeSession.getState();
   }
+  getLocalNotePresenceViewer() {
+    return this.activeSession?.getLocalNotePresenceViewer() ?? null;
+  }
   async seedRemoteMarkdown(entry, localText, contextLabel = entry.path) {
     if (!localText) {
       return;
@@ -13702,6 +13705,24 @@ var BoundCrdtSession = class {
       status: this.status
     };
   }
+  getLocalNotePresenceViewer() {
+    if (this.status === "idle" || this.status === "offline") {
+      return null;
+    }
+    const activeView = this.app.workspace.getActiveViewOfType(import_obsidian5.MarkdownView);
+    if (!activeView?.file || activeView.file.path !== this.file.path) {
+      return null;
+    }
+    return {
+      presenceId: `presence:${this.workspaceId}:${this.entry.id}:${this.yDocument.clientID}`,
+      workspaceId: this.workspaceId,
+      entryId: this.entry.id,
+      userId: this.awarenessUser.userId,
+      displayName: this.awarenessUser.displayName,
+      color: this.awarenessUser.color,
+      hasSelection: this.hasLocalTextSelection()
+    };
+  }
   async destroy() {
     this.clearLocalPresence();
     this.clearRemotePresence();
@@ -13800,6 +13821,13 @@ var BoundCrdtSession = class {
     }
     this.provider.setAwarenessField("viewer", null);
     this.clearLocalSelectionPresence();
+  }
+  hasLocalTextSelection() {
+    if (!this.lastLocalSelectionKey) {
+      return false;
+    }
+    const [anchor, head] = this.lastLocalSelectionKey.split(":").map((part) => Number(part));
+    return Number.isFinite(anchor) && Number.isFinite(head) && anchor !== head;
   }
   schedulePersistedState() {
     if (this.persistHandle !== null) {
@@ -16909,6 +16937,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.explorerDecorationHandle = null;
     this.explorerDecorationFrame = null;
     this.explorerToggleRefreshHandle = null;
+    this.explorerMutationObserver = null;
     this.notePresenceUiHandle = null;
     this.roomList = [];
     this.adminRoomList = [];
@@ -17043,8 +17072,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       this.app.workspace.on("layout-change", () => {
         this.scheduleExplorerLoadingDecorations();
         this.scheduleNotePresenceUiRefresh();
+        this.ensureExplorerMutationObserver();
       })
     );
+    this.ensureExplorerMutationObserver();
     this.registerDomEvent(this.app.workspace.containerEl, "click", (event) => {
       if (this.isExplorerFolderInteractionTarget(event.target)) {
         this.refreshExplorerDecorationsAfterFolderToggle();
@@ -17090,6 +17121,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       if (this.explorerToggleRefreshHandle !== null) {
         window.clearTimeout(this.explorerToggleRefreshHandle);
       }
+      this.explorerMutationObserver?.disconnect();
+      this.explorerMutationObserver = null;
       if (this.notePresenceUiHandle !== null) {
         window.clearTimeout(this.notePresenceUiHandle);
       }
@@ -18136,8 +18169,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     runtime.streamStatus = "stopped";
     runtime.lastHandledEventId = runtime.treeStore.getCursor();
     this.updateStatusBar();
-    this.scheduleExplorerLoadingDecorations();
-    this.scheduleNotePresenceUiRefresh();
+    this.scheduleImmediateExplorerLoadingDecorations();
+    this.refreshNotePresenceUiNow();
   }
   stopAllRoomEventStreams() {
     for (const workspaceId of this.roomRuntime.keys()) {
@@ -18193,8 +18226,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     runtime.notePresenceStream = null;
     runtime.notePresenceByEntryId.clear();
     runtime.noteAnonymousViewerCountByEntryId.clear();
-    this.scheduleExplorerLoadingDecorations();
-    this.scheduleNotePresenceUiRefresh();
+    this.scheduleImmediateExplorerLoadingDecorations();
+    this.refreshNotePresenceUiNow();
   }
   startSettingsEventStream(cursor) {
     this.stopSettingsEventStream();
@@ -18448,8 +18481,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
     await this.syncMarkdownLockForLocalPath(file?.path ?? null);
     this.updateStatusBar();
-    this.scheduleNotePresenceUiRefresh();
-    this.scheduleExplorerLoadingDecorations();
+    this.refreshNotePresenceUiNow();
+    this.scheduleImmediateExplorerLoadingDecorations();
   }
   async handleVaultCreate(file) {
     try {
@@ -19104,6 +19137,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       this.refreshExplorerLoadingDecorations();
     });
   }
+  refreshNotePresenceUiNow() {
+    if (this.notePresenceUiHandle !== null) {
+      window.clearTimeout(this.notePresenceUiHandle);
+      this.notePresenceUiHandle = null;
+    }
+    this.refreshNotePresenceUi();
+  }
   refreshExplorerDecorationsAfterFolderToggle() {
     this.scheduleImmediateExplorerLoadingDecorations();
     if (this.explorerToggleRefreshHandle !== null) {
@@ -19113,6 +19153,27 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       this.explorerToggleRefreshHandle = null;
       this.scheduleImmediateExplorerLoadingDecorations();
     }, 32);
+  }
+  ensureExplorerMutationObserver() {
+    if (this.explorerMutationObserver || typeof MutationObserver === "undefined") {
+      return;
+    }
+    const container = this.app.workspace.containerEl;
+    if (!container) {
+      return;
+    }
+    this.explorerMutationObserver = new MutationObserver((mutations) => {
+      if (this.shouldRefreshExplorerDecorationsForMutations(mutations)) {
+        this.refreshExplorerDecorationsAfterFolderToggle();
+      }
+    });
+    this.explorerMutationObserver.observe(container, {
+      subtree: true,
+      childList: true,
+      attributes: true,
+      attributeFilter: ["class", "aria-expanded", "style"],
+      attributeOldValue: true
+    });
   }
   scheduleNotePresenceUiRefresh() {
     if (this.notePresenceUiHandle !== null) {
@@ -19276,10 +19337,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         continue;
       }
       const roomRoot = (0, import_obsidian9.normalizePath)(getRoomRoot(this.data.settings.syncRoot, downloadedRoom.folderName));
+      let localPresenceRolledUp = false;
       for (const [entryId, viewers] of runtime.notePresenceByEntryId.entries()) {
-        if (viewers.length === 0) {
+        const effectiveViewers = this.mergeLocalNotePresenceViewer(workspaceId, entryId, viewers);
+        if (effectiveViewers.length === 0) {
           continue;
         }
+        localPresenceRolledUp || (localPresenceRolledUp = this.isLocalNotePresenceForEntry(workspaceId, entryId));
         const entry = runtime.treeStore.getEntryById(entryId);
         if (!entry || entry.deleted || entry.kind !== "markdown") {
           continue;
@@ -19292,8 +19356,20 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         this.accumulateExplorerNotePresenceBadge(
           aggregate,
           this.getMinimalVisibleExplorerPresencePath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
-          viewers
+          effectiveViewers
         );
+      }
+      const localPresence = this.crdtManager.getLocalNotePresenceViewer();
+      if (localPresence && localPresence.workspaceId === workspaceId && !localPresenceRolledUp && !runtime.notePresenceByEntryId.has(localPresence.entryId)) {
+        const entry = runtime.treeStore.getEntryById(localPresence.entryId);
+        const localPath = entry && !entry.deleted && entry.kind === "markdown" ? this.fileBridge.toLocalPath(workspaceId, entry.path) : null;
+        if (localPath) {
+          this.accumulateExplorerNotePresenceBadge(
+            aggregate,
+            this.getMinimalVisibleExplorerPresencePath((0, import_obsidian9.normalizePath)(localPath), roomRoot, visibleExplorerPaths),
+            [localPresence]
+          );
+        }
       }
     }
     const badges = /* @__PURE__ */ new Map();
@@ -19352,6 +19428,32 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   accumulateExplorerAnonymousPresenceBadge(aggregate, localPath, anonymousViewerCount) {
     aggregate.set(localPath, (aggregate.get(localPath) ?? 0) + anonymousViewerCount);
   }
+  mergeLocalNotePresenceViewer(workspaceId, entryId, viewers) {
+    const merged = [...viewers];
+    const localPresence = this.crdtManager.getLocalNotePresenceViewer();
+    if (!localPresence || localPresence.workspaceId !== workspaceId || localPresence.entryId !== entryId) {
+      return merged;
+    }
+    if (merged.some((viewer) => this.isSamePresenceViewer(viewer, localPresence))) {
+      return merged;
+    }
+    merged.push(localPresence);
+    merged.sort(compareNotePresenceViewers);
+    return merged;
+  }
+  isLocalNotePresenceForEntry(workspaceId, entryId) {
+    const localPresence = this.crdtManager.getLocalNotePresenceViewer();
+    return Boolean(localPresence && localPresence.workspaceId === workspaceId && localPresence.entryId === entryId);
+  }
+  isSamePresenceViewer(viewer, localPresence) {
+    if (viewer.presenceId === localPresence.presenceId) {
+      return true;
+    }
+    const localClientId = localPresence.presenceId.split(":").pop();
+    return Boolean(
+      localClientId && viewer.userId === localPresence.userId && viewer.presenceId.endsWith(`:${localClientId}`)
+    );
+  }
   getVisibleExplorerPathSet(pathElements) {
     const visiblePaths = /* @__PURE__ */ new Set();
     for (const element2 of pathElements) {
@@ -19388,6 +19490,63 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   isElementVisiblyRendered(element2) {
     return element2.getClientRects().length > 0;
+  }
+  shouldRefreshExplorerDecorationsForMutations(mutations) {
+    for (const mutation of mutations) {
+      if (mutation.type === "attributes") {
+        const target2 = mutation.target;
+        if (!(target2 instanceof HTMLElement) || !this.isExplorerDecorationElement(target2)) {
+          continue;
+        }
+        if (mutation.attributeName === "class") {
+          const previousClass = this.stripRolayDecorationClasses(mutation.oldValue ?? "");
+          const currentClass = this.stripRolayDecorationClasses(target2.className);
+          if (previousClass === currentClass) {
+            continue;
+          }
+        }
+        return true;
+      }
+      if (mutation.type !== "childList") {
+        continue;
+      }
+      const target = mutation.target;
+      if (!(target instanceof HTMLElement) || !this.isExplorerDecorationElement(target)) {
+        continue;
+      }
+      const changedNodes = [...mutation.addedNodes, ...mutation.removedNodes];
+      if (changedNodes.length === 0 || changedNodes.every((node) => this.isRolayDecorationNode(node))) {
+        continue;
+      }
+      if (changedNodes.some((node) => this.isExplorerStructureNode(node))) {
+        return true;
+      }
+    }
+    return false;
+  }
+  stripRolayDecorationClasses(className) {
+    return className.split(/\s+/).filter((classToken) => classToken && !classToken.startsWith("rolay-")).sort().join(" ");
+  }
+  isRolayDecorationNode(node) {
+    if (!(node instanceof HTMLElement)) {
+      return false;
+    }
+    return this.isRolayDecorationElement(node);
+  }
+  isRolayDecorationElement(element2) {
+    return Boolean(
+      element2.closest(
+        ".rolay-note-presence-badge, .rolay-note-anonymous-presence-badge, .rolay-transfer-progress-badge"
+      ) || [...element2.classList].some((className) => className.startsWith("rolay-"))
+    );
+  }
+  isExplorerStructureNode(node) {
+    if (!(node instanceof HTMLElement)) {
+      return false;
+    }
+    return Boolean(
+      node.matches?.("[data-path], .nav-file, .nav-folder, .nav-file-title, .nav-folder-title, .tree-item-self") || node.querySelector?.("[data-path], .nav-file, .nav-folder, .nav-file-title, .nav-folder-title, .tree-item-self")
+    );
   }
   isExplorerFolderInteractionTarget(target) {
     if (!(target instanceof HTMLElement)) {
@@ -19776,7 +19935,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
     const viewers = runtime.notePresenceByEntryId.get(entryId) ?? [];
     return {
-      viewers: [...viewers],
+      viewers: this.mergeLocalNotePresenceViewer(workspaceId, entryId, viewers),
       anonymousViewerCount: runtime.noteAnonymousViewerCountByEntryId.get(entryId) ?? 0
     };
   }

@@ -78,7 +78,8 @@ Check:
    - `renderNotePresenceChipsForView`
    - `getExplorerNotePresenceBadges`
    - minimal-visible-parent explorer aggregation logic for note presence
-   - immediate explorer folder interaction refresh for expand/collapse state
+   - optimistic local self-viewer merge for the active note
+   - immediate explorer folder interaction refresh and mutation-observer refresh for expand/collapse state
 4. [src/realtime/crdt-session.ts](../src/realtime/crdt-session.ts):
    - `publishLocalViewerPresence`
    - `clearLocalPresence`
@@ -87,6 +88,7 @@ Check:
 Useful expectation:
 
 - expanding or collapsing a folder should move presence/anonymous/transfer badges to the new minimal visible parent on the next animation frame, not after the slower sync debounce
+- opening a room markdown note should show the current user immediately, even before the room-level note-presence SSE echoes the local awareness state
 
 ### Binary file path appears but bytes do not
 

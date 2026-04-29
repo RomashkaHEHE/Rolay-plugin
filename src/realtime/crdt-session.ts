@@ -10,7 +10,7 @@ import {
   type SharedCursorPresence
 } from "./shared-presence";
 import { applyTextPatchToEditor, diffText } from "../utils/text-diff";
-import type { FileEntry, User } from "../types/protocol";
+import type { FileEntry, NotePresenceViewer, User } from "../types/protocol";
 
 const LOCAL_EDITOR_ORIGIN = "rolay-local-editor";
 
@@ -19,6 +19,11 @@ export interface CrdtSessionState {
   filePath: string;
   docId: string;
   status: "idle" | "connecting" | "synced" | "offline";
+}
+
+export interface LocalNotePresenceViewer extends NotePresenceViewer {
+  workspaceId: string;
+  entryId: string;
 }
 
 interface CrdtSessionManagerConfig {
@@ -207,6 +212,10 @@ export class CrdtSessionManager {
     }
 
     return this.activeSession.getState();
+  }
+
+  getLocalNotePresenceViewer(): LocalNotePresenceViewer | null {
+    return this.activeSession?.getLocalNotePresenceViewer() ?? null;
   }
 
   async seedRemoteMarkdown(entry: FileEntry, localText: string, contextLabel = entry.path): Promise<void> {
@@ -557,6 +566,27 @@ class BoundCrdtSession {
     };
   }
 
+  getLocalNotePresenceViewer(): LocalNotePresenceViewer | null {
+    if (this.status === "idle" || this.status === "offline") {
+      return null;
+    }
+
+    const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+    if (!activeView?.file || activeView.file.path !== this.file.path) {
+      return null;
+    }
+
+    return {
+      presenceId: `presence:${this.workspaceId}:${this.entry.id}:${this.yDocument.clientID}`,
+      workspaceId: this.workspaceId,
+      entryId: this.entry.id,
+      userId: this.awarenessUser.userId,
+      displayName: this.awarenessUser.displayName,
+      color: this.awarenessUser.color,
+      hasSelection: this.hasLocalTextSelection()
+    };
+  }
+
   async destroy(): Promise<void> {
     this.clearLocalPresence();
     this.clearRemotePresence();
@@ -676,6 +706,15 @@ class BoundCrdtSession {
 
     this.provider.setAwarenessField("viewer", null);
     this.clearLocalSelectionPresence();
+  }
+
+  private hasLocalTextSelection(): boolean {
+    if (!this.lastLocalSelectionKey) {
+      return false;
+    }
+
+    const [anchor, head] = this.lastLocalSelectionKey.split(":").map((part) => Number(part));
+    return Number.isFinite(anchor) && Number.isFinite(head) && anchor !== head;
   }
 
   private schedulePersistedState(): void {
