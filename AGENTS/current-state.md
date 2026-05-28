@@ -4,7 +4,7 @@ Last updated: 2026-05-29
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.14`
+- Plugin version: `1.2.16`
 - Latest notable commit in recent history before this AGENTS layer: `1a8c272` `Document presence and cursor sync behavior`
 
 ## Current Priorities
@@ -29,7 +29,7 @@ These should be treated as high-confidence truths unless code/docs are intention
 - The active local markdown note also gets an optimistic self-viewer overlay. Viewer chips/explorer badges must not wait for the server SSE echo to show the current user, especially when only anonymous public viewers are present.
 - Explorer presence badges use minimal-visible-parent aggregation: a note shows its own badge when visible, otherwise the badge rolls up only to the deepest visible collapsed parent inside the room root. Anonymous public viewers remain separate gray eye indicators and follow the same roll-up rule.
 - Explorer folder expand/collapse interactions must refresh presence/transfer decorations immediately. Use both interaction hooks and the file-explorer DOM mutation observer; do not rely only on the slower general decoration debounce for visible-parent recalculation.
-- Red downloading/protected explorer paths and yellow uploading paths should always show a `0-100%` badge. Binary transfers use byte progress, remote placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll up current bootstrap progress across the whole markdown target set, not only the files still locked.
+- Red downloading/protected explorer paths and yellow uploading paths should always show a `0-100%` badge. Binary transfers use byte progress, remote placeholders start at `0%`, and markdown locks use bootstrap metadata/cache state. Explorer transfer badges use the same minimal-visible-parent roll-up model as note presence: visible files show their own progress, collapsed parents aggregate hidden children, and expanded ancestors should not stay red/yellow just because a descendant is active. Do not hide badges merely because progress is `100%`; visibility should be driven by whether there is still an active transfer/protection/install phase.
 - Room-wide markdown preload requires a large persistent CRDT cache. Do not lower `MAX_PERSISTED_CRDT_DOCS` back to tiny LRU values: downloaded notes will be pruned from `data.json`, then flicker red/normal and retrigger bootstrap loops even though the room was already downloaded.
 - Local delete operations keep a short pending-delete guard so stale snapshots cannot resurrect files while multi-file delete operations are still settling.
 - Bulk duplicate cleanup must stay possible even while markdown preload/locked-state is stale. Remote/suppressed delete echoes and already-pending deletes must be ignored before protected-markdown delete restoration, and safe `entryVersion=0` suffix-copy markdown duplicates may bypass the locked-delete restore so their `delete_entry` can reach the server.
@@ -108,6 +108,7 @@ These are important because future regressions will often land in these areas:
 - Fixed markdown explorer folder percentages so completed bootstrap documents keep contributing to parent progress until the active preload finishes
 - Hardened bulk duplicate deletion against protected-markdown restore races and longer stale-snapshot windows
 - Added client/version headers on authenticated API, blob, and SSE traffic for stale-client diagnostics/enforcement
+- Switched explorer transfer progress to minimal-visible-parent roll-up so expanded folders do not keep noisy/stale red percentage badges when their visible children are already normal; completed markdown siblings contribute to a collapsed folder percentage only when the same folder still contains active incomplete work
 
 ## First Places To Look By Task Type
 

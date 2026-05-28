@@ -19261,12 +19261,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     if (!container) {
       return;
     }
-    const loadingPaths = this.getLoadingExplorerPaths();
-    const uploadingPaths = this.getUploadingExplorerPaths();
     const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
     const pathElements = [...container.querySelectorAll("[data-path]")];
     const visibleExplorerPaths = this.getVisibleExplorerPathSet(pathElements);
-    const transferBadges = this.getExplorerTransferBadges();
+    const transferBadges = this.getExplorerTransferBadges(visibleExplorerPaths);
     const notePresenceBadges = this.getExplorerNotePresenceBadges(visibleExplorerPaths);
     const anonymousPresenceBadges = this.getExplorerAnonymousPresenceBadges(visibleExplorerPaths);
     for (const element2 of pathElements) {
@@ -19285,26 +19283,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         continue;
       }
       const normalizedPath = (0, import_obsidian9.normalizePath)(dataPath);
-      const exactMatch = loadingPaths.has(normalizedPath);
-      const descendantMatch = !exactMatch && [...loadingPaths].some((loadingPath) => {
-        return loadingPath.startsWith(`${normalizedPath}/`);
-      });
-      const exactUploadingMatch = uploadingPaths.has(normalizedPath);
-      const descendantUploadingMatch = !exactUploadingMatch && [...uploadingPaths].some((uploadingPath) => {
-        return uploadingPath.startsWith(`${normalizedPath}/`);
-      });
       const roomFolderStatus = roomFolderStatuses.get(normalizedPath) ?? null;
-      if (exactMatch || descendantMatch) {
+      const transferBadge = transferBadges.get(normalizedPath) ?? null;
+      if (transferBadge?.kind === "download") {
         element2.classList.add("rolay-loading-path");
       }
-      if (descendantMatch) {
-        element2.classList.add("rolay-loading-ancestor");
-      }
-      if (exactUploadingMatch || descendantUploadingMatch) {
+      if (transferBadge?.kind === "upload") {
         element2.classList.add("rolay-uploading-path");
-      }
-      if (descendantUploadingMatch) {
-        element2.classList.add("rolay-uploading-ancestor");
       }
       if (roomFolderStatus) {
         element2.classList.add("rolay-room-folder");
@@ -19318,7 +19303,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       }
       this.updateExplorerTransferBadge(
         element2,
-        transferBadges.get(normalizedPath) ?? null
+        transferBadge
       );
       this.updateExplorerNotePresenceBadge(
         element2,
@@ -19418,7 +19403,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
         this.accumulateExplorerNotePresenceBadge(
           aggregate,
-          this.getMinimalVisibleExplorerPresencePath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
+          this.getMinimalVisibleExplorerRollupPath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
           effectiveViewers
         );
       }
@@ -19429,7 +19414,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         if (localPath) {
           this.accumulateExplorerNotePresenceBadge(
             aggregate,
-            this.getMinimalVisibleExplorerPresencePath((0, import_obsidian9.normalizePath)(localPath), roomRoot, visibleExplorerPaths),
+            this.getMinimalVisibleExplorerRollupPath((0, import_obsidian9.normalizePath)(localPath), roomRoot, visibleExplorerPaths),
             [localPresence]
           );
         }
@@ -19470,7 +19455,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
         this.accumulateExplorerAnonymousPresenceBadge(
           aggregate,
-          this.getMinimalVisibleExplorerPresencePath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
+          this.getMinimalVisibleExplorerRollupPath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
           anonymousViewerCount
         );
       }
@@ -19528,7 +19513,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
     return visiblePaths;
   }
-  getMinimalVisibleExplorerPresencePath(localPath, roomRoot, visibleExplorerPaths) {
+  getMinimalVisibleExplorerRollupPath(localPath, roomRoot, visibleExplorerPaths) {
     const normalizedRoomRoot = (0, import_obsidian9.normalizePath)(roomRoot);
     let candidate = (0, import_obsidian9.normalizePath)(localPath);
     while (candidate) {
@@ -19674,9 +19659,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       badgeState.count === 1 ? "1 anonymous public viewer" : `${badgeState.count} anonymous public viewers`
     );
   }
-  getExplorerTransferBadges() {
+  getExplorerTransferBadges(visibleExplorerPaths) {
     const aggregate = /* @__PURE__ */ new Map();
     const exactTransferPaths = /* @__PURE__ */ new Set();
+    const markdownBootstrapCoveredPaths = /* @__PURE__ */ new Set();
     for (const transfer of this.binaryTransferState.values()) {
       const activeUpload = transfer.kind === "upload" && (transfer.status === "preparing" || transfer.status === "uploading" || transfer.status === "canceling" || transfer.status === "committing");
       const activeDownload = transfer.kind === "download" && (transfer.status === "preparing" || transfer.status === "downloading");
@@ -19689,7 +19675,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         transfer.localPath,
         transfer.kind,
         Math.max(0, transfer.bytesDone),
-        Math.max(0, transfer.bytesTotal)
+        Math.max(0, transfer.bytesTotal),
+        visibleExplorerPaths
       );
     }
     for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
@@ -19704,16 +19691,23 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         normalizedPath,
         "download",
         0,
-        entry?.blob?.sizeBytes ?? 1
+        entry?.blob?.sizeBytes ?? 1,
+        visibleExplorerPaths
       );
     }
     for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
       if (runtime.markdownBootstrap.status === "loading" && runtime.markdownBootstrap.documentBytesByEntryId.size > 0 && runtime.markdownBootstrap.lockedLocalPaths.size > 0) {
-        this.addMarkdownBootstrapFolderProgress(aggregate, workspaceId, runtime);
+        this.addMarkdownBootstrapVisibleProgress(
+          aggregate,
+          workspaceId,
+          runtime,
+          visibleExplorerPaths,
+          markdownBootstrapCoveredPaths
+        );
       }
       for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
         const normalizedPath = (0, import_obsidian9.normalizePath)(lockedPath);
-        if (this.isExplorerPathUploading(normalizedPath) || exactTransferPaths.has(normalizedPath)) {
+        if (this.isExplorerPathUploading(normalizedPath) || exactTransferPaths.has(normalizedPath) || markdownBootstrapCoveredPaths.has(normalizedPath)) {
           continue;
         }
         const progress = this.getMarkdownLockProgress(workspaceId, normalizedPath);
@@ -19723,7 +19717,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
           "download",
           progress.completedBytes,
           progress.totalBytes,
-          { includeAncestors: runtime.markdownBootstrap.status !== "loading" }
+          visibleExplorerPaths
         );
       }
     }
@@ -19738,7 +19732,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         normalizedPath,
         "upload",
         0,
-        this.getLocalFileSizeOrOne(normalizedPath)
+        this.getLocalFileSizeOrOne(normalizedPath),
+        visibleExplorerPaths
       );
     }
     for (const pendingMerge of Object.values(this.data.pendingMarkdownMerges)) {
@@ -19752,7 +19747,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         normalizedPath,
         "upload",
         0,
-        this.getLocalFileSizeOrOne(normalizedPath)
+        this.getLocalFileSizeOrOne(normalizedPath),
+        visibleExplorerPaths
       );
     }
     for (const pendingWrite of Object.values(this.data.pendingBinaryWrites)) {
@@ -19766,11 +19762,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         normalizedPath,
         "upload",
         0,
-        this.getLocalFileSizeOrOne(normalizedPath)
+        this.getLocalFileSizeOrOne(normalizedPath),
+        visibleExplorerPaths
       );
     }
     return new Map(
-      [...aggregate.entries()].map(([localPath, state]) => [
+      [...aggregate.entries()].filter(([, state]) => state.activeItemCount > 0).map(([localPath, state]) => [
         localPath,
         {
           label: this.formatExplorerTransferAggregatePercentLabel(state),
@@ -19779,31 +19776,23 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       ])
     );
   }
-  addExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes, options = {}) {
+  addExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes, visibleExplorerPaths) {
     const normalizedPath = (0, import_obsidian9.normalizePath)(localPath);
-    const includeExact = options.includeExact ?? true;
-    const includeAncestors = options.includeAncestors ?? true;
-    if (includeExact) {
-      this.mergeExplorerTransferProgress(aggregate, normalizedPath, kind, completedBytes, totalBytes);
-    }
     const room = this.resolveDownloadedRoomByLocalPath(normalizedPath);
-    if (!room || !includeAncestors) {
+    if (!room) {
+      this.mergeExplorerTransferProgress(aggregate, normalizedPath, kind, completedBytes, totalBytes);
       return;
     }
     const roomRoot = (0, import_obsidian9.normalizePath)(getRoomRoot(this.data.settings.syncRoot, room.folderName));
-    let parentPath = getParentPath2(normalizedPath);
-    while (parentPath) {
-      if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
-        break;
-      }
-      this.mergeExplorerTransferProgress(aggregate, parentPath, kind, completedBytes, totalBytes);
-      if (parentPath === roomRoot) {
-        break;
-      }
-      parentPath = getParentPath2(parentPath);
-    }
+    this.mergeExplorerTransferProgress(
+      aggregate,
+      this.getMinimalVisibleExplorerRollupPath(normalizedPath, roomRoot, visibleExplorerPaths),
+      kind,
+      completedBytes,
+      totalBytes
+    );
   }
-  addMarkdownBootstrapFolderProgress(aggregate, workspaceId, runtime) {
+  addMarkdownBootstrapVisibleProgress(aggregate, workspaceId, runtime, visibleExplorerPaths, coveredLocalPaths) {
     const room = this.getDownloadedRooms().find((entry) => entry.workspaceId === workspaceId);
     if (!room) {
       return;
@@ -19815,7 +19804,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         continue;
       }
       const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
-      if (this.isExplorerPathUploading(localPath)) {
+      const normalizedLocalPath = (0, import_obsidian9.normalizePath)(localPath);
+      coveredLocalPaths.add(normalizedLocalPath);
+      if (this.isExplorerPathUploading(normalizedLocalPath)) {
         continue;
       }
       const totalBytes = Math.max(
@@ -19823,30 +19814,25 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         runtime.markdownBootstrap.documentBytesByEntryId.get(entry.id) ?? 1
       );
       const completed = runtime.markdownBootstrap.completedEntryIds.has(entry.id) || this.hasPersistedCrdtCache(entry.id);
-      this.addExplorerTransferAncestorProgress(
-        aggregate,
-        localPath,
+      const targetPath = this.getMinimalVisibleExplorerRollupPath(
+        normalizedLocalPath,
         roomRoot,
+        visibleExplorerPaths
+      );
+      if (completed && targetPath === normalizedLocalPath) {
+        continue;
+      }
+      this.mergeExplorerTransferProgress(
+        aggregate,
+        targetPath,
         "download",
         completed ? totalBytes : 0,
-        totalBytes
+        totalBytes,
+        !completed
       );
     }
   }
-  addExplorerTransferAncestorProgress(aggregate, localPath, roomRoot, kind, completedBytes, totalBytes) {
-    let parentPath = getParentPath2((0, import_obsidian9.normalizePath)(localPath));
-    while (parentPath) {
-      if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
-        break;
-      }
-      this.mergeExplorerTransferProgress(aggregate, parentPath, kind, completedBytes, totalBytes);
-      if (parentPath === roomRoot) {
-        break;
-      }
-      parentPath = getParentPath2(parentPath);
-    }
-  }
-  mergeExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes) {
+  mergeExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes, active = true) {
     const normalizedTotalBytes = Math.max(1, Math.trunc(totalBytes));
     const normalizedCompletedBytes = Math.max(
       0,
@@ -19858,7 +19844,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         kind,
         completedBytes: normalizedCompletedBytes,
         totalBytes: normalizedTotalBytes,
-        itemCount: 1
+        itemCount: 1,
+        activeItemCount: active ? 1 : 0
       });
       return;
     }
@@ -19866,7 +19853,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       kind: existing.kind === "download" || kind === "download" ? "download" : "upload",
       completedBytes: existing.completedBytes + normalizedCompletedBytes,
       totalBytes: existing.totalBytes + normalizedTotalBytes,
-      itemCount: existing.itemCount + 1
+      itemCount: existing.itemCount + 1,
+      activeItemCount: existing.activeItemCount + (active ? 1 : 0)
     });
   }
   formatExplorerTransferAggregatePercentLabel(state) {
@@ -19960,58 +19948,6 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   findExplorerTitleHost(element2) {
     return element2.querySelector(".nav-file-title-content") ?? element2.querySelector(".tree-item-inner");
-  }
-  getLoadingExplorerPaths() {
-    const loadingPaths = /* @__PURE__ */ new Set();
-    const uploadingPaths = this.getUploadingExplorerPaths();
-    for (const runtime of this.roomRuntime.values()) {
-      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
-        if (!uploadingPaths.has(lockedPath)) {
-          loadingPaths.add(lockedPath);
-        }
-      }
-    }
-    for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
-      const normalizedPath = (0, import_obsidian9.normalizePath)(placeholderPath);
-      const transfer = this.binaryTransferState.get(normalizedPath);
-      if (!transfer) {
-        loadingPaths.add(normalizedPath);
-        continue;
-      }
-      if (transfer.kind === "download" && (transfer.status === "preparing" || transfer.status === "downloading")) {
-        loadingPaths.add(normalizedPath);
-      }
-    }
-    for (const transfer of this.binaryTransferState.values()) {
-      if (transfer.kind !== "download") {
-        continue;
-      }
-      if (transfer.status === "preparing" || transfer.status === "downloading") {
-        loadingPaths.add((0, import_obsidian9.normalizePath)(transfer.localPath));
-      }
-    }
-    return loadingPaths;
-  }
-  getUploadingExplorerPaths() {
-    const uploadingPaths = /* @__PURE__ */ new Set();
-    for (const pendingCreate of Object.values(this.data.pendingMarkdownCreates)) {
-      uploadingPaths.add((0, import_obsidian9.normalizePath)(pendingCreate.localPath));
-    }
-    for (const pendingMerge of Object.values(this.data.pendingMarkdownMerges)) {
-      uploadingPaths.add((0, import_obsidian9.normalizePath)(pendingMerge.localPath));
-    }
-    for (const pendingWrite of Object.values(this.data.pendingBinaryWrites)) {
-      uploadingPaths.add((0, import_obsidian9.normalizePath)(pendingWrite.localPath));
-    }
-    for (const transfer of this.binaryTransferState.values()) {
-      if (transfer.kind !== "upload") {
-        continue;
-      }
-      if (transfer.status === "preparing" || transfer.status === "uploading" || transfer.status === "canceling" || transfer.status === "committing") {
-        uploadingPaths.add((0, import_obsidian9.normalizePath)(transfer.localPath));
-      }
-    }
-    return uploadingPaths;
   }
   getRoomFolderExplorerStatuses() {
     const statuses = /* @__PURE__ */ new Map();

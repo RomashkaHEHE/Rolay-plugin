@@ -33,6 +33,13 @@ Explorer decorations are not decorative fluff. They are operational UI:
 - yellow upload state answers "is this still being sent?"
 - room indicators answer "is this room connected?"
 
+Presence and transfer progress should avoid noisy ancestor spam. Use the minimal visible parent rule:
+
+- if the file is visible, show the badge on the file
+- if the file is hidden inside a collapsed folder, roll the badge up to the deepest visible collapsed parent
+- if a folder is expanded, do not keep showing the same child state on that expanded ancestor
+- do not suppress a `100%` badge just because it is `100%`; if work is still active, `100%` can honestly mean "downloaded, now finalizing/applying"
+
 ## Cursor Behavior Intent
 
 Cursor rendering has several goals at once:

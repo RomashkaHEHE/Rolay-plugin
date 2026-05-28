@@ -171,6 +171,7 @@ interface ExplorerTransferBadgeAggregate {
   completedBytes: number;
   totalBytes: number;
   itemCount: number;
+  activeItemCount: number;
 }
 
 export interface RoomCardState {
@@ -2977,12 +2978,10 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
-    const loadingPaths = this.getLoadingExplorerPaths();
-    const uploadingPaths = this.getUploadingExplorerPaths();
     const roomFolderStatuses = this.getRoomFolderExplorerStatuses();
     const pathElements = [...container.querySelectorAll<HTMLElement>("[data-path]")];
     const visibleExplorerPaths = this.getVisibleExplorerPathSet(pathElements);
-    const transferBadges = this.getExplorerTransferBadges();
+    const transferBadges = this.getExplorerTransferBadges(visibleExplorerPaths);
     const notePresenceBadges = this.getExplorerNotePresenceBadges(visibleExplorerPaths);
     const anonymousPresenceBadges = this.getExplorerAnonymousPresenceBadges(visibleExplorerPaths);
 
@@ -3004,30 +3003,15 @@ export default class RolayPlugin extends Plugin {
       }
 
       const normalizedPath = normalizePath(dataPath);
-      const exactMatch = loadingPaths.has(normalizedPath);
-      const descendantMatch = !exactMatch && [...loadingPaths].some((loadingPath) => {
-        return loadingPath.startsWith(`${normalizedPath}/`);
-      });
-      const exactUploadingMatch = uploadingPaths.has(normalizedPath);
-      const descendantUploadingMatch = !exactUploadingMatch && [...uploadingPaths].some((uploadingPath) => {
-        return uploadingPath.startsWith(`${normalizedPath}/`);
-      });
       const roomFolderStatus = roomFolderStatuses.get(normalizedPath) ?? null;
+      const transferBadge = transferBadges.get(normalizedPath) ?? null;
 
-      if (exactMatch || descendantMatch) {
+      if (transferBadge?.kind === "download") {
         element.classList.add("rolay-loading-path");
       }
 
-      if (descendantMatch) {
-        element.classList.add("rolay-loading-ancestor");
-      }
-
-      if (exactUploadingMatch || descendantUploadingMatch) {
+      if (transferBadge?.kind === "upload") {
         element.classList.add("rolay-uploading-path");
-      }
-
-      if (descendantUploadingMatch) {
-        element.classList.add("rolay-uploading-ancestor");
       }
 
       if (roomFolderStatus) {
@@ -3043,7 +3027,7 @@ export default class RolayPlugin extends Plugin {
 
       this.updateExplorerTransferBadge(
         element,
-        transferBadges.get(normalizedPath) ?? null
+        transferBadge
       );
       this.updateExplorerNotePresenceBadge(
         element,
@@ -3170,7 +3154,7 @@ export default class RolayPlugin extends Plugin {
         const normalizedLocalPath = normalizePath(localPath);
         this.accumulateExplorerNotePresenceBadge(
           aggregate,
-          this.getMinimalVisibleExplorerPresencePath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
+          this.getMinimalVisibleExplorerRollupPath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
           effectiveViewers
         );
       }
@@ -3189,7 +3173,7 @@ export default class RolayPlugin extends Plugin {
         if (localPath) {
           this.accumulateExplorerNotePresenceBadge(
             aggregate,
-            this.getMinimalVisibleExplorerPresencePath(normalizePath(localPath), roomRoot, visibleExplorerPaths),
+            this.getMinimalVisibleExplorerRollupPath(normalizePath(localPath), roomRoot, visibleExplorerPaths),
             [localPresence]
           );
         }
@@ -3242,7 +3226,7 @@ export default class RolayPlugin extends Plugin {
         const normalizedLocalPath = normalizePath(localPath);
         this.accumulateExplorerAnonymousPresenceBadge(
           aggregate,
-          this.getMinimalVisibleExplorerPresencePath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
+          this.getMinimalVisibleExplorerRollupPath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
           anonymousViewerCount
         );
       }
@@ -3331,7 +3315,7 @@ export default class RolayPlugin extends Plugin {
     return visiblePaths;
   }
 
-  private getMinimalVisibleExplorerPresencePath(
+  private getMinimalVisibleExplorerRollupPath(
     localPath: string,
     roomRoot: string,
     visibleExplorerPaths: Set<string>
@@ -3540,9 +3524,12 @@ export default class RolayPlugin extends Plugin {
     );
   }
 
-  private getExplorerTransferBadges(): Map<string, ExplorerTransferBadgeState> {
+  private getExplorerTransferBadges(
+    visibleExplorerPaths: Set<string>
+  ): Map<string, ExplorerTransferBadgeState> {
     const aggregate = new Map<string, ExplorerTransferBadgeAggregate>();
     const exactTransferPaths = new Set<string>();
+    const markdownBootstrapCoveredPaths = new Set<string>();
 
     for (const transfer of this.binaryTransferState.values()) {
       const activeUpload =
@@ -3567,7 +3554,8 @@ export default class RolayPlugin extends Plugin {
         transfer.localPath,
         transfer.kind,
         Math.max(0, transfer.bytesDone),
-        Math.max(0, transfer.bytesTotal)
+        Math.max(0, transfer.bytesTotal),
+        visibleExplorerPaths
       );
     }
 
@@ -3588,7 +3576,8 @@ export default class RolayPlugin extends Plugin {
         normalizedPath,
         "download",
         0,
-        entry?.blob?.sizeBytes ?? 1
+        entry?.blob?.sizeBytes ?? 1,
+        visibleExplorerPaths
       );
     }
 
@@ -3598,12 +3587,22 @@ export default class RolayPlugin extends Plugin {
         runtime.markdownBootstrap.documentBytesByEntryId.size > 0 &&
         runtime.markdownBootstrap.lockedLocalPaths.size > 0
       ) {
-        this.addMarkdownBootstrapFolderProgress(aggregate, workspaceId, runtime);
+        this.addMarkdownBootstrapVisibleProgress(
+          aggregate,
+          workspaceId,
+          runtime,
+          visibleExplorerPaths,
+          markdownBootstrapCoveredPaths
+        );
       }
 
       for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
         const normalizedPath = normalizePath(lockedPath);
-        if (this.isExplorerPathUploading(normalizedPath) || exactTransferPaths.has(normalizedPath)) {
+        if (
+          this.isExplorerPathUploading(normalizedPath) ||
+          exactTransferPaths.has(normalizedPath) ||
+          markdownBootstrapCoveredPaths.has(normalizedPath)
+        ) {
           continue;
         }
 
@@ -3614,7 +3613,7 @@ export default class RolayPlugin extends Plugin {
           "download",
           progress.completedBytes,
           progress.totalBytes,
-          { includeAncestors: runtime.markdownBootstrap.status !== "loading" }
+          visibleExplorerPaths
         );
       }
     }
@@ -3631,7 +3630,8 @@ export default class RolayPlugin extends Plugin {
         normalizedPath,
         "upload",
         0,
-        this.getLocalFileSizeOrOne(normalizedPath)
+        this.getLocalFileSizeOrOne(normalizedPath),
+        visibleExplorerPaths
       );
     }
 
@@ -3647,7 +3647,8 @@ export default class RolayPlugin extends Plugin {
         normalizedPath,
         "upload",
         0,
-        this.getLocalFileSizeOrOne(normalizedPath)
+        this.getLocalFileSizeOrOne(normalizedPath),
+        visibleExplorerPaths
       );
     }
 
@@ -3663,18 +3664,21 @@ export default class RolayPlugin extends Plugin {
         normalizedPath,
         "upload",
         0,
-        this.getLocalFileSizeOrOne(normalizedPath)
+        this.getLocalFileSizeOrOne(normalizedPath),
+        visibleExplorerPaths
       );
     }
 
     return new Map(
-      [...aggregate.entries()].map(([localPath, state]) => [
-        localPath,
-        {
-          label: this.formatExplorerTransferAggregatePercentLabel(state),
-          kind: state.kind
-        }
-      ] as const)
+      [...aggregate.entries()]
+        .filter(([, state]) => state.activeItemCount > 0)
+        .map(([localPath, state]) => [
+          localPath,
+          {
+            label: this.formatExplorerTransferAggregatePercentLabel(state),
+            kind: state.kind
+          }
+        ] as const)
     );
   }
 
@@ -3684,40 +3688,31 @@ export default class RolayPlugin extends Plugin {
     kind: BinaryTransferKind,
     completedBytes: number,
     totalBytes: number,
-    options: { includeExact?: boolean; includeAncestors?: boolean } = {}
+    visibleExplorerPaths: Set<string>
   ): void {
     const normalizedPath = normalizePath(localPath);
-    const includeExact = options.includeExact ?? true;
-    const includeAncestors = options.includeAncestors ?? true;
-    if (includeExact) {
-      this.mergeExplorerTransferProgress(aggregate, normalizedPath, kind, completedBytes, totalBytes);
-    }
-
     const room = this.resolveDownloadedRoomByLocalPath(normalizedPath);
-    if (!room || !includeAncestors) {
+    if (!room) {
+      this.mergeExplorerTransferProgress(aggregate, normalizedPath, kind, completedBytes, totalBytes);
       return;
     }
 
     const roomRoot = normalizePath(getRoomRoot(this.data.settings.syncRoot, room.folderName));
-    let parentPath = getParentPath(normalizedPath);
-    while (parentPath) {
-      if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
-        break;
-      }
-
-      this.mergeExplorerTransferProgress(aggregate, parentPath, kind, completedBytes, totalBytes);
-      if (parentPath === roomRoot) {
-        break;
-      }
-
-      parentPath = getParentPath(parentPath);
-    }
+    this.mergeExplorerTransferProgress(
+      aggregate,
+      this.getMinimalVisibleExplorerRollupPath(normalizedPath, roomRoot, visibleExplorerPaths),
+      kind,
+      completedBytes,
+      totalBytes
+    );
   }
 
-  private addMarkdownBootstrapFolderProgress(
+  private addMarkdownBootstrapVisibleProgress(
     aggregate: Map<string, ExplorerTransferBadgeAggregate>,
     workspaceId: string,
-    runtime: RoomRuntimeState
+    runtime: RoomRuntimeState,
+    visibleExplorerPaths: Set<string>,
+    coveredLocalPaths: Set<string>
   ): void {
     const room = this.getDownloadedRooms().find((entry) => entry.workspaceId === workspaceId);
     if (!room) {
@@ -3732,7 +3727,9 @@ export default class RolayPlugin extends Plugin {
       }
 
       const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
-      if (this.isExplorerPathUploading(localPath)) {
+      const normalizedLocalPath = normalizePath(localPath);
+      coveredLocalPaths.add(normalizedLocalPath);
+      if (this.isExplorerPathUploading(normalizedLocalPath)) {
         continue;
       }
 
@@ -3741,37 +3738,23 @@ export default class RolayPlugin extends Plugin {
         runtime.markdownBootstrap.documentBytesByEntryId.get(entry.id) ?? 1
       );
       const completed = runtime.markdownBootstrap.completedEntryIds.has(entry.id) || this.hasPersistedCrdtCache(entry.id);
-      this.addExplorerTransferAncestorProgress(
-        aggregate,
-        localPath,
+      const targetPath = this.getMinimalVisibleExplorerRollupPath(
+        normalizedLocalPath,
         roomRoot,
+        visibleExplorerPaths
+      );
+      if (completed && targetPath === normalizedLocalPath) {
+        continue;
+      }
+
+      this.mergeExplorerTransferProgress(
+        aggregate,
+        targetPath,
         "download",
         completed ? totalBytes : 0,
-        totalBytes
+        totalBytes,
+        !completed
       );
-    }
-  }
-
-  private addExplorerTransferAncestorProgress(
-    aggregate: Map<string, ExplorerTransferBadgeAggregate>,
-    localPath: string,
-    roomRoot: string,
-    kind: BinaryTransferKind,
-    completedBytes: number,
-    totalBytes: number
-  ): void {
-    let parentPath = getParentPath(normalizePath(localPath));
-    while (parentPath) {
-      if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
-        break;
-      }
-
-      this.mergeExplorerTransferProgress(aggregate, parentPath, kind, completedBytes, totalBytes);
-      if (parentPath === roomRoot) {
-        break;
-      }
-
-      parentPath = getParentPath(parentPath);
     }
   }
 
@@ -3780,7 +3763,8 @@ export default class RolayPlugin extends Plugin {
     localPath: string,
     kind: BinaryTransferKind,
     completedBytes: number,
-    totalBytes: number
+    totalBytes: number,
+    active = true
   ): void {
     const normalizedTotalBytes = Math.max(1, Math.trunc(totalBytes));
     const normalizedCompletedBytes = Math.max(
@@ -3793,7 +3777,8 @@ export default class RolayPlugin extends Plugin {
         kind,
         completedBytes: normalizedCompletedBytes,
         totalBytes: normalizedTotalBytes,
-        itemCount: 1
+        itemCount: 1,
+        activeItemCount: active ? 1 : 0
       });
       return;
     }
@@ -3802,7 +3787,8 @@ export default class RolayPlugin extends Plugin {
       kind: existing.kind === "download" || kind === "download" ? "download" : "upload",
       completedBytes: existing.completedBytes + normalizedCompletedBytes,
       totalBytes: existing.totalBytes + normalizedTotalBytes,
-      itemCount: existing.itemCount + 1
+      itemCount: existing.itemCount + 1,
+      activeItemCount: existing.activeItemCount + (active ? 1 : 0)
     });
   }
 
@@ -3932,83 +3918,6 @@ export default class RolayPlugin extends Plugin {
       element.querySelector<HTMLElement>(".nav-file-title-content") ??
       element.querySelector<HTMLElement>(".tree-item-inner")
     );
-  }
-
-  private getLoadingExplorerPaths(): Set<string> {
-    const loadingPaths = new Set<string>();
-    const uploadingPaths = this.getUploadingExplorerPaths();
-
-    for (const runtime of this.roomRuntime.values()) {
-      for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
-        if (!uploadingPaths.has(lockedPath)) {
-          loadingPaths.add(lockedPath);
-        }
-      }
-    }
-
-    // Snapshot materialization creates empty binary placeholders before the
-    // actual blob download starts. Treat those protected placeholders as
-    // loading immediately so the file is red from the first rendered frame.
-    for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
-      const normalizedPath = normalizePath(placeholderPath);
-      const transfer = this.binaryTransferState.get(normalizedPath);
-      if (!transfer) {
-        loadingPaths.add(normalizedPath);
-        continue;
-      }
-
-      if (
-        transfer.kind === "download" &&
-        (transfer.status === "preparing" || transfer.status === "downloading")
-      ) {
-        loadingPaths.add(normalizedPath);
-      }
-    }
-
-    for (const transfer of this.binaryTransferState.values()) {
-      if (transfer.kind !== "download") {
-        continue;
-      }
-
-      if (transfer.status === "preparing" || transfer.status === "downloading") {
-        loadingPaths.add(normalizePath(transfer.localPath));
-      }
-    }
-
-    return loadingPaths;
-  }
-
-  private getUploadingExplorerPaths(): Set<string> {
-    const uploadingPaths = new Set<string>();
-
-    for (const pendingCreate of Object.values(this.data.pendingMarkdownCreates)) {
-      uploadingPaths.add(normalizePath(pendingCreate.localPath));
-    }
-
-    for (const pendingMerge of Object.values(this.data.pendingMarkdownMerges)) {
-      uploadingPaths.add(normalizePath(pendingMerge.localPath));
-    }
-
-    for (const pendingWrite of Object.values(this.data.pendingBinaryWrites)) {
-      uploadingPaths.add(normalizePath(pendingWrite.localPath));
-    }
-
-    for (const transfer of this.binaryTransferState.values()) {
-      if (transfer.kind !== "upload") {
-        continue;
-      }
-
-      if (
-        transfer.status === "preparing" ||
-        transfer.status === "uploading" ||
-        transfer.status === "canceling" ||
-        transfer.status === "committing"
-      ) {
-        uploadingPaths.add(normalizePath(transfer.localPath));
-      }
-    }
-
-    return uploadingPaths;
   }
 
   private getRoomFolderExplorerStatuses(): Map<string, WorkspaceEventStreamStatus> {
