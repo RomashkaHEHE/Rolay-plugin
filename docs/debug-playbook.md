@@ -145,6 +145,26 @@ Current expectation:
 - downloads resume from the local `.part` file size plus ranged `GET /blob/content`
 - the final vault file should only be written after full hash verification succeeds
 
+### Many duplicate notes appear and are hard to delete
+
+Check:
+
+1. `pendingMarkdownCreates` and `pendingBinaryWrites` in `.obsidian/plugins/rolay/data.json`
+2. `ops/error` lines containing `conflicted with an existing server path`
+3. repeated log lines containing `Room is disconnected; markdown create will retry after reconnect`
+4. [src/main.ts](../src/main.ts):
+   - `syncMarkdownCreate`
+   - `reconcilePendingMarkdownCreates`
+   - `isDisconnectedPendingMarkdownCreateReplay`
+5. [src/obsidian/file-bridge.ts](../src/obsidian/file-bridge.ts):
+   - `handleVaultCreate`
+
+Current expectation:
+
+- stopped/disconnected room vault create events must not be persisted as future create replays
+- stale disconnected pending creates should be cleared, not conflict-renamed into `(1)`, `(2)`, ... copies
+- already-created server duplicates require normal connected-room delete or a one-off server cleanup; the client fix prevents new duplicate generation
+
 ### Markdown opens but live sync is weird
 
 Check:

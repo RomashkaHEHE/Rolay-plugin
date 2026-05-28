@@ -194,6 +194,12 @@ export class FileBridge {
       return;
     }
 
+    if (!this.isWorkspaceSyncActive(resolved.workspaceId)) {
+      this.log(`Ignored local create for ${file.path} because room sync is not active.`);
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
+
     if (this.consumeRecentRemoteCreate(file.path)) {
       this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
       return;

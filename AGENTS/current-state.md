@@ -1,10 +1,10 @@
 # Current State
 
-Last updated: 2026-04-29
+Last updated: 2026-05-28
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.11`
+- Plugin version: `1.2.12`
 - Latest notable commit in recent history before this AGENTS layer: `1a8c272` `Document presence and cursor sync behavior`
 
 ## Current Priorities
@@ -34,6 +34,7 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Persistent `rolay-sync.log` is intentionally short-lived: entries older than 48 hours are removed, and noisy files are capped to a compact recent tail.
 - Startup sync is deferred until after Obsidian workspace layout is ready; downloaded rooms then resume with a small stagger so auth/snapshot/preload work does not block the plugin loading screen.
 - Room Disconnect is a hard per-room pause: it stops room SSE/presence, cancels scheduled snapshot/background markdown work, aborts active binary transfers for that workspace, invalidates in-flight upload tokens, and ignores late snapshot/bootstrap/download results without affecting other connected rooms.
+- Disconnected/stopped rooms must not persist new markdown/binary create replay records from Obsidian vault `create` events. Existing remote files can otherwise be misclassified as local creates on startup/reconnect, causing runaway `(1)`, `(2)`, ... duplicates.
 - Remote markdown patches should preserve the local viewport.
 - Remote cursor rendering has extra stabilization against stale backward awareness offsets.
 - Room publication is private by default and public access is only through the separate server-root read-only site.
@@ -99,6 +100,7 @@ These are important because future regressions will often land in these areas:
 - Hard per-room Disconnect semantics for active preload/blob work
 - Immediate explorer decoration refresh after folder expand/collapse
 - Optimistic local self-viewer overlay for active note presence
+- Guard against disconnected-room stale create replays generating duplicate markdown/binary entries
 
 ## First Places To Look By Task Type
 

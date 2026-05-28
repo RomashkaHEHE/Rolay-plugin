@@ -5590,6 +5590,13 @@ export default class RolayPlugin extends Plugin {
     }
 
     const normalizedLocalPath = normalizePath(pendingCreate.localPath);
+    if (
+      this.isDisconnectedPendingMarkdownCreateReplay(pendingCreate) &&
+      normalizePath(pendingCreate.serverPath) === normalizePath(remoteEntry.path)
+    ) {
+      return true;
+    }
+
     if (this.wasPathRecentlyObservedAsRemote(workspaceId, normalizedLocalPath)) {
       return true;
     }
@@ -5605,6 +5612,20 @@ export default class RolayPlugin extends Plugin {
     }
 
     return false;
+  }
+
+  private isDisconnectedPendingMarkdownCreateReplay(pendingCreate: RolayPendingMarkdownCreateEntry): boolean {
+    return Boolean(
+      pendingCreate.lastError &&
+      /room is disconnected; markdown create will retry after reconnect/i.test(pendingCreate.lastError)
+    );
+  }
+
+  private isDisconnectedPendingBinaryWriteReplay(pendingWrite: RolayPendingBinaryWriteEntry): boolean {
+    return Boolean(
+      pendingWrite.lastError &&
+      /room is disconnected; binary write will retry after reconnect/i.test(pendingWrite.lastError)
+    );
   }
 
   private shouldDropPendingBinaryWriteAsRemoteEcho(
@@ -6533,11 +6554,10 @@ export default class RolayPlugin extends Plugin {
     conflictDepth = 0
   ): Promise<void> {
     if (!this.isRoomSyncActive(workspaceId)) {
-      await this.rememberPendingMarkdownCreate(
-        workspaceId,
-        localPath,
-        path,
-        new Error("Room is disconnected; markdown create will retry after reconnect.")
+      this.recordLog(
+        "ops",
+        `[${workspaceId}] Ignored local markdown create ${path} because the room is disconnected. ` +
+        "The next room snapshot will reconcile the local file instead of replaying it as a new remote entry."
       );
       return;
     }
@@ -6728,6 +6748,16 @@ export default class RolayPlugin extends Plugin {
         continue;
       }
 
+      if (this.isDisconnectedPendingMarkdownCreateReplay(pendingCreate)) {
+        this.clearPendingMarkdownCreate(pendingCreate.localPath);
+        this.clearPendingLocalCreate(workspaceId, currentServerPath);
+        this.recordLog(
+          "ops",
+          `[${workspaceId}] Cleared disconnected pending markdown create for ${currentServerPath}; disconnected room creates are no longer replayed automatically.`
+        );
+        continue;
+      }
+
       const remoteEntry = this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
       if (remoteEntry) {
         if (this.shouldDropPendingMarkdownCreateAsRemoteEcho(workspaceId, pendingCreate, remoteEntry)) {
@@ -6846,12 +6876,10 @@ export default class RolayPlugin extends Plugin {
   ): Promise<void> {
     const localPath = normalizePath(this.fileBridge.toLocalPath(workspaceId, serverPath) ?? serverPath);
     if (!this.isRoomSyncActive(workspaceId)) {
-      this.rememberPendingBinaryWrite(
-        workspaceId,
-        localPath,
-        serverPath,
-        existingEntry?.id ?? null,
-        new Error("Room is disconnected; binary write will retry after reconnect.")
+      this.recordLog(
+        "blob",
+        `[${workspaceId}] Ignored local binary write ${serverPath} because the room is disconnected. ` +
+        "The next room snapshot will reconcile the local file instead of replaying it as a new upload."
       );
       return;
     }
@@ -7471,6 +7499,16 @@ export default class RolayPlugin extends Plugin {
         this.recordLog(
           "blob",
           `[${workspaceId}] Cleared pending binary write for ${pendingWrite.localPath} because it is no longer inside the room root.`
+        );
+        continue;
+      }
+
+      if (this.isDisconnectedPendingBinaryWriteReplay(pendingWrite)) {
+        await this.clearPendingBinaryWriteForLocalPath(pendingWrite.localPath, false);
+        this.clearPendingLocalCreate(workspaceId, currentServerPath);
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Cleared disconnected pending binary write for ${currentServerPath}; disconnected room writes are no longer replayed automatically.`
         );
         continue;
       }

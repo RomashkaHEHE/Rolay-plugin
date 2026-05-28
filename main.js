@@ -10438,6 +10438,11 @@ var _FileBridge = class _FileBridge {
     if (!resolved || this.isSuppressedPath(file.path)) {
       return;
     }
+    if (!this.isWorkspaceSyncActive(resolved.workspaceId)) {
+      this.log(`Ignored local create for ${file.path} because room sync is not active.`);
+      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      return;
+    }
     if (this.consumeRecentRemoteCreate(file.path)) {
       this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
       return;
@@ -21255,6 +21260,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       return false;
     }
     const normalizedLocalPath = (0, import_obsidian9.normalizePath)(pendingCreate.localPath);
+    if (this.isDisconnectedPendingMarkdownCreateReplay(pendingCreate) && (0, import_obsidian9.normalizePath)(pendingCreate.serverPath) === (0, import_obsidian9.normalizePath)(remoteEntry.path)) {
+      return true;
+    }
     if (this.wasPathRecentlyObservedAsRemote(workspaceId, normalizedLocalPath)) {
       return true;
     }
@@ -21267,6 +21275,16 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       return true;
     }
     return false;
+  }
+  isDisconnectedPendingMarkdownCreateReplay(pendingCreate) {
+    return Boolean(
+      pendingCreate.lastError && /room is disconnected; markdown create will retry after reconnect/i.test(pendingCreate.lastError)
+    );
+  }
+  isDisconnectedPendingBinaryWriteReplay(pendingWrite) {
+    return Boolean(
+      pendingWrite.lastError && /room is disconnected; binary write will retry after reconnect/i.test(pendingWrite.lastError)
+    );
   }
   shouldDropPendingBinaryWriteAsRemoteEcho(workspaceId, pendingWrite, remoteEntry) {
     if (remoteEntry.deleted || remoteEntry.kind !== "binary") {
@@ -21961,11 +21979,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async syncMarkdownCreate(workspaceId, path, localPath, localContent = "", conflictDepth = 0) {
     if (!this.isRoomSyncActive(workspaceId)) {
-      await this.rememberPendingMarkdownCreate(
-        workspaceId,
-        localPath,
-        path,
-        new Error("Room is disconnected; markdown create will retry after reconnect.")
+      this.recordLog(
+        "ops",
+        `[${workspaceId}] Ignored local markdown create ${path} because the room is disconnected. The next room snapshot will reconcile the local file instead of replaying it as a new remote entry.`
       );
       return;
     }
@@ -22118,6 +22134,15 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         );
         continue;
       }
+      if (this.isDisconnectedPendingMarkdownCreateReplay(pendingCreate)) {
+        this.clearPendingMarkdownCreate(pendingCreate.localPath);
+        this.clearPendingLocalCreate(workspaceId, currentServerPath);
+        this.recordLog(
+          "ops",
+          `[${workspaceId}] Cleared disconnected pending markdown create for ${currentServerPath}; disconnected room creates are no longer replayed automatically.`
+        );
+        continue;
+      }
       const remoteEntry = this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null;
       if (remoteEntry) {
         if (this.shouldDropPendingMarkdownCreateAsRemoteEcho(workspaceId, pendingCreate, remoteEntry)) {
@@ -22217,12 +22242,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   async queueBinaryWrite(workspaceId, serverPath, localContent, existingEntry) {
     const localPath = (0, import_obsidian9.normalizePath)(this.fileBridge.toLocalPath(workspaceId, serverPath) ?? serverPath);
     if (!this.isRoomSyncActive(workspaceId)) {
-      this.rememberPendingBinaryWrite(
-        workspaceId,
-        localPath,
-        serverPath,
-        existingEntry?.id ?? null,
-        new Error("Room is disconnected; binary write will retry after reconnect.")
+      this.recordLog(
+        "blob",
+        `[${workspaceId}] Ignored local binary write ${serverPath} because the room is disconnected. The next room snapshot will reconcile the local file instead of replaying it as a new upload.`
       );
       return;
     }
@@ -22724,6 +22746,15 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         this.recordLog(
           "blob",
           `[${workspaceId}] Cleared pending binary write for ${pendingWrite.localPath} because it is no longer inside the room root.`
+        );
+        continue;
+      }
+      if (this.isDisconnectedPendingBinaryWriteReplay(pendingWrite)) {
+        await this.clearPendingBinaryWriteForLocalPath(pendingWrite.localPath, false);
+        this.clearPendingLocalCreate(workspaceId, currentServerPath);
+        this.recordLog(
+          "blob",
+          `[${workspaceId}] Cleared disconnected pending binary write for ${currentServerPath}; disconnected room writes are no longer replayed automatically.`
         );
         continue;
       }
