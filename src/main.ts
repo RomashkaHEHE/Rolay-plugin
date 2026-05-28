@@ -209,8 +209,10 @@ interface PasswordChangeDraft {
 }
 
 export default class RolayPlugin extends Plugin {
-  private static readonly MAX_PERSISTED_CRDT_DOCS = 64;
-  private static readonly MAX_PERSISTED_BINARY_ENTRIES = 128;
+  // Markdown preload is room-wide: if this cache is too small, already
+  // bootstrapped notes are pruned and later look "not downloaded" again.
+  private static readonly MAX_PERSISTED_CRDT_DOCS = 10_000;
+  private static readonly MAX_PERSISTED_BINARY_ENTRIES = 10_000;
   private static readonly ENABLE_BLOB_TRANSFER_TRACE = true;
   private static readonly BINARY_TRANSFER_PARTS_FOLDER = "transfers";
   private static readonly BINARY_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;

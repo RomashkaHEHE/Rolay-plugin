@@ -177,6 +177,24 @@ Check:
    - `syncRemoteIntoOpenEditors`
    - `updateLocalPresence`
 
+### Markdown files flicker red/normal or turn red when opened
+
+Check:
+
+1. repeated log lines like `HTTP markdown bootstrap stored ...` immediately followed by `Preloading ... (rerun)`
+2. the size of `crdtCache.entries` in `.obsidian/plugins/rolay/data.json`
+3. [src/main.ts](../src/main.ts):
+   - `MAX_PERSISTED_CRDT_DOCS`
+   - `prunePersistedCrdtCache`
+   - `shouldKeepMarkdownLocked`
+   - `bootstrapRoomMarkdownCache`
+
+Current expectation:
+
+- persistent CRDT cache must be large enough to retain room-wide markdown preload state
+- if the cache cap is too small, downloaded notes are pruned and later treated as still loading
+- red markdown explorer state should only mean the note is genuinely missing/unhydrated/protected, not that its cached bootstrap state was evicted
+
 ### Settings UI looks stale
 
 Check:

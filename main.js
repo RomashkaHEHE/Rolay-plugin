@@ -23284,8 +23284,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     }
   }
 };
-_RolayPlugin.MAX_PERSISTED_CRDT_DOCS = 64;
-_RolayPlugin.MAX_PERSISTED_BINARY_ENTRIES = 128;
+// Markdown preload is room-wide: if this cache is too small, already
+// bootstrapped notes are pruned and later look "not downloaded" again.
+_RolayPlugin.MAX_PERSISTED_CRDT_DOCS = 1e4;
+_RolayPlugin.MAX_PERSISTED_BINARY_ENTRIES = 1e4;
 _RolayPlugin.ENABLE_BLOB_TRANSFER_TRACE = true;
 _RolayPlugin.BINARY_TRANSFER_PARTS_FOLDER = "transfers";
 _RolayPlugin.BINARY_UPLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
