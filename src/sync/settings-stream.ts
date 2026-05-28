@@ -204,13 +204,23 @@ export class SettingsEventStream {
     const url = this.buildUrl();
     const nodeRequire = getNodeRequire();
     if (nodeRequire) {
-      return openNodeRequest(url, accessToken, this.currentCursor, signal, nodeRequire);
+      return openNodeRequest(
+        url,
+        accessToken,
+        this.currentCursor,
+        signal,
+        nodeRequire,
+        this.apiClient.getClientHeaders()
+      );
     }
 
     const headers = new Headers({
       Accept: "text/event-stream",
       Authorization: `Bearer ${accessToken}`
     });
+    for (const [name, value] of Object.entries(this.apiClient.getClientHeaders())) {
+      headers.set(name, value);
+    }
 
     if (this.currentCursor !== null) {
       headers.set("Last-Event-ID", String(this.currentCursor));
@@ -292,7 +302,8 @@ async function openNodeRequest(
   accessToken: string,
   lastEventId: number | null,
   signal: AbortSignal,
-  nodeRequire: (id: string) => unknown
+  nodeRequire: (id: string) => unknown,
+  clientHeaders: Record<string, string>
 ): Promise<IncomingMessage> {
   const url = new URL(urlString);
   const requestModule = (
@@ -304,7 +315,8 @@ async function openNodeRequest(
   return new Promise<IncomingMessage>((resolve, reject) => {
     const headers: Record<string, string> = {
       Accept: "text/event-stream",
-      Authorization: `Bearer ${accessToken}`
+      Authorization: `Bearer ${accessToken}`,
+      ...clientHeaders
     };
 
     if (lastEventId !== null) {

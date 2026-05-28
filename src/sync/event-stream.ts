@@ -222,14 +222,15 @@ export class WorkspaceEventStream {
   ): Promise<Response | IncomingMessage> {
     const nodeRequire = getNodeRequire();
     if (nodeRequire) {
-      return openNodeRequest(url, accessToken, signal, nodeRequire);
+      return openNodeRequest(url, accessToken, signal, nodeRequire, this.apiClient.getClientHeaders());
     }
 
     return fetch(url, {
       method: "GET",
       headers: {
         Accept: "text/event-stream",
-        Authorization: `Bearer ${accessToken}`
+        Authorization: `Bearer ${accessToken}`,
+        ...this.apiClient.getClientHeaders()
       },
       signal
     });
@@ -298,7 +299,8 @@ async function openNodeRequest(
   urlString: string,
   accessToken: string,
   signal: AbortSignal,
-  nodeRequire: (id: string) => unknown
+  nodeRequire: (id: string) => unknown,
+  clientHeaders: Record<string, string>
 ): Promise<IncomingMessage> {
   const url = new URL(urlString);
   const requestModule = (
@@ -316,7 +318,8 @@ async function openNodeRequest(
       method: "GET",
       headers: {
         Accept: "text/event-stream",
-        Authorization: `Bearer ${accessToken}`
+        Authorization: `Bearer ${accessToken}`,
+        ...clientHeaders
       }
     };
 

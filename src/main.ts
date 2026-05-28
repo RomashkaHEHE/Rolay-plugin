@@ -229,7 +229,7 @@ export default class RolayPlugin extends Plugin {
   private static readonly MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = 8;
   private static readonly MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = 512 * 1024;
   private static readonly BINARY_DOWNLOAD_CONCURRENCY = 2;
-  private static readonly PENDING_DELETE_GUARD_MS = 60_000;
+  private static readonly PENDING_DELETE_GUARD_MS = 10 * 60_000;
   private static readonly STARTUP_BOOTSTRAP_DELAY_MS = 1_500;
   private static readonly STARTUP_ROOM_CONNECT_STAGGER_MS = 900;
   private data!: RolayPluginData;
@@ -304,6 +304,7 @@ export default class RolayPlugin extends Plugin {
     this.apiClient = new RolayApiClient({
       getServerUrl: () => normalizeServerUrl(this.data.settings.serverUrl),
       getSession: () => this.data.session,
+      getClientVersion: () => this.manifest.version,
       saveSession: async (session) => {
         this.data.session = session;
         if (!session) {
@@ -2098,6 +2099,10 @@ export default class RolayPlugin extends Plugin {
 
   private async handleVaultDelete(file: TAbstractFile): Promise<void> {
     try {
+      if (this.fileBridge.shouldIgnoreVaultDeleteBeforeProtection(file.path)) {
+        return;
+      }
+
       if (await this.restoreLockedMarkdownDelete(file)) {
         await this.bindActiveMarkdownToCrdt();
         return;
@@ -2685,6 +2690,28 @@ export default class RolayPlugin extends Plugin {
       if (toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName) !== null) {
         return room;
       }
+    }
+
+    return null;
+  }
+
+  private resolveRoomServerPathByLocalPath(
+    localPath: string
+  ): { workspaceId: string; serverPath: string } | null {
+    const downloadedRooms = this.getDownloadedRooms().sort(
+      (left, right) => right.folderName.length - left.folderName.length
+    );
+
+    for (const room of downloadedRooms) {
+      const serverPath = toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName);
+      if (serverPath === null) {
+        continue;
+      }
+
+      return {
+        workspaceId: room.workspaceId,
+        serverPath
+      };
     }
 
     return null;
@@ -4529,12 +4556,48 @@ export default class RolayPlugin extends Plugin {
       return false;
     }
 
+    if (this.shouldBypassLockedMarkdownDeleteRestore(file.path, blocked.workspaceId)) {
+      return false;
+    }
+
     this.recordLog(
       "crdt",
       `[${blocked.workspaceId}] Ignored local delete for ${file.path} because ${blocked.lockedPath} is still loading and protected.`
     );
     new Notice("Rolay is still loading this markdown note. Delete is blocked until download finishes.");
     await this.refreshRoomSnapshot(blocked.workspaceId, "restore-locked-delete");
+    this.scheduleExplorerLoadingDecorations();
+    return true;
+  }
+
+  private shouldBypassLockedMarkdownDeleteRestore(localPath: string, workspaceId: string): boolean {
+    const resolved = this.resolveRoomServerPathByLocalPath(localPath);
+    if (!resolved || resolved.workspaceId !== workspaceId) {
+      return false;
+    }
+
+    if (this.hasPendingLocalDelete(workspaceId, resolved.serverPath)) {
+      this.recordLog(
+        "crdt",
+        `[${workspaceId}] Allowed delete echo for ${localPath} because ${resolved.serverPath} is already pending deletion.`
+      );
+      return true;
+    }
+
+    const entry = this.getRoomStore(workspaceId)?.getEntryByPath(resolved.serverPath) ?? null;
+    if (!entry || entry.deleted || entry.kind !== "markdown") {
+      return false;
+    }
+
+    if (!this.isSafeMarkdownSuffixDuplicateDeleteCandidate(workspaceId, entry)) {
+      return false;
+    }
+
+    this.roomRuntime.get(workspaceId)?.markdownBootstrap.lockedLocalPaths.delete(normalizePath(localPath));
+    this.recordLog(
+      "crdt",
+      `[${workspaceId}] Allowed local delete for locked suffix-copy duplicate ${entry.path}; sending delete_entry instead of restoring it.`
+    );
     this.scheduleExplorerLoadingDecorations();
     return true;
   }
@@ -8177,6 +8240,20 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
+  private isSafeMarkdownSuffixDuplicateDeleteCandidate(workspaceId: string, entry: FileEntry): boolean {
+    if (entry.kind !== "markdown" || entry.deleted || entry.entryVersion !== 0) {
+      return false;
+    }
+
+    const basePath = getCopySuffixBasePath(entry.path);
+    if (!basePath) {
+      return false;
+    }
+
+    const baseEntry = this.getRoomStore(workspaceId)?.getEntryByPath(basePath) ?? null;
+    return Boolean(baseEntry && !baseEntry.deleted && baseEntry.kind === "markdown");
+  }
+
   private findAvailableMarkdownConflictPath(workspaceId: string, desiredServerPath: string): string {
     const normalizedDesiredPath = desiredServerPath.replace(/\\/g, "/");
     const directoryPath = getParentPath(normalizedDesiredPath);
@@ -9015,4 +9092,19 @@ function parseCopySuffix(stem: string): { baseStem: string; nextIndex: number } 
     baseStem: match[1],
     nextIndex: Number(match[2]) + 1
   };
+}
+
+function getCopySuffixBasePath(path: string): string | null {
+  const normalizedPath = path.replace(/\\/g, "/");
+  const directoryPath = getParentPath(normalizedPath);
+  const fileName = getFileName(normalizedPath);
+  const extension = getFileExtension(fileName);
+  const rawStem = extension ? fileName.slice(0, -(extension.length + 1)) : fileName;
+  const match = rawStem.match(/^(.*)\((\d+)\)$/);
+  if (!match) {
+    return null;
+  }
+
+  const baseFileName = extension ? `${match[1]}.${extension}` : match[1];
+  return directoryPath ? `${directoryPath}/${baseFileName}` : baseFileName;
 }

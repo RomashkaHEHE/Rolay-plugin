@@ -397,6 +397,15 @@ export class FileBridge {
     await this.onDeleteEntry(resolved.workspaceId, entry);
   }
 
+  shouldIgnoreVaultDeleteBeforeProtection(localPath: string): boolean {
+    const resolved = this.resolveRoomPath(localPath);
+    if (!resolved || this.isSuppressedPath(localPath)) {
+      return true;
+    }
+
+    return this.consumeRecentRemoteDelete(localPath);
+  }
+
   toLocalPath(workspaceId: string, serverPath: string): string | null {
     const folderName = this.getFolderName(workspaceId);
     if (!folderName) {

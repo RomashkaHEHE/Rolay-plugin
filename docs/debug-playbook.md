@@ -152,18 +152,26 @@ Check:
 1. `pendingMarkdownCreates` and `pendingBinaryWrites` in `.obsidian/plugins/rolay/data.json`
 2. `ops/error` lines containing `conflicted with an existing server path`
 3. repeated log lines containing `Room is disconnected; markdown create will retry after reconnect`
-4. [src/main.ts](../src/main.ts):
+4. `crdt/info` lines containing `Ignored local delete ... still loading and protected` during a bulk duplicate cleanup
+5. [src/main.ts](../src/main.ts):
    - `syncMarkdownCreate`
    - `reconcilePendingMarkdownCreates`
    - `isDisconnectedPendingMarkdownCreateReplay`
-5. [src/obsidian/file-bridge.ts](../src/obsidian/file-bridge.ts):
+   - `restoreLockedMarkdownDelete`
+   - `shouldBypassLockedMarkdownDeleteRestore`
+   - `PENDING_DELETE_GUARD_MS`
+6. [src/obsidian/file-bridge.ts](../src/obsidian/file-bridge.ts):
    - `handleVaultCreate`
+   - `shouldIgnoreVaultDeleteBeforeProtection`
 
 Current expectation:
 
 - stopped/disconnected room vault create events must not be persisted as future create replays
 - stale disconnected pending creates should be cleared, not conflict-renamed into `(1)`, `(2)`, ... copies
 - already-created server duplicates require normal connected-room delete or a one-off server cleanup; the client fix prevents new duplicate generation
+- remote/suppressed delete echoes must be consumed before protected markdown delete restoration, otherwise the client can resurrect files it just deleted
+- safe suffix-copy markdown duplicates with `entryVersion=0` and an active base note may bypass locked-delete restoration so bulk cleanup can send `delete_entry` instead of locally restoring them
+- if new suffix-copy `tree.entry.created` events still appear after this client fix, compare server logs by `X-Rolay-Client-Version`; an outdated/missing-version client should be blocked server-side for tree mutations
 
 ### Markdown opens but live sync is weird
 

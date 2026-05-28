@@ -32,6 +32,8 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Red downloading/protected explorer paths and yellow uploading paths should always show a `0-100%` badge. Binary transfers use byte progress, remote placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll up current bootstrap progress across the whole markdown target set, not only the files still locked.
 - Room-wide markdown preload requires a large persistent CRDT cache. Do not lower `MAX_PERSISTED_CRDT_DOCS` back to tiny LRU values: downloaded notes will be pruned from `data.json`, then flicker red/normal and retrigger bootstrap loops even though the room was already downloaded.
 - Local delete operations keep a short pending-delete guard so stale snapshots cannot resurrect files while multi-file delete operations are still settling.
+- Bulk duplicate cleanup must stay possible even while markdown preload/locked-state is stale. Remote/suppressed delete echoes and already-pending deletes must be ignored before protected-markdown delete restoration, and safe `entryVersion=0` suffix-copy markdown duplicates may bypass the locked-delete restore so their `delete_entry` can reach the server.
+- Authenticated REST/blob/SSE requests include `X-Rolay-Client: obsidian-plugin` and `X-Rolay-Client-Version`; keep this so the server can diagnose or reject stale clients if an old plugin build starts creating duplicate entries.
 - Persistent `rolay-sync.log` is intentionally short-lived: entries older than 48 hours are removed, and noisy files are capped to a compact recent tail.
 - Startup sync is deferred until after Obsidian workspace layout is ready; downloaded rooms then resume with a small stagger so auth/snapshot/preload work does not block the plugin loading screen.
 - Room Disconnect is a hard per-room pause: it stops room SSE/presence, cancels scheduled snapshot/background markdown work, aborts active binary transfers for that workspace, invalidates in-flight upload tokens, and ignores late snapshot/bootstrap/download results without affecting other connected rooms.
@@ -104,6 +106,8 @@ These are important because future regressions will often land in these areas:
 - Guard against disconnected-room stale create replays generating duplicate markdown/binary entries
 - Increased persistent markdown/binary cache caps so room preload can keep downloaded state for large rooms without red/normal flicker
 - Fixed markdown explorer folder percentages so completed bootstrap documents keep contributing to parent progress until the active preload finishes
+- Hardened bulk duplicate deletion against protected-markdown restore races and longer stale-snapshot windows
+- Added client/version headers on authenticated API, blob, and SSE traffic for stale-client diagnostics/enforcement
 
 ## First Places To Look By Task Type
 

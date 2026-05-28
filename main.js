@@ -8438,6 +8438,16 @@ var RolayApiClient = class {
   constructor(config) {
     this.config = config;
   }
+  getClientHeaders() {
+    const version = this.config.getClientVersion?.().trim();
+    const headers = {
+      "X-Rolay-Client": "obsidian-plugin"
+    };
+    if (version) {
+      headers["X-Rolay-Client-Version"] = version;
+    }
+    return headers;
+  }
   async login(request) {
     const response = await this.requestJson(
       "POST",
@@ -8895,7 +8905,8 @@ var RolayApiClient = class {
   }
   async performRequest(method, path, body, accessToken) {
     const headers = {
-      Accept: "application/json"
+      Accept: "application/json",
+      ...this.getClientHeaders()
     };
     if (accessToken) {
       headers.Authorization = `Bearer ${accessToken}`;
@@ -8934,6 +8945,9 @@ var RolayApiClient = class {
     const headers = new Headers(init.headers ?? {});
     headers.set("Accept", "text/event-stream");
     headers.set("Authorization", `Bearer ${accessToken}`);
+    for (const [name, value] of Object.entries(this.getClientHeaders())) {
+      headers.set(name, value);
+    }
     return fetch(this.buildUrl(path), {
       ...init,
       headers
@@ -8974,7 +8988,8 @@ var RolayApiClient = class {
   async performAuthorizedBlobDownload(url, accessToken, offset, onChunk, onProgress, signal) {
     const headers = {
       Accept: "application/octet-stream",
-      Authorization: `Bearer ${accessToken}`
+      Authorization: `Bearer ${accessToken}`,
+      ...this.getClientHeaders()
     };
     if (offset > 0) {
       headers.Range = `bytes=${offset}-`;
@@ -9096,7 +9111,8 @@ var RolayApiClient = class {
     const headers = {
       Accept: "application/json",
       Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/octet-stream"
+      "Content-Type": "application/octet-stream",
+      ...this.getClientHeaders()
     };
     if (data.byteLength > 0 && totalSize > 0) {
       headers["Content-Range"] = `bytes ${startOffset}-${startOffset + data.byteLength - 1}/${totalSize}`;
@@ -10592,6 +10608,13 @@ var _FileBridge = class _FileBridge {
       return;
     }
     await this.onDeleteEntry(resolved.workspaceId, entry);
+  }
+  shouldIgnoreVaultDeleteBeforeProtection(localPath) {
+    const resolved = this.resolveRoomPath(localPath);
+    if (!resolved || this.isSuppressedPath(localPath)) {
+      return true;
+    }
+    return this.consumeRecentRemoteDelete(localPath);
   }
   toLocalPath(workspaceId, serverPath) {
     const folderName = this.getFolderName(workspaceId);
@@ -16196,13 +16219,14 @@ var WorkspaceEventStream = class {
   async openStream(url, accessToken, signal) {
     const nodeRequire = getNodeRequire3();
     if (nodeRequire) {
-      return openNodeRequest(url, accessToken, signal, nodeRequire);
+      return openNodeRequest(url, accessToken, signal, nodeRequire, this.apiClient.getClientHeaders());
     }
     return fetch(url, {
       method: "GET",
       headers: {
         Accept: "text/event-stream",
-        Authorization: `Bearer ${accessToken}`
+        Authorization: `Bearer ${accessToken}`,
+        ...this.apiClient.getClientHeaders()
       },
       signal
     });
@@ -16244,7 +16268,7 @@ function getNodeRequire3() {
     return null;
   }
 }
-async function openNodeRequest(urlString, accessToken, signal, nodeRequire) {
+async function openNodeRequest(urlString, accessToken, signal, nodeRequire, clientHeaders) {
   const url = new URL(urlString);
   const requestModule = url.protocol === "https:" ? nodeRequire("node:https") : nodeRequire("node:http");
   return new Promise((resolve, reject) => {
@@ -16256,7 +16280,8 @@ async function openNodeRequest(urlString, accessToken, signal, nodeRequire) {
       method: "GET",
       headers: {
         Accept: "text/event-stream",
-        Authorization: `Bearer ${accessToken}`
+        Authorization: `Bearer ${accessToken}`,
+        ...clientHeaders
       }
     };
     const request = requestModule.request(options, (response) => {
@@ -16499,12 +16524,22 @@ var SettingsEventStream = class {
     const url = this.buildUrl();
     const nodeRequire = getNodeRequire4();
     if (nodeRequire) {
-      return openNodeRequest2(url, accessToken, this.currentCursor, signal, nodeRequire);
+      return openNodeRequest2(
+        url,
+        accessToken,
+        this.currentCursor,
+        signal,
+        nodeRequire,
+        this.apiClient.getClientHeaders()
+      );
     }
     const headers = new Headers({
       Accept: "text/event-stream",
       Authorization: `Bearer ${accessToken}`
     });
+    for (const [name, value] of Object.entries(this.apiClient.getClientHeaders())) {
+      headers.set(name, value);
+    }
     if (this.currentCursor !== null) {
       headers.set("Last-Event-ID", String(this.currentCursor));
     }
@@ -16555,13 +16590,14 @@ function getNodeRequire4() {
     return null;
   }
 }
-async function openNodeRequest2(urlString, accessToken, lastEventId, signal, nodeRequire) {
+async function openNodeRequest2(urlString, accessToken, lastEventId, signal, nodeRequire, clientHeaders) {
   const url = new URL(urlString);
   const requestModule = url.protocol === "https:" ? nodeRequire("node:https") : nodeRequire("node:http");
   return new Promise((resolve, reject) => {
     const headers = {
       Accept: "text/event-stream",
-      Authorization: `Bearer ${accessToken}`
+      Authorization: `Bearer ${accessToken}`,
+      ...clientHeaders
     };
     if (lastEventId !== null) {
       headers["Last-Event-ID"] = String(lastEventId);
@@ -16745,13 +16781,14 @@ var NotePresenceEventStream = class {
     );
     const nodeRequire = getNodeRequire5();
     if (nodeRequire) {
-      return openNodeRequest3(url, accessToken, signal, nodeRequire);
+      return openNodeRequest3(url, accessToken, signal, nodeRequire, this.apiClient.getClientHeaders());
     }
     return fetch(url, {
       method: "GET",
       headers: {
         Accept: "text/event-stream",
-        Authorization: `Bearer ${accessToken}`
+        Authorization: `Bearer ${accessToken}`,
+        ...this.apiClient.getClientHeaders()
       },
       signal
     });
@@ -16793,7 +16830,7 @@ function getNodeRequire5() {
     return null;
   }
 }
-async function openNodeRequest3(urlString, accessToken, signal, nodeRequire) {
+async function openNodeRequest3(urlString, accessToken, signal, nodeRequire, clientHeaders) {
   const url = new URL(urlString);
   const requestModule = url.protocol === "https:" ? nodeRequire("node:https") : nodeRequire("node:http");
   return new Promise((resolve, reject) => {
@@ -16805,7 +16842,8 @@ async function openNodeRequest3(urlString, accessToken, signal, nodeRequire) {
       method: "GET",
       headers: {
         Accept: "text/event-stream",
-        Authorization: `Bearer ${accessToken}`
+        Authorization: `Bearer ${accessToken}`,
+        ...clientHeaders
       }
     };
     const request = requestModule.request(options, (response) => {
@@ -16992,6 +17030,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     this.apiClient = new RolayApiClient({
       getServerUrl: () => normalizeServerUrl(this.data.settings.serverUrl),
       getSession: () => this.data.session,
+      getClientVersion: () => this.manifest.version,
       saveSession: async (session) => {
         this.data.session = session;
         if (!session) {
@@ -18530,6 +18569,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
   }
   async handleVaultDelete(file) {
     try {
+      if (this.fileBridge.shouldIgnoreVaultDeleteBeforeProtection(file.path)) {
+        return;
+      }
       if (await this.restoreLockedMarkdownDelete(file)) {
         await this.bindActiveMarkdownToCrdt();
         return;
@@ -19008,6 +19050,22 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       if (toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName) !== null) {
         return room;
       }
+    }
+    return null;
+  }
+  resolveRoomServerPathByLocalPath(localPath) {
+    const downloadedRooms = this.getDownloadedRooms().sort(
+      (left, right) => right.folderName.length - left.folderName.length
+    );
+    for (const room of downloadedRooms) {
+      const serverPath = toServerPathForRoom(localPath, this.data.settings.syncRoot, room.folderName);
+      if (serverPath === null) {
+        continue;
+      }
+      return {
+        workspaceId: room.workspaceId,
+        serverPath
+      };
     }
     return null;
   }
@@ -20404,12 +20462,42 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
     if (!blocked) {
       return false;
     }
+    if (this.shouldBypassLockedMarkdownDeleteRestore(file.path, blocked.workspaceId)) {
+      return false;
+    }
     this.recordLog(
       "crdt",
       `[${blocked.workspaceId}] Ignored local delete for ${file.path} because ${blocked.lockedPath} is still loading and protected.`
     );
     new import_obsidian9.Notice("Rolay is still loading this markdown note. Delete is blocked until download finishes.");
     await this.refreshRoomSnapshot(blocked.workspaceId, "restore-locked-delete");
+    this.scheduleExplorerLoadingDecorations();
+    return true;
+  }
+  shouldBypassLockedMarkdownDeleteRestore(localPath, workspaceId) {
+    const resolved = this.resolveRoomServerPathByLocalPath(localPath);
+    if (!resolved || resolved.workspaceId !== workspaceId) {
+      return false;
+    }
+    if (this.hasPendingLocalDelete(workspaceId, resolved.serverPath)) {
+      this.recordLog(
+        "crdt",
+        `[${workspaceId}] Allowed delete echo for ${localPath} because ${resolved.serverPath} is already pending deletion.`
+      );
+      return true;
+    }
+    const entry = this.getRoomStore(workspaceId)?.getEntryByPath(resolved.serverPath) ?? null;
+    if (!entry || entry.deleted || entry.kind !== "markdown") {
+      return false;
+    }
+    if (!this.isSafeMarkdownSuffixDuplicateDeleteCandidate(workspaceId, entry)) {
+      return false;
+    }
+    this.roomRuntime.get(workspaceId)?.markdownBootstrap.lockedLocalPaths.delete((0, import_obsidian9.normalizePath)(localPath));
+    this.recordLog(
+      "crdt",
+      `[${workspaceId}] Allowed local delete for locked suffix-copy duplicate ${entry.path}; sending delete_entry instead of restoring it.`
+    );
     this.scheduleExplorerLoadingDecorations();
     return true;
   }
@@ -23275,6 +23363,17 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       throw error;
     }
   }
+  isSafeMarkdownSuffixDuplicateDeleteCandidate(workspaceId, entry) {
+    if (entry.kind !== "markdown" || entry.deleted || entry.entryVersion !== 0) {
+      return false;
+    }
+    const basePath = getCopySuffixBasePath(entry.path);
+    if (!basePath) {
+      return false;
+    }
+    const baseEntry = this.getRoomStore(workspaceId)?.getEntryByPath(basePath) ?? null;
+    return Boolean(baseEntry && !baseEntry.deleted && baseEntry.kind === "markdown");
+  }
   findAvailableMarkdownConflictPath(workspaceId, desiredServerPath) {
     const normalizedDesiredPath = desiredServerPath.replace(/\\/g, "/");
     const directoryPath = getParentPath2(normalizedDesiredPath);
@@ -23357,7 +23456,7 @@ _RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS = 1200;
 _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = 8;
 _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = 512 * 1024;
 _RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY = 2;
-_RolayPlugin.PENDING_DELETE_GUARD_MS = 6e4;
+_RolayPlugin.PENDING_DELETE_GUARD_MS = 10 * 6e4;
 _RolayPlugin.STARTUP_BOOTSTRAP_DELAY_MS = 1500;
 _RolayPlugin.STARTUP_ROOM_CONNECT_STAGGER_MS = 900;
 var RolayPlugin = _RolayPlugin;
@@ -23914,4 +24013,17 @@ function parseCopySuffix(stem) {
     baseStem: match2[1],
     nextIndex: Number(match2[2]) + 1
   };
+}
+function getCopySuffixBasePath(path) {
+  const normalizedPath = path.replace(/\\/g, "/");
+  const directoryPath = getParentPath2(normalizedPath);
+  const fileName = getFileName(normalizedPath);
+  const extension = getFileExtension(fileName);
+  const rawStem = extension ? fileName.slice(0, -(extension.length + 1)) : fileName;
+  const match2 = rawStem.match(/^(.*)\((\d+)\)$/);
+  if (!match2) {
+    return null;
+  }
+  const baseFileName = extension ? `${match2[1]}.${extension}` : match2[1];
+  return directoryPath ? `${directoryPath}/${baseFileName}` : baseFileName;
 }

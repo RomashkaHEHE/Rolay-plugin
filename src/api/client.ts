@@ -42,6 +42,7 @@ interface RolayApiClientConfig {
   getServerUrl: () => string;
   getSession: () => RolaySessionState | null;
   saveSession: (session: RolaySessionState | null) => Promise<void>;
+  getClientVersion?: () => string;
 }
 
 interface JsonRequestOptions {
@@ -104,6 +105,19 @@ export class RolayApiClient {
 
   constructor(config: RolayApiClientConfig) {
     this.config = config;
+  }
+
+  getClientHeaders(): Record<string, string> {
+    const version = this.config.getClientVersion?.().trim();
+    const headers: Record<string, string> = {
+      "X-Rolay-Client": "obsidian-plugin"
+    };
+
+    if (version) {
+      headers["X-Rolay-Client-Version"] = version;
+    }
+
+    return headers;
   }
 
   async login(request: LoginRequest): Promise<LoginResponse> {
@@ -713,7 +727,8 @@ export class RolayApiClient {
     accessToken?: string
   ): Promise<RequestUrlResponse> {
     const headers: Record<string, string> = {
-      Accept: "application/json"
+      Accept: "application/json",
+      ...this.getClientHeaders()
     };
 
     if (accessToken) {
@@ -765,6 +780,9 @@ export class RolayApiClient {
     const headers = new Headers(init.headers ?? {});
     headers.set("Accept", "text/event-stream");
     headers.set("Authorization", `Bearer ${accessToken}`);
+    for (const [name, value] of Object.entries(this.getClientHeaders())) {
+      headers.set(name, value);
+    }
 
     return fetch(this.buildUrl(path), {
       ...init,
@@ -824,7 +842,8 @@ export class RolayApiClient {
   ): Promise<BlobDownloadStreamResult> {
     const headers: Record<string, string> = {
       Accept: "application/octet-stream",
-      Authorization: `Bearer ${accessToken}`
+      Authorization: `Bearer ${accessToken}`,
+      ...this.getClientHeaders()
     };
     if (offset > 0) {
       headers.Range = `bytes=${offset}-`;
@@ -977,7 +996,8 @@ export class RolayApiClient {
     const headers: Record<string, string> = {
       Accept: "application/json",
       Authorization: `Bearer ${accessToken}`,
-      "Content-Type": "application/octet-stream"
+      "Content-Type": "application/octet-stream",
+      ...this.getClientHeaders()
     };
     if (data.byteLength > 0 && totalSize > 0) {
       headers["Content-Range"] =
