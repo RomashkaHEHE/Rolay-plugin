@@ -19650,6 +19650,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       );
     }
     for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
+      if (runtime.markdownBootstrap.status === "loading" && runtime.markdownBootstrap.documentBytesByEntryId.size > 0 && runtime.markdownBootstrap.lockedLocalPaths.size > 0) {
+        this.addMarkdownBootstrapFolderProgress(aggregate, workspaceId, runtime);
+      }
       for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
         const normalizedPath = (0, import_obsidian9.normalizePath)(lockedPath);
         if (this.isExplorerPathUploading(normalizedPath) || exactTransferPaths.has(normalizedPath)) {
@@ -19661,7 +19664,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
           normalizedPath,
           "download",
           progress.completedBytes,
-          progress.totalBytes
+          progress.totalBytes,
+          { includeAncestors: runtime.markdownBootstrap.status !== "loading" }
         );
       }
     }
@@ -19717,15 +19721,62 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
       ])
     );
   }
-  addExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes) {
+  addExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes, options = {}) {
     const normalizedPath = (0, import_obsidian9.normalizePath)(localPath);
-    this.mergeExplorerTransferProgress(aggregate, normalizedPath, kind, completedBytes, totalBytes);
+    const includeExact = options.includeExact ?? true;
+    const includeAncestors = options.includeAncestors ?? true;
+    if (includeExact) {
+      this.mergeExplorerTransferProgress(aggregate, normalizedPath, kind, completedBytes, totalBytes);
+    }
     const room = this.resolveDownloadedRoomByLocalPath(normalizedPath);
-    if (!room) {
+    if (!room || !includeAncestors) {
       return;
     }
     const roomRoot = (0, import_obsidian9.normalizePath)(getRoomRoot(this.data.settings.syncRoot, room.folderName));
     let parentPath = getParentPath2(normalizedPath);
+    while (parentPath) {
+      if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
+        break;
+      }
+      this.mergeExplorerTransferProgress(aggregate, parentPath, kind, completedBytes, totalBytes);
+      if (parentPath === roomRoot) {
+        break;
+      }
+      parentPath = getParentPath2(parentPath);
+    }
+  }
+  addMarkdownBootstrapFolderProgress(aggregate, workspaceId, runtime) {
+    const room = this.getDownloadedRooms().find((entry) => entry.workspaceId === workspaceId);
+    if (!room) {
+      return;
+    }
+    const roomRoot = (0, import_obsidian9.normalizePath)(getRoomRoot(this.data.settings.syncRoot, room.folderName));
+    const metadataEntryIds = new Set(runtime.markdownBootstrap.documentBytesByEntryId.keys());
+    for (const entry of runtime.treeStore.getEntries()) {
+      if (entry.deleted || entry.kind !== "markdown" || !metadataEntryIds.has(entry.id)) {
+        continue;
+      }
+      const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
+      if (this.isExplorerPathUploading(localPath)) {
+        continue;
+      }
+      const totalBytes = Math.max(
+        1,
+        runtime.markdownBootstrap.documentBytesByEntryId.get(entry.id) ?? 1
+      );
+      const completed = runtime.markdownBootstrap.completedEntryIds.has(entry.id) || this.hasPersistedCrdtCache(entry.id);
+      this.addExplorerTransferAncestorProgress(
+        aggregate,
+        localPath,
+        roomRoot,
+        "download",
+        completed ? totalBytes : 0,
+        totalBytes
+      );
+    }
+  }
+  addExplorerTransferAncestorProgress(aggregate, localPath, roomRoot, kind, completedBytes, totalBytes) {
+    let parentPath = getParentPath2((0, import_obsidian9.normalizePath)(localPath));
     while (parentPath) {
       if (parentPath !== roomRoot && !parentPath.startsWith(`${roomRoot}/`)) {
         break;
@@ -21723,6 +21774,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
         0
       );
       this.updateStatusBar();
+      this.scheduleExplorerLoadingDecorations();
       if (knownEntries.length === 0) {
         runtime.markdownBootstrap.lastError = metadataMissingCount > 0 ? `server returned metadata for 0/${markdownEntries.length} markdown documents` : null;
         runtime.markdownBootstrap.status = metadataMissingCount > 0 ? "error" : "ready";
@@ -21777,6 +21829,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian9.Plugin {
             await this.bindActiveMarkdownToCrdt();
           }
           await this.syncMarkdownLockForEntry(workspaceId, entry, localPath, normalizedState);
+          this.scheduleExplorerLoadingDecorations();
           this.updateStatusBar();
         }
       }

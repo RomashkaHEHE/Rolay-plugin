@@ -1,10 +1,10 @@
 # Current State
 
-Last updated: 2026-05-28
+Last updated: 2026-05-29
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.13`
+- Plugin version: `1.2.14`
 - Latest notable commit in recent history before this AGENTS layer: `1a8c272` `Document presence and cursor sync behavior`
 
 ## Current Priorities
@@ -29,7 +29,7 @@ These should be treated as high-confidence truths unless code/docs are intention
 - The active local markdown note also gets an optimistic self-viewer overlay. Viewer chips/explorer badges must not wait for the server SSE echo to show the current user, especially when only anonymous public viewers are present.
 - Explorer presence badges use minimal-visible-parent aggregation: a note shows its own badge when visible, otherwise the badge rolls up only to the deepest visible collapsed parent inside the room root. Anonymous public viewers remain separate gray eye indicators and follow the same roll-up rule.
 - Explorer folder expand/collapse interactions must refresh presence/transfer decorations immediately. Use both interaction hooks and the file-explorer DOM mutation observer; do not rely only on the slower general decoration debounce for visible-parent recalculation.
-- Red downloading/protected explorer paths and yellow uploading paths should always show a `0-100%` badge. Binary transfers use byte progress, remote placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll up child progress.
+- Red downloading/protected explorer paths and yellow uploading paths should always show a `0-100%` badge. Binary transfers use byte progress, remote placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll up current bootstrap progress across the whole markdown target set, not only the files still locked.
 - Room-wide markdown preload requires a large persistent CRDT cache. Do not lower `MAX_PERSISTED_CRDT_DOCS` back to tiny LRU values: downloaded notes will be pruned from `data.json`, then flicker red/normal and retrigger bootstrap loops even though the room was already downloaded.
 - Local delete operations keep a short pending-delete guard so stale snapshots cannot resurrect files while multi-file delete operations are still settling.
 - Persistent `rolay-sync.log` is intentionally short-lived: entries older than 48 hours are removed, and noisy files are capped to a compact recent tail.
@@ -103,6 +103,7 @@ These are important because future regressions will often land in these areas:
 - Optimistic local self-viewer overlay for active note presence
 - Guard against disconnected-room stale create replays generating duplicate markdown/binary entries
 - Increased persistent markdown/binary cache caps so room preload can keep downloaded state for large rooms without red/normal flicker
+- Fixed markdown explorer folder percentages so completed bootstrap documents keep contributing to parent progress until the active preload finishes
 
 ## First Places To Look By Task Type
 

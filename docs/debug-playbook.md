@@ -194,6 +194,7 @@ Current expectation:
 - persistent CRDT cache must be large enough to retain room-wide markdown preload state
 - if the cache cap is too small, downloaded notes are pruned and later treated as still loading
 - red markdown explorer state should only mean the note is genuinely missing/unhydrated/protected, not that its cached bootstrap state was evicted
+- folder percentages during markdown preload should aggregate the whole active bootstrap target set; if folders stay at `0%` until they disappear, check `addMarkdownBootstrapFolderProgress` and exact-vs-ancestor transfer badge aggregation
 
 ### Settings UI looks stale
 
