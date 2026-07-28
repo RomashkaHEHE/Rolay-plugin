@@ -25,7 +25,7 @@ __export(main_exports, {
   default: () => RolayPlugin
 });
 module.exports = __toCommonJS(main_exports);
-var import_obsidian11 = require("obsidian");
+var import_obsidian10 = require("obsidian");
 
 // node_modules/lib0/map.js
 var create = () => /* @__PURE__ */ new Map();
@@ -14751,7 +14751,7 @@ function hslToHex2(hue, saturationPercent, lightnessPercent) {
 }
 
 // src/settings/tab.ts
-var import_obsidian8 = require("obsidian");
+var import_obsidian9 = require("obsidian");
 
 // src/ui/text-input-modal.ts
 var import_obsidian7 = require("obsidian");
@@ -14812,9 +14812,667 @@ function openTextInputModal(app, options) {
   });
 }
 
+// src/update/plugin-updater.ts
+var import_obsidian8 = require("obsidian");
+var REQUIRED_UPDATE_FILES = [
+  "main.js",
+  "manifest.json",
+  "styles.css"
+];
+var INSTALL_ORDER = [
+  "styles.css",
+  "main.js",
+  "manifest.json"
+];
+var PLAIN_SEMVER_PATTERN = /^\d+\.\d+\.\d+$/;
+var INITIAL_CHECK_DELAY_MS = 8e3;
+var CHECK_INTERVAL_MS = 15 * 60 * 1e3;
+var INSTALL_RETRY_DELAY_MS = 5e3;
+var RETRY_DELAYS_MS = [
+  3e4,
+  2 * 6e4,
+  5 * 6e4,
+  15 * 6e4,
+  30 * 6e4
+];
+var PERSISTENT_ERROR_THRESHOLD = 3;
+var BLOCKER_LOG_INTERVAL_MS = 6e4;
+var BACKUPS_TO_KEEP = 2;
+var PluginUpdater = class {
+  constructor(config) {
+    this.latestManifest = null;
+    this.verifiedDownload = null;
+    this.checkHandle = null;
+    this.checkScheduledAt = null;
+    this.installHandle = null;
+    this.installScheduledAt = null;
+    this.checkPromise = null;
+    this.installPromise = null;
+    this.failurePhase = null;
+    this.lastBlockerSignature = "";
+    this.lastBlockerLoggedAt = 0;
+    this.started = false;
+    this.stopped = false;
+    this.config = config;
+    this.state = {
+      status: "idle",
+      currentVersion: config.currentVersion,
+      latestVersion: null,
+      releasedAt: null,
+      progressPercent: 0,
+      lastCheckedAt: null,
+      lastError: null,
+      consecutiveFailures: 0,
+      nextRetryAt: null,
+      waitingReason: null
+    };
+  }
+  start() {
+    if (this.started) {
+      return;
+    }
+    this.started = true;
+    this.stopped = false;
+    this.scheduleCheck(INITIAL_CHECK_DELAY_MS);
+  }
+  stop() {
+    this.stopped = true;
+    this.started = false;
+    if (this.checkHandle !== null) {
+      window.clearTimeout(this.checkHandle);
+      this.checkHandle = null;
+      this.checkScheduledAt = null;
+    }
+    if (this.installHandle !== null) {
+      window.clearTimeout(this.installHandle);
+      this.installHandle = null;
+      this.installScheduledAt = null;
+    }
+    this.verifiedDownload = null;
+  }
+  getState() {
+    return { ...this.state };
+  }
+  notifyConnectivityRestored() {
+    if (!this.started || this.stopped || this.state.status === "restart-required") {
+      return;
+    }
+    if (isPluginUpdateAvailable(this.state)) {
+      this.scheduleInstall(0);
+    }
+    this.scheduleCheck(2e3);
+  }
+  scheduleCheck(delayMs) {
+    if (!this.started || this.stopped || this.state.status === "restart-required") {
+      return;
+    }
+    const scheduledAt = Date.now() + Math.max(0, delayMs);
+    if (this.checkHandle !== null && this.checkScheduledAt !== null && this.checkScheduledAt <= scheduledAt) {
+      return;
+    }
+    if (this.checkHandle !== null) {
+      window.clearTimeout(this.checkHandle);
+    }
+    this.checkScheduledAt = scheduledAt;
+    this.checkHandle = window.setTimeout(() => {
+      this.checkHandle = null;
+      this.checkScheduledAt = null;
+      void this.runAutomaticCheck();
+    }, Math.max(0, delayMs));
+  }
+  scheduleInstall(delayMs) {
+    if (!this.started || this.stopped || this.state.status === "restart-required") {
+      return;
+    }
+    const scheduledAt = Date.now() + Math.max(0, delayMs);
+    if (this.installHandle !== null && this.installScheduledAt !== null && this.installScheduledAt <= scheduledAt) {
+      return;
+    }
+    if (this.installHandle !== null) {
+      window.clearTimeout(this.installHandle);
+    }
+    this.installScheduledAt = scheduledAt;
+    this.installHandle = window.setTimeout(() => {
+      this.installHandle = null;
+      this.installScheduledAt = null;
+      void this.runAutomaticInstall();
+    }, Math.max(0, delayMs));
+  }
+  async runAutomaticCheck() {
+    if (this.stopped || this.state.status === "restart-required") {
+      return;
+    }
+    if (navigator.onLine === false) {
+      this.scheduleCheck(CHECK_INTERVAL_MS);
+      return;
+    }
+    if (this.checkPromise || this.installPromise) {
+      this.scheduleCheck(CHECK_INTERVAL_MS);
+      return;
+    }
+    const check = this.runCheck();
+    this.checkPromise = check;
+    try {
+      const state = await check;
+      if (isPluginUpdateAvailable(state)) {
+        this.scheduleInstall(0);
+      }
+      this.scheduleCheck(CHECK_INTERVAL_MS);
+    } catch (error) {
+      if (!this.stopped) {
+        const retryDelay = this.recordFailure("check", error);
+        this.scheduleCheck(retryDelay);
+      }
+    } finally {
+      if (this.checkPromise === check) {
+        this.checkPromise = null;
+      }
+    }
+  }
+  async runAutomaticInstall() {
+    if (this.stopped || this.state.status === "restart-required" || this.installPromise) {
+      return;
+    }
+    if (!this.latestManifest || !isPluginUpdateAvailable(this.state)) {
+      this.scheduleCheck(0);
+      return;
+    }
+    const blockers = this.config.getInstallBlockers();
+    if (blockers.length > 0) {
+      this.updateWaitingState(blockers);
+      this.scheduleInstall(INSTALL_RETRY_DELAY_MS);
+      return;
+    }
+    const install = this.runInstall();
+    this.installPromise = install;
+    try {
+      await install;
+    } catch (error) {
+      if (!this.stopped) {
+        const retryDelay = this.recordFailure("installation", error);
+        this.scheduleInstall(retryDelay);
+      }
+    } finally {
+      if (this.installPromise === install) {
+        this.installPromise = null;
+      }
+    }
+  }
+  updateWaitingState(blockers) {
+    const waitingReason = blockers.length > 0 ? blockers.join(", ") : "sync activity is still settling";
+    const progressPercent = this.verifiedDownload ? 90 : 0;
+    if (this.state.status !== "waiting" || this.state.progressPercent !== progressPercent || this.state.waitingReason !== waitingReason) {
+      this.updateState({
+        status: "waiting",
+        progressPercent,
+        lastError: null,
+        nextRetryAt: null,
+        waitingReason
+      });
+    }
+    const signature = blockers.join("|");
+    const now = Date.now();
+    if (signature !== this.lastBlockerSignature || now - this.lastBlockerLoggedAt >= BLOCKER_LOG_INTERVAL_MS) {
+      this.lastBlockerSignature = signature;
+      this.lastBlockerLoggedAt = now;
+      this.log(
+        `Plugin update ${this.latestManifest?.latestVersion ?? ""} is waiting for a safe idle window: ${waitingReason}.`
+      );
+    }
+  }
+  recordFailure(phase, error) {
+    const message = describeError(error);
+    const consecutiveFailures = this.state.consecutiveFailures + 1;
+    const retryDelay = getRetryDelay(consecutiveFailures);
+    this.failurePhase = phase;
+    this.updateState({
+      status: "error",
+      progressPercent: this.verifiedDownload ? 90 : 0,
+      lastCheckedAt: phase === "check" ? (/* @__PURE__ */ new Date()).toISOString() : this.state.lastCheckedAt,
+      lastError: message,
+      consecutiveFailures,
+      nextRetryAt: new Date(Date.now() + retryDelay).toISOString(),
+      waitingReason: null
+    });
+    this.log(
+      `Plugin update ${phase} failed (attempt ${consecutiveFailures}); retrying automatically: ${message}`,
+      true
+    );
+    return retryDelay;
+  }
+  clearScheduledWork() {
+    if (this.checkHandle !== null) {
+      window.clearTimeout(this.checkHandle);
+      this.checkHandle = null;
+      this.checkScheduledAt = null;
+    }
+    if (this.installHandle !== null) {
+      window.clearTimeout(this.installHandle);
+      this.installHandle = null;
+      this.installScheduledAt = null;
+    }
+  }
+  async runCheck() {
+    const previousLatestVersion = this.latestManifest?.latestVersion ?? null;
+    const previousLastError = this.state.lastError;
+    this.updateState({
+      status: "checking",
+      progressPercent: 0
+    });
+    try {
+      const manifest = await this.config.apiClient.getLatestPluginUpdate();
+      this.assertRunning();
+      validateUpdateManifest(manifest, this.config.pluginId);
+      this.latestManifest = manifest;
+      const updateAvailable = compareSemver(
+        manifest.latestVersion,
+        this.config.currentVersion
+      ) > 0;
+      const preserveInstallFailures = updateAvailable && this.failurePhase === "installation" && previousLatestVersion === manifest.latestVersion;
+      const shouldLogCheckResult = previousLatestVersion === null || previousLatestVersion !== manifest.latestVersion || this.failurePhase === "check";
+      if (this.verifiedDownload && (!updateAvailable || this.verifiedDownload.version !== manifest.latestVersion)) {
+        this.verifiedDownload = null;
+      }
+      this.updateState({
+        status: updateAvailable ? "available" : "current",
+        latestVersion: manifest.latestVersion,
+        releasedAt: manifest.releasedAt,
+        progressPercent: updateAvailable ? 0 : 100,
+        lastCheckedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        lastError: preserveInstallFailures ? previousLastError : null,
+        consecutiveFailures: preserveInstallFailures ? this.state.consecutiveFailures : 0,
+        nextRetryAt: null,
+        waitingReason: null
+      });
+      if (!preserveInstallFailures) {
+        this.failurePhase = null;
+      }
+      if (shouldLogCheckResult) {
+        this.log(
+          updateAvailable ? `Plugin update ${manifest.latestVersion} is available (current ${this.config.currentVersion}).` : `Plugin version ${this.config.currentVersion} is current.`
+        );
+      }
+      return this.getState();
+    } catch (error) {
+      if (this.stopped) {
+        return this.getState();
+      }
+      throw error;
+    }
+  }
+  async runInstall() {
+    const manifest = this.latestManifest;
+    if (!manifest || compareSemver(manifest.latestVersion, this.config.currentVersion) <= 0) {
+      return;
+    }
+    let verifiedDownload = this.verifiedDownload;
+    if (!verifiedDownload || verifiedDownload.version !== manifest.latestVersion) {
+      const files = await this.downloadAndVerifyFiles(manifest);
+      verifiedDownload = {
+        version: manifest.latestVersion,
+        files
+      };
+      this.verifiedDownload = verifiedDownload;
+    }
+    this.assertRunning();
+    if (!await this.config.prepareForInstall()) {
+      this.updateWaitingState(this.config.getInstallBlockers());
+      this.scheduleInstall(INSTALL_RETRY_DELAY_MS);
+      return;
+    }
+    this.assertRunning();
+    this.updateState({
+      status: "installing",
+      progressPercent: 95,
+      lastError: null,
+      nextRetryAt: null,
+      waitingReason: null
+    });
+    await this.installFiles(manifest, verifiedDownload.files);
+    this.verifiedDownload = null;
+    this.failurePhase = null;
+    this.updateState({
+      status: "restart-required",
+      progressPercent: 100,
+      lastError: null,
+      consecutiveFailures: 0,
+      nextRetryAt: null,
+      waitingReason: null
+    });
+    this.log(
+      `Plugin update ${manifest.latestVersion} was installed automatically. Attempting a soft reload.`
+    );
+    this.clearScheduledWork();
+    const reloadScheduled = this.scheduleSoftReload();
+    if (!reloadScheduled) {
+      this.log(
+        `Plugin update ${manifest.latestVersion} is on disk; Obsidian restart is required.`
+      );
+    }
+  }
+  async downloadAndVerifyFiles(manifest) {
+    this.updateState({
+      status: "downloading",
+      progressPercent: 0,
+      lastError: null,
+      nextRetryAt: null,
+      waitingReason: null
+    });
+    const downloaded = /* @__PURE__ */ new Map();
+    const totalBytes = manifest.files.reduce((sum, file) => sum + file.sizeBytes, 0);
+    let completedBytes = 0;
+    for (const descriptor of manifest.files) {
+      this.assertRunning();
+      const response = await this.config.apiClient.downloadPluginUpdateFile(descriptor.url);
+      this.assertRunning();
+      await verifyDownloadedFile(descriptor, response.data);
+      downloaded.set(descriptor.name, {
+        descriptor,
+        data: response.data
+      });
+      completedBytes += response.data.byteLength;
+      this.updateState({
+        status: "downloading",
+        progressPercent: totalBytes > 0 ? Math.min(90, Math.round(completedBytes / totalBytes * 90)) : 90
+      });
+    }
+    validateDownloadedPluginManifest(
+      downloaded.get("manifest.json")?.data,
+      manifest.latestVersion,
+      this.config.pluginId
+    );
+    return downloaded;
+  }
+  async installFiles(manifest, files) {
+    const adapter = this.config.app.vault.adapter;
+    const pluginRoot = (0, import_obsidian8.normalizePath)(
+      `${this.config.app.vault.configDir}/plugins/${this.config.pluginId}`
+    );
+    if (!await adapter.exists(pluginRoot)) {
+      throw new Error(`Rolay plugin folder does not exist at ${pluginRoot}.`);
+    }
+    const updateRoot = (0, import_obsidian8.normalizePath)(`${pluginRoot}/.rolay-update`);
+    const operationId = createOperationId();
+    const stagingRoot = (0, import_obsidian8.normalizePath)(`${updateRoot}/staging-${operationId}`);
+    const rollbackRoot = (0, import_obsidian8.normalizePath)(`${updateRoot}/rollback-${operationId}`);
+    const backupRoot = (0, import_obsidian8.normalizePath)(
+      `${updateRoot}/backup-${Date.now()}-${this.config.currentVersion}`
+    );
+    await ensureDirectory(adapter, updateRoot);
+    await ensureDirectory(adapter, stagingRoot);
+    await ensureDirectory(adapter, rollbackRoot);
+    await ensureDirectory(adapter, backupRoot);
+    let replacementCompleted = false;
+    try {
+      for (const name of REQUIRED_UPDATE_FILES) {
+        const file = files.get(name);
+        if (!file) {
+          throw new Error(`Verified update is missing ${name}.`);
+        }
+        const stagingPath = (0, import_obsidian8.normalizePath)(`${stagingRoot}/${name}`);
+        await adapter.writeBinary(stagingPath, file.data);
+        await verifyDownloadedFile(file.descriptor, await adapter.readBinary(stagingPath));
+      }
+      for (const name of REQUIRED_UPDATE_FILES) {
+        const targetPath = (0, import_obsidian8.normalizePath)(`${pluginRoot}/${name}`);
+        if (await adapter.exists(targetPath)) {
+          await adapter.copy(targetPath, (0, import_obsidian8.normalizePath)(`${backupRoot}/${name}`));
+        } else if (name !== "styles.css") {
+          throw new Error(`Installed plugin is missing required file ${name}.`);
+        }
+      }
+      await replaceInstalledFiles(
+        adapter,
+        pluginRoot,
+        stagingRoot,
+        rollbackRoot
+      );
+      replacementCompleted = true;
+      this.log(
+        `Installed verified plugin ${manifest.latestVersion}; backup stored at ${backupRoot}.`
+      );
+    } finally {
+      await removeDirectoryIfPresent(adapter, stagingRoot);
+      if (replacementCompleted) {
+        await removeDirectoryIfPresent(adapter, rollbackRoot);
+      }
+    }
+    await pruneOldBackups(adapter, updateRoot);
+  }
+  scheduleSoftReload() {
+    const manager = this.config.app.plugins;
+    if (typeof manager?.disablePlugin !== "function" || typeof manager.enablePlugin !== "function" || typeof manager.loadManifests !== "function") {
+      return false;
+    }
+    window.setTimeout(() => {
+      void this.reloadPlugin(manager);
+    }, 250);
+    return true;
+  }
+  async reloadPlugin(manager) {
+    try {
+      await manager.disablePlugin?.(this.config.pluginId);
+      await manager.loadManifests?.();
+      await manager.enablePlugin?.(this.config.pluginId);
+    } catch (error) {
+      console.error("[Rolay] Soft plugin reload failed", error);
+      try {
+        await manager.enablePlugin?.(this.config.pluginId);
+      } catch {
+      }
+      new import_obsidian8.Notice(
+        "Rolay update is installed, but the plugin could not reload. Restart Obsidian to apply it.",
+        1e4
+      );
+    }
+  }
+  updateState(update) {
+    if (this.stopped) {
+      return;
+    }
+    this.state = {
+      ...this.state,
+      ...update
+    };
+    this.config.onStateChange(this.getState());
+  }
+  assertRunning() {
+    if (this.stopped) {
+      throw new Error("Rolay unloaded before the update operation completed.");
+    }
+  }
+  log(message, error = false) {
+    if (!this.stopped) {
+      this.config.log(message, error);
+    }
+  }
+};
+function isPluginUpdateAvailable(state) {
+  return Boolean(
+    state.latestVersion && compareSemver(state.latestVersion, state.currentVersion) > 0
+  );
+}
+function hasPersistentPluginUpdateError(state) {
+  return state.status === "error" && state.consecutiveFailures >= PERSISTENT_ERROR_THRESHOLD;
+}
+function compareSemver(left, right) {
+  const leftParts = parseSemver(left);
+  const rightParts = parseSemver(right);
+  for (let index = 0; index < 3; index += 1) {
+    const difference = leftParts[index] - rightParts[index];
+    if (difference !== 0) {
+      return difference;
+    }
+  }
+  return 0;
+}
+function parseSemver(version) {
+  if (!PLAIN_SEMVER_PATTERN.test(version)) {
+    throw new Error(`Invalid plain semver version: ${version}`);
+  }
+  const parts = version.split(".").map((part) => Number.parseInt(part, 10));
+  return [parts[0], parts[1], parts[2]];
+}
+function validateUpdateManifest(manifest, pluginId) {
+  if (manifest.pluginId !== pluginId) {
+    throw new Error(`Update manifest targets unexpected plugin ${manifest.pluginId}.`);
+  }
+  parseSemver(manifest.latestVersion);
+  if (Number.isNaN(Date.parse(manifest.releasedAt))) {
+    throw new Error("Update manifest has an invalid release timestamp.");
+  }
+  if (manifest.files.length !== REQUIRED_UPDATE_FILES.length) {
+    throw new Error("Update manifest must describe exactly three plugin files.");
+  }
+  const seen = /* @__PURE__ */ new Set();
+  for (const file of manifest.files) {
+    if (!REQUIRED_UPDATE_FILES.includes(file.name) || seen.has(file.name)) {
+      throw new Error(`Update manifest contains unexpected or duplicate file ${file.name}.`);
+    }
+    seen.add(file.name);
+    if (!Number.isSafeInteger(file.sizeBytes) || file.sizeBytes < 0) {
+      throw new Error(`Update manifest has an invalid size for ${file.name}.`);
+    }
+    if (normalizeSha256Hash(file.sha256) !== file.sha256) {
+      throw new Error(`Update manifest has a non-canonical SHA-256 for ${file.name}.`);
+    }
+    const expectedPath = `/v1/plugin-updates/${manifest.latestVersion}/files/${file.name}`;
+    if (file.url !== expectedPath) {
+      throw new Error(`Update manifest has an unexpected download path for ${file.name}.`);
+    }
+  }
+  for (const name of REQUIRED_UPDATE_FILES) {
+    if (!seen.has(name)) {
+      throw new Error(`Update manifest is missing ${name}.`);
+    }
+  }
+}
+async function verifyDownloadedFile(descriptor, data) {
+  if (data.byteLength !== descriptor.sizeBytes) {
+    throw new Error(
+      `${descriptor.name} has ${data.byteLength} bytes; expected ${descriptor.sizeBytes}.`
+    );
+  }
+  const actualHash = await sha256Hash(data);
+  if (actualHash !== descriptor.sha256) {
+    throw new Error(`${descriptor.name} failed SHA-256 verification.`);
+  }
+}
+function validateDownloadedPluginManifest(data, version, pluginId) {
+  if (!data) {
+    throw new Error("Downloaded plugin manifest is missing.");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data));
+  } catch {
+    throw new Error("Downloaded plugin manifest is not valid UTF-8 JSON.");
+  }
+  if (!isRecord2(parsed) || parsed.id !== pluginId || parsed.version !== version) {
+    throw new Error(
+      `Downloaded manifest must declare id "${pluginId}" and version "${version}".`
+    );
+  }
+  if (typeof parsed.minAppVersion !== "string" || !parsed.minAppVersion.trim()) {
+    throw new Error("Downloaded manifest has no minAppVersion.");
+  }
+  if (!(0, import_obsidian8.requireApiVersion)(parsed.minAppVersion)) {
+    throw new Error(
+      `Rolay ${version} requires Obsidian ${parsed.minAppVersion} or newer.`
+    );
+  }
+}
+async function replaceInstalledFiles(adapter, pluginRoot, stagingRoot, rollbackRoot) {
+  const installed = [];
+  try {
+    for (const name of INSTALL_ORDER) {
+      const targetPath = (0, import_obsidian8.normalizePath)(`${pluginRoot}/${name}`);
+      const stagingPath = (0, import_obsidian8.normalizePath)(`${stagingRoot}/${name}`);
+      const rollbackPath = (0, import_obsidian8.normalizePath)(`${rollbackRoot}/${name}`);
+      const hadOriginal = await adapter.exists(targetPath);
+      if (hadOriginal) {
+        await adapter.rename(targetPath, rollbackPath);
+      }
+      try {
+        await adapter.rename(stagingPath, targetPath);
+      } catch (error) {
+        if (hadOriginal && await adapter.exists(rollbackPath)) {
+          await adapter.rename(rollbackPath, targetPath);
+        }
+        throw error;
+      }
+      installed.push({
+        targetPath,
+        rollbackPath,
+        hadOriginal
+      });
+    }
+  } catch (error) {
+    const rollbackErrors = [];
+    for (const file of installed.reverse()) {
+      try {
+        if (await adapter.exists(file.targetPath)) {
+          await adapter.remove(file.targetPath);
+        }
+        if (file.hadOriginal && await adapter.exists(file.rollbackPath)) {
+          await adapter.rename(file.rollbackPath, file.targetPath);
+        }
+      } catch (rollbackError) {
+        rollbackErrors.push(describeError(rollbackError));
+      }
+    }
+    if (rollbackErrors.length > 0) {
+      throw new Error(
+        `${describeError(error)} Rollback also failed: ${rollbackErrors.join("; ")}`
+      );
+    }
+    throw error;
+  }
+}
+async function ensureDirectory(adapter, path) {
+  if (!await adapter.exists(path)) {
+    await adapter.mkdir(path);
+  }
+}
+async function removeDirectoryIfPresent(adapter, path) {
+  try {
+    if (await adapter.exists(path)) {
+      await adapter.rmdir(path, true);
+    }
+  } catch {
+  }
+}
+async function pruneOldBackups(adapter, updateRoot) {
+  try {
+    const listing = await adapter.list(updateRoot);
+    const backups = listing.folders.filter((path) => path.startsWith(`${updateRoot}/backup-`)).sort().reverse();
+    for (const path of backups.slice(BACKUPS_TO_KEEP)) {
+      await adapter.rmdir(path, true);
+    }
+  } catch {
+  }
+}
+function createOperationId() {
+  const randomId = globalThis.crypto?.randomUUID?.();
+  return randomId ? randomId.replace(/-/g, "") : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+function isRecord2(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function describeError(error) {
+  return error instanceof Error ? error.message : String(error);
+}
+function getRetryDelay(consecutiveFailures) {
+  const index = Math.min(
+    Math.max(0, consecutiveFailures - 1),
+    RETRY_DELAYS_MS.length - 1
+  );
+  return RETRY_DELAYS_MS[index];
+}
+
 // src/settings/tab.ts
 var PAGE_SIZE = 3;
-var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
+var RolaySettingTab = class extends import_obsidian9.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
     this.activeView = "rooms";
@@ -14962,7 +15620,8 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
   }
   renderPluginUpdateBanner(containerEl) {
     const state = this.rolay.getPluginUpdateState();
-    const shouldShow = state.status === "available" || state.status === "downloading" || state.status === "installing" || state.status === "restart-required" || state.status === "error" && this.rolay.hasPluginUpdateAvailable();
+    const persistentError = hasPersistentPluginUpdateError(state);
+    const shouldShow = state.status === "restart-required" || persistentError;
     if (!shouldShow) {
       return;
     }
@@ -14970,36 +15629,19 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
       cls: `rolay-update-banner rolay-update-banner-${state.status}`
     });
     const icon = banner.createDiv({ cls: "rolay-update-banner-icon" });
-    (0, import_obsidian8.setIcon)(
+    (0, import_obsidian9.setIcon)(
       icon,
-      state.status === "restart-required" ? "refresh-cw" : state.status === "downloading" || state.status === "installing" ? "loader-circle" : "download"
+      state.status === "restart-required" ? "refresh-cw" : "alert-triangle"
     );
     const copy2 = banner.createDiv({ cls: "rolay-update-banner-copy" });
     copy2.createDiv({
       cls: "rolay-update-banner-title",
-      text: state.status === "restart-required" ? "Rolay update installed" : state.status === "error" ? "Rolay update needs attention" : state.status === "downloading" || state.status === "installing" ? `Updating Rolay: ${state.progressPercent}%` : `Rolay ${state.latestVersion} is available`
+      text: state.status === "restart-required" ? "Rolay update installed" : "Rolay update is retrying"
     });
     copy2.createDiv({
       cls: "rolay-update-banner-detail",
-      text: state.status === "restart-required" ? "Restart Obsidian to load the new plugin files." : state.status === "error" ? state.lastError ?? "The update could not be installed." : `Installed version: ${state.currentVersion}`
+      text: state.status === "restart-required" ? "Restart Obsidian to load the new plugin files." : `${state.lastError ?? "The update service is temporarily unavailable."} No action is required; Rolay will retry automatically.`
     });
-    if (state.status === "downloading" || state.status === "installing") {
-      const progress = banner.createEl("progress", {
-        cls: "rolay-update-banner-progress"
-      });
-      progress.max = 100;
-      progress.value = state.progressPercent;
-      return;
-    }
-    if (state.status === "restart-required") {
-      return;
-    }
-    const action = banner.createEl("button", {
-      cls: "mod-cta rolay-update-action"
-    });
-    (0, import_obsidian8.setIcon)(action, "download");
-    action.createSpan({ text: "Force update" });
-    action.addEventListener("click", () => this.rolay.openPluginUpdateDialog());
   }
   renderAccountView(containerEl, settings, currentUser) {
     const grid = this.createGrid(containerEl);
@@ -15048,7 +15690,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
     const overviewActions = this.createActionRow(overviewCard.body);
     this.createActionButton(overviewActions, "Logout", "mod-warning", async () => {
       await this.rolay.logout();
-      new import_obsidian8.Notice("Rolay session cleared.");
+      new import_obsidian9.Notice("Rolay session cleared.");
       this.activeDetail = null;
       this.activeView = "account";
       this.resetScrollOnNextRender = true;
@@ -15148,18 +15790,12 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
   }
   renderPluginUpdateCard(containerEl, state) {
     const card = this.createCard(containerEl, "Plugin Version");
-    const statusLabel = state.status === "current" ? "up to date" : state.status === "available" ? "update available" : state.status === "downloading" || state.status === "installing" ? `${state.progressPercent}%` : state.status === "restart-required" ? "restart required" : state.status === "error" ? "check failed" : state.status;
+    const statusLabel = state.status === "current" ? "up to date" : state.status === "available" ? "update scheduled" : state.status === "waiting" ? "waiting for sync to settle" : state.status === "downloading" || state.status === "installing" ? `updating automatically (${state.progressPercent}%)` : state.status === "restart-required" ? "restart required" : state.status === "error" ? "retrying automatically" : state.status;
     this.createInfoBlock(card.body, [
       ["Installed", state.currentVersion],
       ["Latest", state.latestVersion ?? "not checked"],
       ["Status", statusLabel]
     ]);
-    const actions = this.createActionRow(card.body);
-    const checkButton = this.createActionButton(actions, "Check now", "", async () => {
-      await this.rolay.checkForPluginUpdate();
-      this.requestRender();
-    });
-    checkButton.disabled = state.status === "checking" || state.status === "downloading" || state.status === "installing";
   }
   renderRoomsView(containerEl, currentUser, rooms) {
     const topGrid = this.createGrid(containerEl);
@@ -15242,7 +15878,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
             title: "Install folder"
           }
         });
-        (0, import_obsidian8.setIcon)(installButton, "download");
+        (0, import_obsidian9.setIcon)(installButton, "download");
         installButton.addEventListener("click", () => {
           void this.promptInstallOrRenameRoom(room);
         });
@@ -15254,7 +15890,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
           title: "Room settings"
         }
       });
-      (0, import_obsidian8.setIcon)(actionButton, "settings");
+      (0, import_obsidian9.setIcon)(actionButton, "settings");
       actionButton.addEventListener("click", () => {
         this.openDetail("room", room.room.workspace.id);
       });
@@ -15270,7 +15906,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
         title: "Back to rooms"
       }
     });
-    (0, import_obsidian8.setIcon)(backButton, "arrow-left");
+    (0, import_obsidian9.setIcon)(backButton, "arrow-left");
     backButton.addEventListener("click", () => {
       this.resetScrollOnNextRender = true;
       this.activeDetail = null;
@@ -15618,7 +16254,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
         title: "Back to admin"
       }
     });
-    (0, import_obsidian8.setIcon)(backButton, "arrow-left");
+    (0, import_obsidian9.setIcon)(backButton, "arrow-left");
     backButton.addEventListener("click", () => {
       this.resetScrollOnNextRender = true;
       this.activeDetail = null;
@@ -15803,7 +16439,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
           "data-tooltip": helpText
         }
       });
-      (0, import_obsidian8.setIcon)(helpButton, "help-circle");
+      (0, import_obsidian9.setIcon)(helpButton, "help-circle");
       helpButton.createSpan({
         cls: "rolay-settings-sr-only",
         text: helpText
@@ -15922,7 +16558,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
         title: "Previous page"
       }
     });
-    (0, import_obsidian8.setIcon)(prevButton, "chevron-left");
+    (0, import_obsidian9.setIcon)(prevButton, "chevron-left");
     prevButton.disabled = pagination.page <= 0;
     prevButton.addEventListener("click", () => {
       this.setListPage(key, pagination.page - 1);
@@ -15935,7 +16571,7 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
         title: "Next page"
       }
     });
-    (0, import_obsidian8.setIcon)(nextButton, "chevron-right");
+    (0, import_obsidian9.setIcon)(nextButton, "chevron-right");
     nextButton.disabled = pagination.page >= pagination.totalPages - 1;
     nextButton.addEventListener("click", () => {
       this.setListPage(key, pagination.page + 1);
@@ -16095,9 +16731,9 @@ var RolaySettingTab = class extends import_obsidian8.PluginSettingTab {
   async copyToClipboard(text2, successMessage) {
     try {
       await navigator.clipboard.writeText(text2);
-      new import_obsidian8.Notice(successMessage);
+      new import_obsidian9.Notice(successMessage);
     } catch (error) {
-      new import_obsidian8.Notice(`Copy failed: ${error instanceof Error ? error.message : String(error)}`);
+      new import_obsidian9.Notice(`Copy failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
   hasFocusedTextInput() {
@@ -16529,6 +17165,7 @@ async function openNodeRequest(urlString, accessToken, signal, nodeRequire, clie
 var OperationsQueue = class {
   constructor(config) {
     this.chain = Promise.resolve();
+    this.pendingCount = 0;
     this.apiClient = config.apiClient;
     this.getDeviceId = config.getDeviceId;
     this.log = config.log;
@@ -16536,10 +17173,11 @@ var OperationsQueue = class {
     this.onAfterApply = config.onAfterApply;
   }
   enqueue(workspaceId, operation, reason) {
+    this.pendingCount += 1;
     const queued = async () => {
       const opWithId = {
         ...operation,
-        opId: createOperationId()
+        opId: createOperationId2()
       };
       this.log(`Sending ${operation.type} (${opWithId.opId}) for ${reason}.`);
       const response = await this.apiClient.applyBatchOperations(workspaceId, {
@@ -16560,8 +17198,14 @@ var OperationsQueue = class {
       return response;
     };
     const task = this.chain.then(queued, queued);
-    this.chain = task.then(() => void 0, () => void 0);
-    return task;
+    const trackedTask = task.finally(() => {
+      this.pendingCount = Math.max(0, this.pendingCount - 1);
+    });
+    this.chain = trackedTask.then(() => void 0, () => void 0);
+    return trackedTask;
+  }
+  isIdle() {
+    return this.pendingCount === 0;
   }
   async waitForIdle() {
     await this.chain;
@@ -16576,7 +17220,7 @@ var RolayOperationError = class extends Error {
     this.result = result;
   }
 };
-function createOperationId() {
+function createOperationId2() {
   if (typeof globalThis.crypto?.randomUUID === "function") {
     return globalThis.crypto.randomUUID();
   }
@@ -17234,7 +17878,7 @@ var TreeStore = class {
     for (const entry of snapshot.entries) {
       this.entriesById.set(entry.id, entry);
       if (!entry.deleted) {
-        this.entriesByPath.set(normalizePath3(entry.path), entry);
+        this.entriesByPath.set(normalizePath4(entry.path), entry);
       }
     }
   }
@@ -17257,16 +17901,16 @@ var TreeStore = class {
     return this.entriesById.get(entryId) ?? null;
   }
   getEntryByPath(path) {
-    return this.entriesByPath.get(normalizePath3(path)) ?? null;
+    return this.entriesByPath.get(normalizePath4(path)) ?? null;
   }
   upsertEntry(entry) {
     const previousEntry = this.entriesById.get(entry.id);
     if (previousEntry) {
-      this.entriesByPath.delete(normalizePath3(previousEntry.path));
+      this.entriesByPath.delete(normalizePath4(previousEntry.path));
     }
     this.entriesById.set(entry.id, entry);
     if (!entry.deleted) {
-      this.entriesByPath.set(normalizePath3(entry.path), entry);
+      this.entriesByPath.set(normalizePath4(entry.path), entry);
     }
   }
   markEntryDeleted(entryId) {
@@ -17274,576 +17918,15 @@ var TreeStore = class {
     if (!existingEntry) {
       return;
     }
-    this.entriesByPath.delete(normalizePath3(existingEntry.path));
+    this.entriesByPath.delete(normalizePath4(existingEntry.path));
     this.entriesById.set(entryId, {
       ...existingEntry,
       deleted: true
     });
   }
 };
-function normalizePath3(path) {
+function normalizePath4(path) {
   return path.replace(/\\/g, "/");
-}
-
-// src/ui/plugin-update-modal.ts
-var import_obsidian9 = require("obsidian");
-var PluginUpdateModal = class extends import_obsidian9.Modal {
-  constructor(app, config) {
-    super(app);
-    this.config = config;
-  }
-  onOpen() {
-    this.modalEl.classList.add("rolay-update-modal");
-    this.setTitle("Rolay update");
-    this.render();
-  }
-  render() {
-    const state = this.config.getState();
-    this.contentEl.empty();
-    if (state.status === "restart-required") {
-      this.contentEl.createEl("p", {
-        text: `Rolay ${state.latestVersion ?? "update"} is installed. Restart Obsidian to load the new files.`
-      });
-      this.createCloseButton();
-      return;
-    }
-    if (state.status === "downloading" || state.status === "installing") {
-      this.contentEl.createEl("p", {
-        text: `Rolay update is in progress: ${state.progressPercent}%.`
-      });
-      const progress = this.contentEl.createEl("progress", {
-        cls: "rolay-update-modal-progress"
-      });
-      progress.max = 100;
-      progress.value = state.progressPercent;
-      this.createCloseButton();
-      return;
-    }
-    this.contentEl.createEl("p", {
-      text: state.latestVersion ? `Installed: ${state.currentVersion}. Available: ${state.latestVersion}.` : `Installed version: ${state.currentVersion}.`
-    });
-    this.contentEl.createEl("p", {
-      cls: "rolay-update-modal-note",
-      text: "Force update downloads and verifies main.js, manifest.json, and styles.css, preserves local Rolay data, then reloads the plugin when Obsidian allows it."
-    });
-    if (state.lastError) {
-      this.contentEl.createEl("p", {
-        cls: "rolay-update-modal-error",
-        text: state.lastError
-      });
-    }
-    const actions = this.contentEl.createDiv({ cls: "rolay-modal-actions" });
-    const cancelButton = actions.createEl("button", { text: "Later" });
-    cancelButton.addEventListener("click", () => this.close());
-    const updateButton = actions.createEl("button", {
-      cls: "mod-cta rolay-update-action"
-    });
-    (0, import_obsidian9.setIcon)(updateButton, "download");
-    updateButton.createSpan({ text: "Force update" });
-    updateButton.addEventListener("click", () => {
-      updateButton.disabled = true;
-      cancelButton.disabled = true;
-      this.close();
-      void this.config.startInstall();
-    });
-  }
-  createCloseButton() {
-    const actions = this.contentEl.createDiv({ cls: "rolay-modal-actions" });
-    const closeButton = actions.createEl("button", {
-      cls: "mod-cta",
-      text: "Close"
-    });
-    closeButton.addEventListener("click", () => this.close());
-  }
-};
-
-// src/update/plugin-updater.ts
-var import_obsidian10 = require("obsidian");
-var REQUIRED_UPDATE_FILES = [
-  "main.js",
-  "manifest.json",
-  "styles.css"
-];
-var INSTALL_ORDER = [
-  "styles.css",
-  "main.js",
-  "manifest.json"
-];
-var PLAIN_SEMVER_PATTERN = /^\d+\.\d+\.\d+$/;
-var INITIAL_CHECK_DELAY_MS = 8e3;
-var CHECK_INTERVAL_MS = 60 * 60 * 1e3;
-var BACKUPS_TO_KEEP = 2;
-var PluginUpdater = class {
-  constructor(config) {
-    this.latestManifest = null;
-    this.initialCheckHandle = null;
-    this.checkIntervalHandle = null;
-    this.checkPromise = null;
-    this.installPromise = null;
-    this.stopped = false;
-    this.config = config;
-    this.state = {
-      status: "idle",
-      currentVersion: config.currentVersion,
-      latestVersion: null,
-      releasedAt: null,
-      progressPercent: 0,
-      lastCheckedAt: null,
-      lastError: null
-    };
-  }
-  start() {
-    if (this.initialCheckHandle !== null || this.checkIntervalHandle !== null) {
-      return;
-    }
-    this.stopped = false;
-    this.initialCheckHandle = window.setTimeout(() => {
-      this.initialCheckHandle = null;
-      void this.checkForUpdates().catch(() => void 0);
-    }, INITIAL_CHECK_DELAY_MS);
-    this.checkIntervalHandle = window.setInterval(() => {
-      void this.checkForUpdates().catch(() => void 0);
-    }, CHECK_INTERVAL_MS);
-  }
-  stop() {
-    this.stopped = true;
-    if (this.initialCheckHandle !== null) {
-      window.clearTimeout(this.initialCheckHandle);
-      this.initialCheckHandle = null;
-    }
-    if (this.checkIntervalHandle !== null) {
-      window.clearInterval(this.checkIntervalHandle);
-      this.checkIntervalHandle = null;
-    }
-  }
-  getState() {
-    return { ...this.state };
-  }
-  checkForUpdates() {
-    if (this.stopped) {
-      return Promise.resolve(this.getState());
-    }
-    if (this.checkPromise) {
-      return this.checkPromise;
-    }
-    if (this.installPromise) {
-      return Promise.resolve(this.getState());
-    }
-    this.checkPromise = this.runCheck().finally(() => {
-      this.checkPromise = null;
-    });
-    return this.checkPromise;
-  }
-  installAvailableUpdate() {
-    if (this.stopped) {
-      return Promise.reject(new Error("Rolay unloaded before the update could start."));
-    }
-    if (this.installPromise) {
-      return this.installPromise;
-    }
-    this.installPromise = this.runInstall().finally(() => {
-      this.installPromise = null;
-    });
-    return this.installPromise;
-  }
-  async runCheck() {
-    this.updateState({
-      status: "checking",
-      progressPercent: 0,
-      lastError: null
-    });
-    try {
-      const manifest = await this.config.apiClient.getLatestPluginUpdate();
-      this.assertRunning();
-      validateUpdateManifest(manifest, this.config.pluginId);
-      this.latestManifest = manifest;
-      const updateAvailable = compareSemver(
-        manifest.latestVersion,
-        this.config.currentVersion
-      ) > 0;
-      this.updateState({
-        status: updateAvailable ? "available" : "current",
-        latestVersion: manifest.latestVersion,
-        releasedAt: manifest.releasedAt,
-        progressPercent: updateAvailable ? 0 : 100,
-        lastCheckedAt: (/* @__PURE__ */ new Date()).toISOString(),
-        lastError: null
-      });
-      this.log(
-        updateAvailable ? `Plugin update ${manifest.latestVersion} is available (current ${this.config.currentVersion}).` : `Plugin version ${this.config.currentVersion} is current.`
-      );
-      return this.getState();
-    } catch (error) {
-      if (this.stopped) {
-        return this.getState();
-      }
-      const message = describeError(error);
-      this.updateState({
-        status: "error",
-        progressPercent: 0,
-        lastCheckedAt: (/* @__PURE__ */ new Date()).toISOString(),
-        lastError: message
-      });
-      this.log(`Plugin update check failed: ${message}`, true);
-      throw error;
-    }
-  }
-  async runInstall() {
-    let manifest = this.latestManifest;
-    if (!manifest || compareSemver(manifest.latestVersion, this.config.currentVersion) <= 0) {
-      await this.checkForUpdates();
-      manifest = this.latestManifest;
-    }
-    if (!manifest || compareSemver(manifest.latestVersion, this.config.currentVersion) <= 0) {
-      throw new Error("No newer Rolay plugin version is available.");
-    }
-    try {
-      const files = await this.downloadAndVerifyFiles(manifest);
-      this.assertRunning();
-      await this.config.prepareForInstall();
-      this.assertRunning();
-      this.updateState({
-        status: "installing",
-        progressPercent: 95,
-        lastError: null
-      });
-      await this.installFiles(manifest, files);
-      this.updateState({
-        status: "restart-required",
-        progressPercent: 100,
-        lastError: null
-      });
-      this.log(
-        `Plugin update ${manifest.latestVersion} was installed. Attempting a soft reload.`
-      );
-      const reloadScheduled = this.scheduleSoftReload();
-      if (!reloadScheduled) {
-        this.log(
-          `Plugin update ${manifest.latestVersion} is on disk; Obsidian restart is required.`
-        );
-      }
-      return {
-        version: manifest.latestVersion,
-        reloaded: reloadScheduled,
-        restartRequired: !reloadScheduled
-      };
-    } catch (error) {
-      const message = describeError(error);
-      this.updateState({
-        status: "error",
-        progressPercent: 0,
-        lastError: message
-      });
-      this.log(`Plugin update installation failed: ${message}`, true);
-      throw error;
-    }
-  }
-  async downloadAndVerifyFiles(manifest) {
-    this.updateState({
-      status: "downloading",
-      progressPercent: 0,
-      lastError: null
-    });
-    const downloaded = /* @__PURE__ */ new Map();
-    const totalBytes = manifest.files.reduce((sum, file) => sum + file.sizeBytes, 0);
-    let completedBytes = 0;
-    for (const descriptor of manifest.files) {
-      this.assertRunning();
-      const response = await this.config.apiClient.downloadPluginUpdateFile(descriptor.url);
-      this.assertRunning();
-      await verifyDownloadedFile(descriptor, response.data);
-      downloaded.set(descriptor.name, {
-        descriptor,
-        data: response.data
-      });
-      completedBytes += response.data.byteLength;
-      this.updateState({
-        status: "downloading",
-        progressPercent: totalBytes > 0 ? Math.min(90, Math.round(completedBytes / totalBytes * 90)) : 90
-      });
-    }
-    validateDownloadedPluginManifest(
-      downloaded.get("manifest.json")?.data,
-      manifest.latestVersion,
-      this.config.pluginId
-    );
-    return downloaded;
-  }
-  async installFiles(manifest, files) {
-    const adapter = this.config.app.vault.adapter;
-    const pluginRoot = (0, import_obsidian10.normalizePath)(
-      `${this.config.app.vault.configDir}/plugins/${this.config.pluginId}`
-    );
-    if (!await adapter.exists(pluginRoot)) {
-      throw new Error(`Rolay plugin folder does not exist at ${pluginRoot}.`);
-    }
-    const updateRoot = (0, import_obsidian10.normalizePath)(`${pluginRoot}/.rolay-update`);
-    const operationId = createOperationId2();
-    const stagingRoot = (0, import_obsidian10.normalizePath)(`${updateRoot}/staging-${operationId}`);
-    const rollbackRoot = (0, import_obsidian10.normalizePath)(`${updateRoot}/rollback-${operationId}`);
-    const backupRoot = (0, import_obsidian10.normalizePath)(
-      `${updateRoot}/backup-${Date.now()}-${this.config.currentVersion}`
-    );
-    await ensureDirectory(adapter, updateRoot);
-    await ensureDirectory(adapter, stagingRoot);
-    await ensureDirectory(adapter, rollbackRoot);
-    await ensureDirectory(adapter, backupRoot);
-    let replacementCompleted = false;
-    try {
-      for (const name of REQUIRED_UPDATE_FILES) {
-        const file = files.get(name);
-        if (!file) {
-          throw new Error(`Verified update is missing ${name}.`);
-        }
-        const stagingPath = (0, import_obsidian10.normalizePath)(`${stagingRoot}/${name}`);
-        await adapter.writeBinary(stagingPath, file.data);
-        await verifyDownloadedFile(file.descriptor, await adapter.readBinary(stagingPath));
-      }
-      for (const name of REQUIRED_UPDATE_FILES) {
-        const targetPath = (0, import_obsidian10.normalizePath)(`${pluginRoot}/${name}`);
-        if (await adapter.exists(targetPath)) {
-          await adapter.copy(targetPath, (0, import_obsidian10.normalizePath)(`${backupRoot}/${name}`));
-        } else if (name !== "styles.css") {
-          throw new Error(`Installed plugin is missing required file ${name}.`);
-        }
-      }
-      await replaceInstalledFiles(
-        adapter,
-        pluginRoot,
-        stagingRoot,
-        rollbackRoot
-      );
-      replacementCompleted = true;
-      this.log(
-        `Installed verified plugin ${manifest.latestVersion}; backup stored at ${backupRoot}.`
-      );
-    } finally {
-      await removeDirectoryIfPresent(adapter, stagingRoot);
-      if (replacementCompleted) {
-        await removeDirectoryIfPresent(adapter, rollbackRoot);
-      }
-    }
-    await pruneOldBackups(adapter, updateRoot);
-  }
-  scheduleSoftReload() {
-    const manager = this.config.app.plugins;
-    if (typeof manager?.disablePlugin !== "function" || typeof manager.enablePlugin !== "function" || typeof manager.loadManifests !== "function") {
-      return false;
-    }
-    window.setTimeout(() => {
-      void this.reloadPlugin(manager);
-    }, 250);
-    return true;
-  }
-  async reloadPlugin(manager) {
-    try {
-      await manager.disablePlugin?.(this.config.pluginId);
-      await manager.loadManifests?.();
-      await manager.enablePlugin?.(this.config.pluginId);
-    } catch (error) {
-      console.error("[Rolay] Soft plugin reload failed", error);
-      try {
-        await manager.enablePlugin?.(this.config.pluginId);
-      } catch {
-      }
-      new import_obsidian10.Notice(
-        "Rolay update is installed, but the plugin could not reload. Restart Obsidian to apply it.",
-        1e4
-      );
-    }
-  }
-  updateState(update) {
-    if (this.stopped) {
-      return;
-    }
-    this.state = {
-      ...this.state,
-      ...update
-    };
-    this.config.onStateChange(this.getState());
-  }
-  assertRunning() {
-    if (this.stopped) {
-      throw new Error("Rolay unloaded before the update operation completed.");
-    }
-  }
-  log(message, error = false) {
-    if (!this.stopped) {
-      this.config.log(message, error);
-    }
-  }
-};
-function isPluginUpdateAvailable(state) {
-  return Boolean(
-    state.latestVersion && compareSemver(state.latestVersion, state.currentVersion) > 0
-  );
-}
-function compareSemver(left, right) {
-  const leftParts = parseSemver(left);
-  const rightParts = parseSemver(right);
-  for (let index = 0; index < 3; index += 1) {
-    const difference = leftParts[index] - rightParts[index];
-    if (difference !== 0) {
-      return difference;
-    }
-  }
-  return 0;
-}
-function parseSemver(version) {
-  if (!PLAIN_SEMVER_PATTERN.test(version)) {
-    throw new Error(`Invalid plain semver version: ${version}`);
-  }
-  const parts = version.split(".").map((part) => Number.parseInt(part, 10));
-  return [parts[0], parts[1], parts[2]];
-}
-function validateUpdateManifest(manifest, pluginId) {
-  if (manifest.pluginId !== pluginId) {
-    throw new Error(`Update manifest targets unexpected plugin ${manifest.pluginId}.`);
-  }
-  parseSemver(manifest.latestVersion);
-  if (Number.isNaN(Date.parse(manifest.releasedAt))) {
-    throw new Error("Update manifest has an invalid release timestamp.");
-  }
-  if (manifest.files.length !== REQUIRED_UPDATE_FILES.length) {
-    throw new Error("Update manifest must describe exactly three plugin files.");
-  }
-  const seen = /* @__PURE__ */ new Set();
-  for (const file of manifest.files) {
-    if (!REQUIRED_UPDATE_FILES.includes(file.name) || seen.has(file.name)) {
-      throw new Error(`Update manifest contains unexpected or duplicate file ${file.name}.`);
-    }
-    seen.add(file.name);
-    if (!Number.isSafeInteger(file.sizeBytes) || file.sizeBytes < 0) {
-      throw new Error(`Update manifest has an invalid size for ${file.name}.`);
-    }
-    if (normalizeSha256Hash(file.sha256) !== file.sha256) {
-      throw new Error(`Update manifest has a non-canonical SHA-256 for ${file.name}.`);
-    }
-    const expectedPath = `/v1/plugin-updates/${manifest.latestVersion}/files/${file.name}`;
-    if (file.url !== expectedPath) {
-      throw new Error(`Update manifest has an unexpected download path for ${file.name}.`);
-    }
-  }
-  for (const name of REQUIRED_UPDATE_FILES) {
-    if (!seen.has(name)) {
-      throw new Error(`Update manifest is missing ${name}.`);
-    }
-  }
-}
-async function verifyDownloadedFile(descriptor, data) {
-  if (data.byteLength !== descriptor.sizeBytes) {
-    throw new Error(
-      `${descriptor.name} has ${data.byteLength} bytes; expected ${descriptor.sizeBytes}.`
-    );
-  }
-  const actualHash = await sha256Hash(data);
-  if (actualHash !== descriptor.sha256) {
-    throw new Error(`${descriptor.name} failed SHA-256 verification.`);
-  }
-}
-function validateDownloadedPluginManifest(data, version, pluginId) {
-  if (!data) {
-    throw new Error("Downloaded plugin manifest is missing.");
-  }
-  let parsed;
-  try {
-    parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data));
-  } catch {
-    throw new Error("Downloaded plugin manifest is not valid UTF-8 JSON.");
-  }
-  if (!isRecord2(parsed) || parsed.id !== pluginId || parsed.version !== version) {
-    throw new Error(
-      `Downloaded manifest must declare id "${pluginId}" and version "${version}".`
-    );
-  }
-  if (typeof parsed.minAppVersion !== "string" || !parsed.minAppVersion.trim()) {
-    throw new Error("Downloaded manifest has no minAppVersion.");
-  }
-  if (!(0, import_obsidian10.requireApiVersion)(parsed.minAppVersion)) {
-    throw new Error(
-      `Rolay ${version} requires Obsidian ${parsed.minAppVersion} or newer.`
-    );
-  }
-}
-async function replaceInstalledFiles(adapter, pluginRoot, stagingRoot, rollbackRoot) {
-  const installed = [];
-  try {
-    for (const name of INSTALL_ORDER) {
-      const targetPath = (0, import_obsidian10.normalizePath)(`${pluginRoot}/${name}`);
-      const stagingPath = (0, import_obsidian10.normalizePath)(`${stagingRoot}/${name}`);
-      const rollbackPath = (0, import_obsidian10.normalizePath)(`${rollbackRoot}/${name}`);
-      const hadOriginal = await adapter.exists(targetPath);
-      if (hadOriginal) {
-        await adapter.rename(targetPath, rollbackPath);
-      }
-      try {
-        await adapter.rename(stagingPath, targetPath);
-      } catch (error) {
-        if (hadOriginal && await adapter.exists(rollbackPath)) {
-          await adapter.rename(rollbackPath, targetPath);
-        }
-        throw error;
-      }
-      installed.push({
-        targetPath,
-        rollbackPath,
-        hadOriginal
-      });
-    }
-  } catch (error) {
-    const rollbackErrors = [];
-    for (const file of installed.reverse()) {
-      try {
-        if (await adapter.exists(file.targetPath)) {
-          await adapter.remove(file.targetPath);
-        }
-        if (file.hadOriginal && await adapter.exists(file.rollbackPath)) {
-          await adapter.rename(file.rollbackPath, file.targetPath);
-        }
-      } catch (rollbackError) {
-        rollbackErrors.push(describeError(rollbackError));
-      }
-    }
-    if (rollbackErrors.length > 0) {
-      throw new Error(
-        `${describeError(error)} Rollback also failed: ${rollbackErrors.join("; ")}`
-      );
-    }
-    throw error;
-  }
-}
-async function ensureDirectory(adapter, path) {
-  if (!await adapter.exists(path)) {
-    await adapter.mkdir(path);
-  }
-}
-async function removeDirectoryIfPresent(adapter, path) {
-  try {
-    if (await adapter.exists(path)) {
-      await adapter.rmdir(path, true);
-    }
-  } catch {
-  }
-}
-async function pruneOldBackups(adapter, updateRoot) {
-  try {
-    const listing = await adapter.list(updateRoot);
-    const backups = listing.folders.filter((path) => path.startsWith(`${updateRoot}/backup-`)).sort().reverse();
-    for (const path of backups.slice(BACKUPS_TO_KEEP)) {
-      await adapter.rmdir(path, true);
-    }
-  } catch {
-  }
-}
-function createOperationId2() {
-  const randomId = globalThis.crypto?.randomUUID?.();
-  return randomId ? randomId.replace(/-/g, "") : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-}
-function isRecord2(value) {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-function describeError(error) {
-  return error instanceof Error ? error.message : String(error);
 }
 
 // src/utils/base64.ts
@@ -17866,7 +17949,7 @@ function decodeBase64(encoded) {
 }
 
 // src/main.ts
-var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
+var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
   constructor() {
     super(...arguments);
     this.roomRuntime = /* @__PURE__ */ new Map();
@@ -17902,10 +17985,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.settingsEventStreamStatus = "stopped";
     this.settingsStreamRecoveryInFlight = false;
     this.startupBootstrapHandle = null;
+    this.startupBootstrapInFlight = false;
     this.startupRoomResumeHandles = /* @__PURE__ */ new Set();
     this.lifecycleRecoveryHandle = null;
     this.lifecycleRecoveryInFlight = false;
     this.mobileHiddenAt = null;
+    this.lastPluginUpdateActivityAt = Date.now();
     this.profileDraftDisplayName = "";
     this.passwordChangeDraft = {
       currentPassword: "",
@@ -17954,8 +18039,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       apiClient: this.apiClient,
       pluginId: this.manifest.id,
       currentVersion: this.manifest.version,
+      getInstallBlockers: () => this.getPluginUpdateInstallBlockers(),
       prepareForInstall: async () => {
-        await this.prepareForPluginUpdate();
+        return this.prepareForPluginUpdate();
       },
       onStateChange: () => {
         this.updatePluginUpdateUi();
@@ -17967,8 +18053,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     });
     this.updateRibbonEl = this.addRibbonIcon(
       "download",
-      "Rolay update",
-      () => this.openPluginUpdateDialog()
+      "Rolay update status",
+      () => this.showPluginUpdateStatus()
     );
     this.updateRibbonEl.classList.add("rolay-update-ribbon");
     this.updatePluginUpdateUi();
@@ -18014,7 +18100,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       isWorkspaceSyncActive: (workspaceId) => this.isRoomSyncActive(workspaceId),
       hasPendingCreate: (workspaceId, path) => this.hasPendingLocalCreate(workspaceId, path),
       hasPendingDelete: (workspaceId, path) => this.hasPendingLocalDelete(workspaceId, path),
-      hasPendingBinaryWrite: (localPath) => (0, import_obsidian11.normalizePath)(localPath) in this.data.pendingBinaryWrites,
+      hasPendingBinaryWrite: (localPath) => (0, import_obsidian10.normalizePath)(localPath) in this.data.pendingBinaryWrites,
       log: (message) => this.recordLog("bridge", message),
       onCreateFolder: (workspaceId, path) => this.queueCreateFolder(workspaceId, path),
       onCreateMarkdown: (workspaceId, path, localContent) => this.queueCreateMarkdown(workspaceId, path, localContent),
@@ -18034,12 +18120,14 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.registerCommands();
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
+        this.notePluginUpdateActivity();
         void this.handleFileOpen(file);
       })
     );
     this.registerEvent(
       this.app.workspace.on("editor-change", (editor, info) => {
-        if (info instanceof import_obsidian11.MarkdownView) {
+        this.notePluginUpdateActivity();
+        if (info instanceof import_obsidian10.MarkdownView) {
           this.crdtManager.handleEditorChange(editor, info);
         }
       })
@@ -18052,44 +18140,52 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       })
     );
     this.registerDomEvent(window, "online", () => {
+      this.pluginUpdater.notifyConnectivityRestored();
       this.scheduleLiveTransportRecovery("network-online");
     });
-    if (import_obsidian11.Platform.isMobileApp) {
+    if (import_obsidian10.Platform.isMobileApp) {
       this.registerDomEvent(document, "visibilitychange", () => {
         this.handleMobileVisibilityChange();
       });
       this.registerDomEvent(window, "pageshow", () => {
+        this.pluginUpdater.notifyConnectivityRestored();
         this.scheduleLiveTransportRecovery("mobile-pageshow");
       });
     }
     this.ensureExplorerMutationObserver();
     this.registerDomEvent(this.app.workspace.containerEl, "click", (event) => {
+      this.notePluginUpdateActivity();
       if (this.isExplorerFolderInteractionTarget(event.target)) {
         this.refreshExplorerDecorationsAfterFolderToggle();
       }
     }, true);
     this.registerDomEvent(this.app.workspace.containerEl, "keydown", (event) => {
+      this.notePluginUpdateActivity();
       if ((event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "Enter" || event.key === " ") && this.isExplorerFolderInteractionTarget(event.target)) {
         this.refreshExplorerDecorationsAfterFolderToggle();
       }
     }, true);
     this.registerEvent(
       this.app.vault.on("create", (file) => {
+        this.notePluginUpdateActivity();
         void this.handleVaultCreate(file);
       })
     );
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
+        this.notePluginUpdateActivity();
         void this.handleVaultRename(file, oldPath);
       })
     );
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
+        this.notePluginUpdateActivity();
         void this.handleVaultModify(file);
       })
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
+        this.notePluginUpdateActivity();
         void this.handleVaultDelete(file);
       })
     );
@@ -18165,55 +18261,20 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   getPluginUpdateState() {
     return this.pluginUpdater.getState();
   }
-  hasPluginUpdateAvailable() {
-    return isPluginUpdateAvailable(this.pluginUpdater.getState());
-  }
-  async checkForPluginUpdate(showNotice = true) {
-    try {
-      const state = await this.pluginUpdater.checkForUpdates();
-      if (this.isUnloading || !showNotice) {
-        return;
-      }
-      if (isPluginUpdateAvailable(state)) {
-        new import_obsidian11.Notice(`Rolay ${state.latestVersion} is available.`);
-      } else {
-        new import_obsidian11.Notice(`Rolay ${state.currentVersion} is up to date.`);
-      }
-    } catch (error) {
-      if (this.isUnloading) {
-        return;
-      }
-      this.handleError("Rolay update check failed", error, showNotice);
+  showPluginUpdateStatus() {
+    const state = this.pluginUpdater.getState();
+    if (state.status === "restart-required") {
+      new import_obsidian10.Notice(
+        `Rolay ${state.latestVersion ?? ""} is installed. Restart Obsidian to load it.`,
+        1e4
+      );
+      return;
     }
-  }
-  openPluginUpdateDialog() {
-    new PluginUpdateModal(this.app, {
-      getState: () => this.pluginUpdater.getState(),
-      startInstall: async () => {
-        await this.forcePluginUpdate();
-      }
-    }).open();
-  }
-  async forcePluginUpdate() {
-    try {
-      new import_obsidian11.Notice("Downloading and verifying the Rolay update.");
-      const result = await this.pluginUpdater.installAvailableUpdate();
-      if (this.isUnloading) {
-        return;
-      }
-      if (result.restartRequired) {
-        new import_obsidian11.Notice(
-          `Rolay ${result.version} is installed. Restart Obsidian to apply it.`,
-          1e4
-        );
-      } else {
-        new import_obsidian11.Notice(`Rolay was updated to ${result.version}.`);
-      }
-    } catch (error) {
-      if (this.isUnloading) {
-        return;
-      }
-      this.handleError("Rolay update failed", error);
+    if (hasPersistentPluginUpdateError(state)) {
+      new import_obsidian10.Notice(
+        `Rolay update is retrying automatically. ${state.lastError ?? "The update service is unavailable."}`,
+        1e4
+      );
     }
   }
   getCurrentUser() {
@@ -18466,7 +18527,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       }
       this.recordLog("auth", `Logged in as ${response.user.username}.`);
       if (showNotice) {
-        new import_obsidian11.Notice(`Rolay login successful for ${response.user.username}.`);
+        new import_obsidian10.Notice(`Rolay login successful for ${response.user.username}.`);
       }
       this.updateStatusBar();
     } catch (error) {
@@ -18480,7 +18541,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       await this.fetchCurrentUser(false);
       this.recordLog("auth", "Session tokens refreshed.");
       if (showNotice) {
-        new import_obsidian11.Notice("Rolay session refreshed.");
+        new import_obsidian10.Notice("Rolay session refreshed.");
       }
       this.updateStatusBar();
     } catch (error) {
@@ -18526,7 +18587,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       this.recordLog("auth", `Loaded current user ${response.user.username}.`);
     }
     if (showNotice) {
-      new import_obsidian11.Notice(`Current Rolay user: ${response.user.displayName}`);
+      new import_obsidian10.Notice(`Current Rolay user: ${response.user.displayName}`);
     }
     return response.user;
   }
@@ -18540,7 +18601,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       await this.applySessionUser(response.user);
       await this.crdtManager.refreshPresencePreferences();
       this.recordLog("auth", `Updated display name to ${response.user.displayName}.`);
-      new import_obsidian11.Notice(`Rolay display name updated to ${response.user.displayName}.`);
+      new import_obsidian10.Notice(`Rolay display name updated to ${response.user.displayName}.`);
     } catch (error) {
       this.handleError("Display name update failed", error);
       throw error;
@@ -18579,12 +18640,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         password: newPassword
       });
       this.recordLog("auth", `Changed password for ${response.user.username}. Session tokens were rotated.`);
-      new import_obsidian11.Notice("Rolay password updated. The current session was rotated.");
+      new import_obsidian10.Notice("Rolay password updated. The current session was rotated.");
     } catch (error) {
       const friendlyMessage = this.getPasswordChangeErrorMessage(error);
       if (friendlyMessage) {
         this.recordLog("error", `Password change failed: ${friendlyMessage}`, "error");
-        new import_obsidian11.Notice(friendlyMessage);
+        new import_obsidian10.Notice(friendlyMessage);
         throw new Error(friendlyMessage);
       }
       this.handleError("Password change failed", error);
@@ -18600,7 +18661,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       this.recordLog("rooms", `Loaded ${this.roomList.length} room(s).`);
     }
     if (showNotice) {
-      new import_obsidian11.Notice(`Loaded ${this.roomList.length} Rolay room(s).`);
+      new import_obsidian10.Notice(`Loaded ${this.roomList.length} Rolay room(s).`);
     }
     this.updateStatusBar();
     return this.getRoomList();
@@ -18619,7 +18680,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       this.clearCreateRoomDraft();
       await this.refreshRooms(false);
       this.recordLog("rooms", `Created room ${response.workspace.name} (${response.workspace.id}).`);
-      new import_obsidian11.Notice(`Rolay room created: ${response.workspace.name}`);
+      new import_obsidian10.Notice(`Rolay room created: ${response.workspace.name}`);
     } catch (error) {
       this.handleError("Room creation failed", error);
       throw error;
@@ -18636,7 +18697,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       this.clearJoinRoomDraft();
       await this.refreshRooms(false);
       this.recordLog("rooms", `Joined room ${response.workspace.name} (${response.workspace.id}).`);
-      new import_obsidian11.Notice(`Joined Rolay room: ${response.workspace.name}`);
+      new import_obsidian10.Notice(`Joined Rolay room: ${response.workspace.name}`);
     } catch (error) {
       this.handleError("Join room failed", error);
       throw error;
@@ -18687,7 +18748,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     try {
       await this.connectRoom(room.workspace.id, false, "download");
       this.recordLog("rooms", `Installed room ${room.workspace.name} into ${localRoot}.`);
-      new import_obsidian11.Notice(`Rolay room installed: ${room.workspace.name}`);
+      new import_obsidian10.Notice(`Rolay room installed: ${room.workspace.name}`);
     } catch (error) {
       this.handleError("Room download failed", error);
       throw error;
@@ -18716,7 +18777,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       await this.bindActiveMarkdownToCrdt();
     }
     if (showNotice) {
-      new import_obsidian11.Notice(`Rolay room connected: ${room.workspace.name}`);
+      new import_obsidian10.Notice(`Rolay room connected: ${room.workspace.name}`);
     }
   }
   async disconnectRoom(workspaceId, showNotice = true) {
@@ -18729,7 +18790,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       this.updateStatusBar();
     }
     if (showNotice) {
-      new import_obsidian11.Notice(`Rolay room disconnected: ${room.workspace.name}`);
+      new import_obsidian10.Notice(`Rolay room disconnected: ${room.workspace.name}`);
     }
   }
   async installRoom(workspaceId, folderName) {
@@ -18780,7 +18841,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     });
     await this.bindActiveMarkdownToCrdt();
     this.recordLog("rooms", `Renamed local room folder for ${room.workspace.id} from ${currentFolderName} to ${nextFolderName}.`);
-    new import_obsidian11.Notice(`Rolay room folder renamed to ${nextFolderName}.`);
+    new import_obsidian10.Notice(`Rolay room folder renamed to ${nextFolderName}.`);
   }
   async refreshRoomInvite(workspaceId, showNotice = true, logActivity = true) {
     const room = this.requireOwnerRoom(workspaceId);
@@ -18791,7 +18852,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       this.recordLog("invite", `Loaded invite state for ${room.workspace.id}.`);
     }
     if (showNotice) {
-      new import_obsidian11.Notice(`Invite key loaded for ${room.workspace.name}.`);
+      new import_obsidian10.Notice(`Invite key loaded for ${room.workspace.name}.`);
     }
     return response.invite;
   }
@@ -18802,7 +18863,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       this.roomInvites.set(room.workspace.id, response.invite);
       this.patchInviteEnabled(room.workspace.id, response.invite.enabled);
       this.recordLog("invite", `${enabled ? "Enabled" : "Disabled"} invite key for ${room.workspace.id}.`);
-      new import_obsidian11.Notice(`Invite key ${enabled ? "enabled" : "disabled"} for ${room.workspace.name}.`);
+      new import_obsidian10.Notice(`Invite key ${enabled ? "enabled" : "disabled"} for ${room.workspace.name}.`);
     } catch (error) {
       this.handleError("Invite state update failed", error);
       throw error;
@@ -18815,7 +18876,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       this.roomInvites.set(room.workspace.id, response.invite);
       this.patchInviteEnabled(room.workspace.id, response.invite.enabled);
       this.recordLog("invite", `Regenerated invite key for ${room.workspace.id}.`);
-      new import_obsidian11.Notice(`Invite key regenerated for ${room.workspace.name}.`);
+      new import_obsidian10.Notice(`Invite key regenerated for ${room.workspace.name}.`);
     } catch (error) {
       this.handleError("Invite regenerate failed", error);
       throw error;
@@ -18863,7 +18924,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         `${enabled ? "Enabled" : "Disabled"} public publication for ${workspaceId}.`
       );
       this.updateStatusBar();
-      new import_obsidian11.Notice(
+      new import_obsidian10.Notice(
         enabled ? `Room is now public on the read-only site: ${roomName}` : `Room is now private again: ${roomName}`
       );
       this.requestSettingsRender();
@@ -18880,7 +18941,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       this.recordLog("admin", `Loaded ${this.managedUsers.length} managed user(s).`);
     }
     if (showNotice) {
-      new import_obsidian11.Notice(`Loaded ${this.managedUsers.length} managed user(s).`);
+      new import_obsidian10.Notice(`Loaded ${this.managedUsers.length} managed user(s).`);
     }
     return this.getManagedUsers();
   }
@@ -18904,7 +18965,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         "admin",
         `Created managed user ${response.user.username} (${response.user.globalRole}).`
       );
-      new import_obsidian11.Notice(`Rolay account created: ${response.user.username}`);
+      new import_obsidian10.Notice(`Rolay account created: ${response.user.username}`);
       this.clearManagedUserDraft();
       await this.refreshManagedUsers(false);
     } catch (error) {
@@ -18918,7 +18979,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       const response = await this.apiClient.deleteManagedUser(userId);
       this.managedUsers = this.managedUsers.filter((user) => user.id !== userId);
       this.recordLog("admin", `Deleted managed user ${response.user.username}.`);
-      new import_obsidian11.Notice(`Rolay account deleted: ${response.user.username}`);
+      new import_obsidian10.Notice(`Rolay account deleted: ${response.user.username}`);
       if (this.adminRoomMembers.some((member) => member.user.id === userId)) {
         await this.refreshAdminRoomMembers(false);
       }
@@ -18941,7 +19002,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       this.recordLog("admin", `Loaded ${this.adminRoomList.length} room(s) in admin scope.`);
     }
     if (showNotice) {
-      new import_obsidian11.Notice(`Loaded ${this.adminRoomList.length} admin room(s).`);
+      new import_obsidian10.Notice(`Loaded ${this.adminRoomList.length} admin room(s).`);
     }
     return this.getAdminRooms();
   }
@@ -18958,7 +19019,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       this.recordLog("admin", `Loaded ${this.adminRoomMembers.length} member(s) for room ${targetRoomId}.`);
     }
     if (showNotice) {
-      new import_obsidian11.Notice(`Loaded ${this.adminRoomMembers.length} room member(s).`);
+      new import_obsidian10.Notice(`Loaded ${this.adminRoomMembers.length} room member(s).`);
     }
     return this.getAdminRoomMembers();
   }
@@ -19004,7 +19065,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         "admin",
         `Added ${response.user.username} to room ${response.workspace.id} as ${response.membership.role}.`
       );
-      new import_obsidian11.Notice(`Added ${response.user.username} to ${response.workspace.name}.`);
+      new import_obsidian10.Notice(`Added ${response.user.username} to ${response.workspace.name}.`);
       this.clearAdminRoomMemberDraft();
       await this.refreshAdminRoomMembers(false, roomId);
       await this.refreshAdminRooms(false);
@@ -19023,7 +19084,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     try {
       const response = await this.apiClient.deleteRoomAsAdmin(targetRoomId);
       this.recordLog("admin", `Deleted room ${response.workspace.name} (${response.workspace.id}).`);
-      new import_obsidian11.Notice(`Deleted Rolay room: ${response.workspace.name}`);
+      new import_obsidian10.Notice(`Deleted Rolay room: ${response.workspace.name}`);
       await this.deactivateRoomDownload(targetRoomId);
       if (this.adminSelectedRoomId === targetRoomId) {
         this.adminSelectedRoomId = "";
@@ -19423,11 +19484,17 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       );
       return;
     }
+    if (this.startupBootstrapInFlight) {
+      return;
+    }
+    this.startupBootstrapInFlight = true;
     try {
       await this.ensureAuthenticated(true, !reason.includes("startup"));
       await this.resumeDownloadedRooms(reason);
     } catch (error) {
       this.handleError("Startup sync failed", error, false);
+    } finally {
+      this.startupBootstrapInFlight = false;
     }
   }
   scheduleStartupBootstrap(reason) {
@@ -19472,6 +19539,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     }
     const hiddenDurationMs = this.mobileHiddenAt === null ? null : Math.max(0, Date.now() - this.mobileHiddenAt);
     this.mobileHiddenAt = null;
+    this.pluginUpdater.notifyConnectivityRestored();
     this.scheduleLiveTransportRecovery(
       hiddenDurationMs === null ? "mobile-visible" : `mobile-resume-${hiddenDurationMs}ms`
     );
@@ -19607,7 +19675,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   }
   async handleVaultModify(file) {
     try {
-      if (!(file instanceof import_obsidian11.TFile) || isMarkdownPath(file.path)) {
+      if (!(file instanceof import_obsidian10.TFile) || isMarkdownPath(file.path)) {
         return;
       }
       await this.fileBridge.handleVaultModify(file);
@@ -19855,11 +19923,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     const message = error instanceof Error ? error.message : String(error);
     this.recordLog("error", `${title}: ${message}`, "error");
     if (showNotice) {
-      new import_obsidian11.Notice(`${title}: ${message}`);
+      new import_obsidian10.Notice(`${title}: ${message}`);
     }
   }
   notifyError(message) {
-    new import_obsidian11.Notice(message);
+    new import_obsidian10.Notice(message);
     return new Error(message);
   }
   schedulePersist() {
@@ -19916,29 +19984,29 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     await this.logFileWrite;
   }
   getPersistentLogFilePath() {
-    return (0, import_obsidian11.normalizePath)(`${this.app.vault.configDir}/plugins/${this.manifest.id}/${_RolayPlugin.LOG_FILE_NAME}`);
+    return (0, import_obsidian10.normalizePath)(`${this.app.vault.configDir}/plugins/${this.manifest.id}/${_RolayPlugin.LOG_FILE_NAME}`);
   }
   getPersistentLogFolderPath() {
-    return (0, import_obsidian11.normalizePath)(`${this.app.vault.configDir}/plugins/${this.manifest.id}`);
+    return (0, import_obsidian10.normalizePath)(`${this.app.vault.configDir}/plugins/${this.manifest.id}`);
   }
   getBinaryTransferFolderPath() {
-    return (0, import_obsidian11.normalizePath)(
+    return (0, import_obsidian10.normalizePath)(
       `${this.app.vault.configDir}/plugins/${this.manifest.id}/${_RolayPlugin.BINARY_TRANSFER_PARTS_FOLDER}`
     );
   }
   getBinaryTransferWorkspaceFolderPath(workspaceId) {
-    return (0, import_obsidian11.normalizePath)(`${this.getBinaryTransferFolderPath()}/${sanitizePathSegment(workspaceId)}`);
+    return (0, import_obsidian10.normalizePath)(`${this.getBinaryTransferFolderPath()}/${sanitizePathSegment(workspaceId)}`);
   }
   getBinaryDownloadPartPath(workspaceId, entryId, hash) {
     const normalizedHash = normalizeSha256Hash(hash) ?? hash;
     const safeHash = sanitizePathSegment(normalizedHash.replace(/[:/+=]/g, "-")).slice(0, 48) || "blob";
-    return (0, import_obsidian11.normalizePath)(
+    return (0, import_obsidian10.normalizePath)(
       `${this.getBinaryTransferWorkspaceFolderPath(workspaceId)}/${sanitizePathSegment(entryId)}-${safeHash}.part`
     );
   }
   async ensureAdapterFolderExists(folderPath) {
     const adapter = this.app.vault.adapter;
-    const segments = (0, import_obsidian11.normalizePath)(folderPath).split("/").filter(Boolean);
+    const segments = (0, import_obsidian10.normalizePath)(folderPath).split("/").filter(Boolean);
     let currentPath = "";
     for (const segment of segments) {
       currentPath = currentPath ? `${currentPath}/${segment}` : segment;
@@ -19971,14 +20039,14 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   }
   async getAdapterFileSize(path) {
     try {
-      const stat = await this.app.vault.adapter.stat((0, import_obsidian11.normalizePath)(path));
+      const stat = await this.app.vault.adapter.stat((0, import_obsidian10.normalizePath)(path));
       return stat?.size ?? 0;
     } catch {
       return 0;
     }
   }
   async removeAdapterPathIfExists(path) {
-    const normalizedPath = (0, import_obsidian11.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian10.normalizePath)(path);
     try {
       if (!await this.app.vault.adapter.exists(normalizedPath)) {
         return;
@@ -19990,17 +20058,17 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   async writeBinaryTransferPart(partPath, data, append2) {
     await this.ensureAdapterFolderExists(getParentPath2(partPath));
     if (append2) {
-      await this.app.vault.adapter.appendBinary((0, import_obsidian11.normalizePath)(partPath), data);
+      await this.app.vault.adapter.appendBinary((0, import_obsidian10.normalizePath)(partPath), data);
       return;
     }
-    await this.app.vault.adapter.writeBinary((0, import_obsidian11.normalizePath)(partPath), data);
+    await this.app.vault.adapter.writeBinary((0, import_obsidian10.normalizePath)(partPath), data);
   }
   async readBinaryTransferPart(partPath) {
     try {
-      if (!await this.app.vault.adapter.exists((0, import_obsidian11.normalizePath)(partPath))) {
+      if (!await this.app.vault.adapter.exists((0, import_obsidian10.normalizePath)(partPath))) {
         return null;
       }
-      return await this.app.vault.adapter.readBinary((0, import_obsidian11.normalizePath)(partPath));
+      return await this.app.vault.adapter.readBinary((0, import_obsidian10.normalizePath)(partPath));
     } catch {
       return null;
     }
@@ -20140,7 +20208,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     return null;
   }
   findLockedMarkdownPathAtOrBelow(localPath) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
       for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
         if (lockedPath === normalizedLocalPath || lockedPath.startsWith(`${normalizedLocalPath}/`) || normalizedLocalPath.startsWith(`${lockedPath}/`)) {
@@ -20154,7 +20222,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     return null;
   }
   async shouldKeepMarkdownLocked(workspaceId, entry, localPath, persistedState = null) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     const waitingForRemoteSettle = this.isWaitingForRemoteMarkdownSettle(workspaceId, normalizedLocalPath);
     const activeCrdtState = this.crdtManager.getState();
     if (activeCrdtState?.entryId === entry.id && (activeCrdtState.status === "synced" || activeCrdtState.status === "offline")) {
@@ -20170,7 +20238,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       return true;
     }
     const localFile = this.app.vault.getAbstractFileByPath(normalizedLocalPath);
-    if (!(localFile instanceof import_obsidian11.TFile) || localFile.extension !== "md") {
+    if (!(localFile instanceof import_obsidian10.TFile) || localFile.extension !== "md") {
       return true;
     }
     const nextState = persistedState ?? this.getPersistedCrdtState(entry.id);
@@ -20197,7 +20265,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       }
       const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
       if (await this.shouldKeepMarkdownLocked(workspaceId, entry, localPath)) {
-        runtime.markdownBootstrap.lockedLocalPaths.add((0, import_obsidian11.normalizePath)(localPath));
+        runtime.markdownBootstrap.lockedLocalPaths.add((0, import_obsidian10.normalizePath)(localPath));
       }
     }
     if (runtime.markdownBootstrap.lockedLocalPaths.size === 0) {
@@ -20212,7 +20280,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     if (!runtime) {
       return;
     }
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     if (await this.shouldKeepMarkdownLocked(workspaceId, entry, normalizedLocalPath, persistedState)) {
       runtime.markdownBootstrap.lockedLocalPaths.add(normalizedLocalPath);
     } else {
@@ -20320,7 +20388,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   refreshNotePresenceUi() {
     for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
-      if (!(view instanceof import_obsidian11.MarkdownView)) {
+      if (!(view instanceof import_obsidian10.MarkdownView)) {
         continue;
       }
       this.renderNotePresenceChipsForView(view);
@@ -20352,7 +20420,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       if (!dataPath) {
         continue;
       }
-      const normalizedPath = (0, import_obsidian11.normalizePath)(dataPath);
+      const normalizedPath = (0, import_obsidian10.normalizePath)(dataPath);
       const roomFolderStatus = roomFolderStatuses.get(normalizedPath) ?? null;
       const transferBadge = transferBadges.get(normalizedPath) ?? null;
       if (transferBadge?.kind === "download") {
@@ -20431,7 +20499,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     );
     const icon = document.createElement("span");
     icon.className = "rolay-note-presence-chip-icon";
-    (0, import_obsidian11.setIcon)(icon, "eye");
+    (0, import_obsidian10.setIcon)(icon, "eye");
     const label = document.createElement("span");
     label.textContent = String(count);
     chip.replaceChildren(icon, label);
@@ -20454,7 +20522,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       if (!downloadedRoom) {
         continue;
       }
-      const roomRoot = (0, import_obsidian11.normalizePath)(getRoomRoot(this.data.settings.syncRoot, downloadedRoom.folderName));
+      const roomRoot = (0, import_obsidian10.normalizePath)(getRoomRoot(this.data.settings.syncRoot, downloadedRoom.folderName));
       let localPresenceRolledUp = false;
       for (const [entryId, viewers] of runtime.notePresenceByEntryId.entries()) {
         const effectiveViewers = this.mergeLocalNotePresenceViewer(workspaceId, entryId, viewers);
@@ -20470,7 +20538,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         if (!localPath) {
           continue;
         }
-        const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+        const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
         this.accumulateExplorerNotePresenceBadge(
           aggregate,
           this.getMinimalVisibleExplorerRollupPath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
@@ -20484,7 +20552,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         if (localPath) {
           this.accumulateExplorerNotePresenceBadge(
             aggregate,
-            this.getMinimalVisibleExplorerRollupPath((0, import_obsidian11.normalizePath)(localPath), roomRoot, visibleExplorerPaths),
+            this.getMinimalVisibleExplorerRollupPath((0, import_obsidian10.normalizePath)(localPath), roomRoot, visibleExplorerPaths),
             [localPresence]
           );
         }
@@ -20509,7 +20577,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       if (!downloadedRoom) {
         continue;
       }
-      const roomRoot = (0, import_obsidian11.normalizePath)(getRoomRoot(this.data.settings.syncRoot, downloadedRoom.folderName));
+      const roomRoot = (0, import_obsidian10.normalizePath)(getRoomRoot(this.data.settings.syncRoot, downloadedRoom.folderName));
       for (const [entryId, anonymousViewerCount] of runtime.noteAnonymousViewerCountByEntryId.entries()) {
         if (anonymousViewerCount <= 0) {
           continue;
@@ -20522,7 +20590,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         if (!localPath) {
           continue;
         }
-        const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+        const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
         this.accumulateExplorerAnonymousPresenceBadge(
           aggregate,
           this.getMinimalVisibleExplorerRollupPath(normalizedLocalPath, roomRoot, visibleExplorerPaths),
@@ -20579,13 +20647,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       if (!dataPath || !this.isExplorerDecorationElement(element2) || !this.isElementVisiblyRendered(element2)) {
         continue;
       }
-      visiblePaths.add((0, import_obsidian11.normalizePath)(dataPath));
+      visiblePaths.add((0, import_obsidian10.normalizePath)(dataPath));
     }
     return visiblePaths;
   }
   getMinimalVisibleExplorerRollupPath(localPath, roomRoot, visibleExplorerPaths) {
-    const normalizedRoomRoot = (0, import_obsidian11.normalizePath)(roomRoot);
-    let candidate = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedRoomRoot = (0, import_obsidian10.normalizePath)(roomRoot);
+    let candidate = (0, import_obsidian10.normalizePath)(localPath);
     while (candidate) {
       if ((candidate === normalizedRoomRoot || candidate.startsWith(`${normalizedRoomRoot}/`)) && visibleExplorerPaths.has(candidate)) {
         return candidate;
@@ -20599,7 +20667,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       }
       candidate = parentPath;
     }
-    return visibleExplorerPaths.has(normalizedRoomRoot) ? normalizedRoomRoot : (0, import_obsidian11.normalizePath)(localPath);
+    return visibleExplorerPaths.has(normalizedRoomRoot) ? normalizedRoomRoot : (0, import_obsidian10.normalizePath)(localPath);
   }
   isExplorerDecorationElement(element2) {
     return Boolean(
@@ -20720,7 +20788,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     }
     const icon = document.createElement("span");
     icon.className = "rolay-note-anonymous-presence-badge-icon";
-    (0, import_obsidian11.setIcon)(icon, "eye");
+    (0, import_obsidian10.setIcon)(icon, "eye");
     const label = document.createElement("span");
     label.textContent = String(badgeState.count);
     badge.replaceChildren(icon, label);
@@ -20739,7 +20807,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       if (!activeUpload && !activeDownload) {
         continue;
       }
-      exactTransferPaths.add((0, import_obsidian11.normalizePath)(transfer.localPath));
+      exactTransferPaths.add((0, import_obsidian10.normalizePath)(transfer.localPath));
       this.addExplorerTransferProgress(
         aggregate,
         transfer.localPath,
@@ -20750,7 +20818,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       );
     }
     for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
-      const normalizedPath = (0, import_obsidian11.normalizePath)(placeholderPath);
+      const normalizedPath = (0, import_obsidian10.normalizePath)(placeholderPath);
       if (exactTransferPaths.has(normalizedPath)) {
         continue;
       }
@@ -20776,7 +20844,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         );
       }
       for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
-        const normalizedPath = (0, import_obsidian11.normalizePath)(lockedPath);
+        const normalizedPath = (0, import_obsidian10.normalizePath)(lockedPath);
         if (this.isExplorerPathUploading(normalizedPath) || exactTransferPaths.has(normalizedPath) || markdownBootstrapCoveredPaths.has(normalizedPath)) {
           continue;
         }
@@ -20792,7 +20860,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       }
     }
     for (const pendingCreate of Object.values(this.data.pendingMarkdownCreates)) {
-      const normalizedPath = (0, import_obsidian11.normalizePath)(pendingCreate.localPath);
+      const normalizedPath = (0, import_obsidian10.normalizePath)(pendingCreate.localPath);
       if (exactTransferPaths.has(normalizedPath)) {
         continue;
       }
@@ -20807,7 +20875,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       );
     }
     for (const pendingMerge of Object.values(this.data.pendingMarkdownMerges)) {
-      const normalizedPath = (0, import_obsidian11.normalizePath)(pendingMerge.localPath);
+      const normalizedPath = (0, import_obsidian10.normalizePath)(pendingMerge.localPath);
       if (exactTransferPaths.has(normalizedPath)) {
         continue;
       }
@@ -20822,7 +20890,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       );
     }
     for (const pendingWrite of Object.values(this.data.pendingBinaryWrites)) {
-      const normalizedPath = (0, import_obsidian11.normalizePath)(pendingWrite.localPath);
+      const normalizedPath = (0, import_obsidian10.normalizePath)(pendingWrite.localPath);
       if (exactTransferPaths.has(normalizedPath)) {
         continue;
       }
@@ -20847,13 +20915,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     );
   }
   addExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes, visibleExplorerPaths) {
-    const normalizedPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedPath = (0, import_obsidian10.normalizePath)(localPath);
     const room = this.resolveDownloadedRoomByLocalPath(normalizedPath);
     if (!room) {
       this.mergeExplorerTransferProgress(aggregate, normalizedPath, kind, completedBytes, totalBytes);
       return;
     }
-    const roomRoot = (0, import_obsidian11.normalizePath)(getRoomRoot(this.data.settings.syncRoot, room.folderName));
+    const roomRoot = (0, import_obsidian10.normalizePath)(getRoomRoot(this.data.settings.syncRoot, room.folderName));
     this.mergeExplorerTransferProgress(
       aggregate,
       this.getMinimalVisibleExplorerRollupPath(normalizedPath, roomRoot, visibleExplorerPaths),
@@ -20867,14 +20935,14 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     if (!room) {
       return;
     }
-    const roomRoot = (0, import_obsidian11.normalizePath)(getRoomRoot(this.data.settings.syncRoot, room.folderName));
+    const roomRoot = (0, import_obsidian10.normalizePath)(getRoomRoot(this.data.settings.syncRoot, room.folderName));
     const metadataEntryIds = new Set(runtime.markdownBootstrap.documentBytesByEntryId.keys());
     for (const entry of runtime.treeStore.getEntries()) {
       if (entry.deleted || entry.kind !== "markdown" || !metadataEntryIds.has(entry.id)) {
         continue;
       }
       const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
-      const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+      const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
       coveredLocalPaths.add(normalizedLocalPath);
       if (this.isExplorerPathUploading(normalizedLocalPath)) {
         continue;
@@ -20963,13 +21031,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   }
   getLocalFileSizeOrOne(localPath) {
     const file = this.app.vault.getAbstractFileByPath(localPath);
-    if (file instanceof import_obsidian11.TFile && Number.isFinite(file.stat.size) && file.stat.size > 0) {
+    if (file instanceof import_obsidian10.TFile && Number.isFinite(file.stat.size) && file.stat.size > 0) {
       return file.stat.size;
     }
     return 1;
   }
   isExplorerPathUploading(localPath) {
-    const normalizedPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedPath = (0, import_obsidian10.normalizePath)(localPath);
     if (normalizedPath in this.data.pendingMarkdownCreates) {
       return true;
     }
@@ -20977,7 +21045,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       return true;
     }
     if (Object.values(this.data.pendingMarkdownMerges).some((entry) => {
-      return (0, import_obsidian11.normalizePath)(entry.localPath) === normalizedPath;
+      return (0, import_obsidian10.normalizePath)(entry.localPath) === normalizedPath;
     })) {
       return true;
     }
@@ -21027,7 +21095,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         continue;
       }
       statuses.set(
-        (0, import_obsidian11.normalizePath)(roomRoot),
+        (0, import_obsidian10.normalizePath)(roomRoot),
         this.roomRuntime.get(room.workspaceId)?.streamStatus ?? "stopped"
       );
     }
@@ -21127,7 +21195,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     return parts.join(", ");
   }
   createBinarySyncToken(localPath) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     const existingToken = this.binarySyncTokens.get(normalizedLocalPath);
     if (existingToken) {
       this.binarySyncPathsByToken.delete(existingToken);
@@ -21138,7 +21206,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     return token;
   }
   invalidateBinarySyncToken(localPath) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     const existingToken = this.binarySyncTokens.get(normalizedLocalPath);
     if (existingToken) {
       this.binarySyncPathsByToken.delete(existingToken);
@@ -21146,11 +21214,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.binarySyncTokens.delete(normalizedLocalPath);
   }
   isBinarySyncTokenCurrent(localPath, token) {
-    return this.binarySyncTokens.get((0, import_obsidian11.normalizePath)(localPath)) === token;
+    return this.binarySyncTokens.get((0, import_obsidian10.normalizePath)(localPath)) === token;
   }
   moveBinarySyncToken(oldPath, newPath) {
-    const normalizedOldPath = (0, import_obsidian11.normalizePath)(oldPath);
-    const normalizedNewPath = (0, import_obsidian11.normalizePath)(newPath);
+    const normalizedOldPath = (0, import_obsidian10.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian10.normalizePath)(newPath);
     const existingToken = this.binarySyncTokens.get(normalizedOldPath);
     if (!existingToken) {
       return;
@@ -21163,7 +21231,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     return this.binarySyncPathsByToken.get(token) ?? null;
   }
   updateBinaryTransferState(localPath, patch) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     const existing = this.binaryTransferState.get(normalizedLocalPath);
     if (!existing) {
       throw new Error(`Missing binary transfer state for ${normalizedLocalPath}.`);
@@ -21181,7 +21249,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     return nextState;
   }
   maybeUpdateBinaryTransferState(localPath, patch) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     const existing = this.binaryTransferState.get(normalizedLocalPath);
     if (!existing) {
       return null;
@@ -21189,7 +21257,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     return this.updateBinaryTransferState(normalizedLocalPath, patch);
   }
   setBinaryTransferState(state) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(state.localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(state.localPath);
     const nextState = {
       ...state,
       localPath: normalizedLocalPath
@@ -21206,23 +21274,23 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.recordLog("blob-trace", message, level);
   }
   clearBinaryTransferRuntimeState(localPath) {
-    if (!this.binaryTransferState.delete((0, import_obsidian11.normalizePath)(localPath))) {
+    if (!this.binaryTransferState.delete((0, import_obsidian10.normalizePath)(localPath))) {
       return;
     }
     this.scheduleExplorerLoadingDecorations();
     this.updateStatusBar();
   }
   clearBinaryTransferState(localPath) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     this.clearPersistedBinaryTransferState(normalizedLocalPath);
     this.clearBinaryTransferRuntimeState(normalizedLocalPath);
   }
   restorePersistedBinaryTransfers() {
     for (const persisted of Object.values(this.data.binaryTransfers)) {
-      this.binaryTransferState.set((0, import_obsidian11.normalizePath)(persisted.localPath), {
+      this.binaryTransferState.set((0, import_obsidian10.normalizePath)(persisted.localPath), {
         workspaceId: persisted.workspaceId,
         entryId: persisted.entryId,
-        localPath: (0, import_obsidian11.normalizePath)(persisted.localPath),
+        localPath: (0, import_obsidian10.normalizePath)(persisted.localPath),
         serverPath: persisted.serverPath,
         kind: persisted.kind,
         status: persisted.status,
@@ -21242,7 +21310,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     }
   }
   persistBinaryTransferState(state) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(state.localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(state.localPath);
     this.data.binaryTransfers[normalizedLocalPath] = {
       workspaceId: state.workspaceId,
       entryId: state.entryId,
@@ -21263,7 +21331,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.schedulePersist();
   }
   clearPersistedBinaryTransferState(localPath) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     if (!(normalizedLocalPath in this.data.binaryTransfers)) {
       return;
     }
@@ -21271,8 +21339,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.schedulePersist();
   }
   movePersistedBinaryTransferState(oldPath, newPath, serverPath) {
-    const normalizedOldPath = (0, import_obsidian11.normalizePath)(oldPath);
-    const normalizedNewPath = (0, import_obsidian11.normalizePath)(newPath);
+    const normalizedOldPath = (0, import_obsidian10.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian10.normalizePath)(newPath);
     const existing = this.data.binaryTransfers[normalizedOldPath];
     if (!existing) {
       return;
@@ -21313,7 +21381,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     );
   }
   async cancelBinaryTransferForLocalPath(localPath, reason) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     const transfer = this.binaryTransferState.get(normalizedLocalPath);
     if (!transfer) {
       return;
@@ -21351,7 +21419,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         continue;
       }
       this.invalidateBinarySyncToken(localPath);
-      this.pendingBinarySyncReruns.delete((0, import_obsidian11.normalizePath)(localPath));
+      this.pendingBinarySyncReruns.delete((0, import_obsidian10.normalizePath)(localPath));
     }
     const transfers = this.getBinaryTransfersForWorkspace(workspaceId);
     if (transfers.length === 0) {
@@ -21366,12 +21434,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     );
   }
   findDownloadingBinaryPathAtOrBelow(localPath) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     for (const transfer of this.binaryTransferState.values()) {
       if (transfer.kind !== "download" || transfer.status !== "preparing" && transfer.status !== "downloading") {
         continue;
       }
-      const transferLocalPath = (0, import_obsidian11.normalizePath)(transfer.localPath);
+      const transferLocalPath = (0, import_obsidian10.normalizePath)(transfer.localPath);
       if (normalizedLocalPath === transferLocalPath || transferLocalPath.startsWith(`${normalizedLocalPath}/`)) {
         return {
           workspaceId: transfer.workspaceId,
@@ -21390,7 +21458,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       "blob",
       `[${blocked.workspaceId}] Reverted local move/rename for ${oldPath} because ${blocked.localPath} is still downloading and protected.`
     );
-    new import_obsidian11.Notice("Rolay is still downloading this file. Move and rename are blocked until download finishes.");
+    new import_obsidian10.Notice("Rolay is still downloading this file. Move and rename are blocked until download finishes.");
     if (file.path === oldPath) {
       this.scheduleExplorerLoadingDecorations();
       return true;
@@ -21424,7 +21492,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       "blob",
       `[${blocked.workspaceId}] Ignored local delete for ${file.path} because ${blocked.localPath} is still downloading and protected.`
     );
-    new import_obsidian11.Notice("Rolay is still downloading this file. Delete is blocked until download finishes.");
+    new import_obsidian10.Notice("Rolay is still downloading this file. Delete is blocked until download finishes.");
     await this.refreshRoomSnapshot(blocked.workspaceId, "restore-downloading-binary-delete");
     this.scheduleExplorerLoadingDecorations();
     return true;
@@ -21438,7 +21506,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       "crdt",
       `[${blocked.workspaceId}] Reverted local move/rename for ${oldPath} because ${blocked.lockedPath} is still loading and protected.`
     );
-    new import_obsidian11.Notice("Rolay is still loading this markdown note. Move and rename are blocked until download finishes.");
+    new import_obsidian10.Notice("Rolay is still loading this markdown note. Move and rename are blocked until download finishes.");
     if (file.path === oldPath) {
       this.scheduleExplorerLoadingDecorations();
       return true;
@@ -21475,7 +21543,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       "crdt",
       `[${blocked.workspaceId}] Ignored local delete for ${file.path} because ${blocked.lockedPath} is still loading and protected.`
     );
-    new import_obsidian11.Notice("Rolay is still loading this markdown note. Delete is blocked until download finishes.");
+    new import_obsidian10.Notice("Rolay is still loading this markdown note. Delete is blocked until download finishes.");
     await this.refreshRoomSnapshot(blocked.workspaceId, "restore-locked-delete");
     this.scheduleExplorerLoadingDecorations();
     return true;
@@ -21499,7 +21567,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     if (!this.isSafeMarkdownSuffixDuplicateDeleteCandidate(workspaceId, entry)) {
       return false;
     }
-    this.roomRuntime.get(workspaceId)?.markdownBootstrap.lockedLocalPaths.delete((0, import_obsidian11.normalizePath)(localPath));
+    this.roomRuntime.get(workspaceId)?.markdownBootstrap.lockedLocalPaths.delete((0, import_obsidian10.normalizePath)(localPath));
     this.recordLog(
       "crdt",
       `[${workspaceId}] Allowed local delete for locked suffix-copy duplicate ${entry.path}; sending delete_entry instead of restoring it.`
@@ -21550,7 +21618,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
           return false;
         }
         const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
-        return currentRuntime.markdownBootstrap.lockedLocalPaths.has((0, import_obsidian11.normalizePath)(localPath));
+        return currentRuntime.markdownBootstrap.lockedLocalPaths.has((0, import_obsidian10.normalizePath)(localPath));
       });
       if (lockedEntries.length === 0) {
         this.clearLockedMarkdownBootstrapRetry(workspaceId);
@@ -21593,7 +21661,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   }
   hasPendingLocalDelete(workspaceId, path) {
     const prefix = `${workspaceId}::`;
-    const normalizedPath = (0, import_obsidian11.normalizePath)(path);
+    const normalizedPath = (0, import_obsidian10.normalizePath)(path);
     const now = Date.now();
     for (const [key, createdAt] of [...this.pendingLocalDeletes.entries()]) {
       if (now - createdAt > _RolayPlugin.PENDING_DELETE_GUARD_MS) {
@@ -21653,7 +21721,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   }
   confirmSnapshotPendingDeletes(workspaceId, entries) {
     const prefix = `${workspaceId}::`;
-    const activePaths = entries.filter((entry) => !entry.deleted).map((entry) => (0, import_obsidian11.normalizePath)(entry.path));
+    const activePaths = entries.filter((entry) => !entry.deleted).map((entry) => (0, import_obsidian10.normalizePath)(entry.path));
     for (const key of [...this.pendingLocalDeletes.keys()]) {
       if (!key.startsWith(prefix)) {
         continue;
@@ -21668,7 +21736,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     }
   }
   buildRemoteObservedPathKey(workspaceId, localPath) {
-    return `${workspaceId}::${(0, import_obsidian11.normalizePath)(localPath)}`;
+    return `${workspaceId}::${(0, import_obsidian10.normalizePath)(localPath)}`;
   }
   noteRemoteObservedPath(workspaceId, localPath, serverPath) {
     const key = this.buildRemoteObservedPathKey(workspaceId, localPath);
@@ -21807,7 +21875,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       });
     }
     if (showNotice) {
-      new import_obsidian11.Notice("Rolay room folder detached from the vault.");
+      new import_obsidian10.Notice("Rolay room folder detached from the vault.");
     }
   }
   updateStatusBar() {
@@ -21823,17 +21891,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       return;
     }
     const state = this.pluginUpdater.getState();
-    const updateAvailable = isPluginUpdateAvailable(state);
-    const visible = updateAvailable || state.status === "downloading" || state.status === "installing" || state.status === "restart-required";
+    const persistentError = hasPersistentPluginUpdateError(state);
+    const visible = persistentError || state.status === "restart-required";
     this.updateRibbonEl.hidden = !visible;
-    this.updateRibbonEl.classList.toggle(
-      "is-busy",
-      state.status === "downloading" || state.status === "installing"
-    );
-    this.updateRibbonEl.classList.toggle(
-      "is-error",
-      state.status === "error" && updateAvailable
-    );
+    this.updateRibbonEl.classList.toggle("is-error", persistentError);
     this.updateRibbonEl.classList.toggle(
       "is-restart-required",
       state.status === "restart-required"
@@ -21841,27 +21902,73 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     if (!visible) {
       return;
     }
-    const label = state.status === "restart-required" ? `Rolay ${state.latestVersion ?? ""} installed; restart Obsidian` : state.status === "downloading" || state.status === "installing" ? `Updating Rolay: ${state.progressPercent}%` : state.status === "error" ? `Rolay update failed; click to retry ${state.latestVersion ?? ""}` : `Rolay ${state.latestVersion ?? ""} available; click to force update`;
+    const label = state.status === "restart-required" ? `Rolay ${state.latestVersion ?? ""} installed; restart Obsidian` : `Rolay update is retrying automatically: ${state.lastError ?? "temporary failure"}`;
     this.updateRibbonEl.setAttribute("aria-label", label.trim());
     this.updateRibbonEl.setAttribute("data-tooltip-position", "right");
-    (0, import_obsidian11.setIcon)(
+    (0, import_obsidian10.setIcon)(
       this.updateRibbonEl,
-      state.status === "restart-required" ? "refresh-cw" : state.status === "downloading" || state.status === "installing" ? "loader-circle" : "download"
+      state.status === "restart-required" ? "refresh-cw" : "alert-triangle"
     );
   }
+  notePluginUpdateActivity() {
+    this.lastPluginUpdateActivityAt = Date.now();
+  }
+  getPluginUpdateInstallBlockers() {
+    const blockers = [];
+    if (this.isUnloading) {
+      blockers.push("plugin unload is in progress");
+    }
+    if (Date.now() - this.lastPluginUpdateActivityAt < _RolayPlugin.PLUGIN_UPDATE_QUIET_WINDOW_MS) {
+      blockers.push("recent user or vault activity");
+    }
+    if (!this.operationsQueue.isIdle()) {
+      blockers.push("tree operations are pending");
+    }
+    if (this.startupBootstrapHandle !== null || this.startupBootstrapInFlight || this.startupRoomResumeHandles.size > 0) {
+      blockers.push("startup sync is still settling");
+    }
+    if (this.lifecycleRecoveryHandle !== null || this.lifecycleRecoveryInFlight) {
+      blockers.push("transport recovery is in progress");
+    }
+    const hasActiveBinaryTransfer = [...this.binaryTransferState.values()].some(
+      (transfer) => transfer.status !== "done" && transfer.status !== "failed" && (transfer.abortController !== null || this.binarySyncTokens.has((0, import_obsidian10.normalizePath)(transfer.localPath)))
+    );
+    if (hasActiveBinaryTransfer || this.binarySyncTokens.size > 0 || this.pendingBinarySyncReruns.size > 0) {
+      blockers.push("binary transfers are active");
+    }
+    if (Object.values(this.data.pendingBinaryWrites).some(
+      (pendingWrite) => pendingWrite.lastError === null
+    )) {
+      blockers.push("binary writes are pending");
+    }
+    if (Object.values(this.data.pendingMarkdownMerges).some(
+      (pendingMerge) => pendingMerge.lastError === null
+    )) {
+      blockers.push("markdown changes are pending");
+    }
+    for (const runtime of this.roomRuntime.values()) {
+      if (runtime.snapshotRefreshHandle !== null || runtime.snapshotRefreshInFlight || runtime.backgroundMarkdownRefreshInFlight) {
+        blockers.push("room reconciliation is in progress");
+        break;
+      }
+    }
+    if ([...this.roomRuntime.values()].some(
+      (runtime) => runtime.markdownBootstrap.status === "loading"
+    )) {
+      blockers.push("markdown preload is in progress");
+    }
+    return blockers;
+  }
   async prepareForPluginUpdate() {
-    let timeoutHandle = null;
-    const timeout = new Promise((resolve) => {
-      timeoutHandle = window.setTimeout(resolve, 3e3);
-    });
-    await Promise.race([
-      this.operationsQueue.waitForIdle(),
-      timeout
-    ]);
-    if (timeoutHandle !== null) {
-      window.clearTimeout(timeoutHandle);
+    if (this.getPluginUpdateInstallBlockers().length > 0) {
+      return false;
+    }
+    await this.operationsQueue.waitForIdle();
+    if (this.getPluginUpdateInstallBlockers().length > 0) {
+      return false;
     }
     await this.persistNow();
+    return this.getPluginUpdateInstallBlockers().length === 0;
   }
   async refreshOwnerRoomInvites(logActivity = true) {
     const ownerRooms = this.roomList.filter((room) => room.membershipRole === "owner");
@@ -22172,8 +22279,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     return Object.values(this.data.pendingBinaryWrites).filter((entry) => entry.workspaceId === workspaceId).sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   }
   handlePendingMarkdownCreateRename(oldPath, newPath) {
-    const normalizedOldPath = (0, import_obsidian11.normalizePath)(oldPath);
-    const normalizedNewPath = (0, import_obsidian11.normalizePath)(newPath);
+    const normalizedOldPath = (0, import_obsidian10.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian10.normalizePath)(newPath);
     const pendingCreate = this.data.pendingMarkdownCreates[normalizedOldPath];
     if (!pendingCreate) {
       return;
@@ -22202,8 +22309,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.scheduleExplorerLoadingDecorations();
   }
   handlePendingMarkdownMergeRename(oldPath, newPath) {
-    const normalizedOldPath = (0, import_obsidian11.normalizePath)(oldPath);
-    const normalizedNewPath = (0, import_obsidian11.normalizePath)(newPath);
+    const normalizedOldPath = (0, import_obsidian10.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian10.normalizePath)(newPath);
     let changed = false;
     for (const [entryId, pendingMerge] of Object.entries(this.data.pendingMarkdownMerges)) {
       if (pendingMerge.localPath !== normalizedOldPath) {
@@ -22236,8 +22343,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     }
   }
   async handlePendingBinaryWriteRename(oldPath, newPath) {
-    const normalizedOldPath = (0, import_obsidian11.normalizePath)(oldPath);
-    const normalizedNewPath = (0, import_obsidian11.normalizePath)(newPath);
+    const normalizedOldPath = (0, import_obsidian10.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian10.normalizePath)(newPath);
     const pendingWrite = this.data.pendingBinaryWrites[normalizedOldPath];
     if (!pendingWrite) {
       return;
@@ -22269,7 +22376,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.scheduleExplorerLoadingDecorations();
     const currentFile = this.app.vault.getAbstractFileByPath(normalizedNewPath);
     const entry = pendingWrite.entryId ? this.getRoomStore(pendingWrite.workspaceId)?.getEntryById(pendingWrite.entryId) ?? null : this.getRoomStore(pendingWrite.workspaceId)?.getEntryByPath(nextServerPath) ?? null;
-    if (currentFile instanceof import_obsidian11.TFile && isBinaryPath(currentFile.path)) {
+    if (currentFile instanceof import_obsidian10.TFile && isBinaryPath(currentFile.path)) {
       await this.queueBinaryWrite(
         pendingWrite.workspaceId,
         nextServerPath,
@@ -22279,7 +22386,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     }
   }
   clearPendingMarkdownCreate(localPath) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     if (!(normalizedLocalPath in this.data.pendingMarkdownCreates)) {
       return;
     }
@@ -22288,7 +22395,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.scheduleExplorerLoadingDecorations();
   }
   clearPendingBinaryWriteRecord(localPath) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     if (!(normalizedLocalPath in this.data.pendingBinaryWrites)) {
       return;
     }
@@ -22297,7 +22404,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.scheduleExplorerLoadingDecorations();
   }
   async clearPendingBinaryWriteForLocalPath(localPath, cancelTransfer) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     if (!(normalizedLocalPath in this.data.pendingBinaryWrites)) {
       if (cancelTransfer) {
         this.invalidateBinarySyncToken(normalizedLocalPath);
@@ -22314,7 +22421,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.scheduleExplorerLoadingDecorations();
   }
   clearPendingMarkdownMergesForLocalPath(localPath) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     let changed = false;
     for (const [entryId, pendingMerge] of Object.entries(this.data.pendingMarkdownMerges)) {
       if (pendingMerge.localPath !== normalizedLocalPath) {
@@ -22373,7 +22480,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     }
   }
   async rememberPendingMarkdownCreate(workspaceId, localPath, serverPath, error) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = this.data.pendingMarkdownCreates[normalizedLocalPath];
     this.data.pendingMarkdownCreates[normalizedLocalPath] = {
@@ -22393,7 +22500,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     );
   }
   rememberPendingMarkdownMerge(workspaceId, entryId, localPath, filePath, error = null) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     const existing = this.data.pendingMarkdownMerges[entryId];
     this.data.pendingMarkdownMerges[entryId] = {
       workspaceId,
@@ -22408,7 +22515,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.scheduleExplorerLoadingDecorations();
   }
   rememberPendingBinaryWrite(workspaceId, localPath, serverPath, entryId, error = null) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     const existing = this.data.pendingBinaryWrites[normalizedLocalPath];
     this.data.pendingBinaryWrites[normalizedLocalPath] = {
       workspaceId,
@@ -22423,7 +22530,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.scheduleExplorerLoadingDecorations();
   }
   updatePendingBinaryWriteEntryId(localPath, entryId, serverPath) {
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     const existing = this.data.pendingBinaryWrites[normalizedLocalPath];
     if (!existing) {
       return;
@@ -22449,19 +22556,19 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     if (remoteEntry.deleted || remoteEntry.kind !== "markdown") {
       return false;
     }
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(pendingCreate.localPath);
-    if (this.isDisconnectedPendingMarkdownCreateReplay(pendingCreate) && (0, import_obsidian11.normalizePath)(pendingCreate.serverPath) === (0, import_obsidian11.normalizePath)(remoteEntry.path)) {
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(pendingCreate.localPath);
+    if (this.isDisconnectedPendingMarkdownCreateReplay(pendingCreate) && (0, import_obsidian10.normalizePath)(pendingCreate.serverPath) === (0, import_obsidian10.normalizePath)(remoteEntry.path)) {
       return true;
     }
     if (this.wasPathRecentlyObservedAsRemote(workspaceId, normalizedLocalPath)) {
       return true;
     }
     const cachedEntry = this.findPersistedCrdtCacheEntry(remoteEntry.id);
-    if (cachedEntry && (0, import_obsidian11.normalizePath)(cachedEntry.filePath) === normalizedLocalPath) {
+    if (cachedEntry && (0, import_obsidian10.normalizePath)(cachedEntry.filePath) === normalizedLocalPath) {
       return true;
     }
     const pendingMerge = this.data.pendingMarkdownMerges[remoteEntry.id];
-    if (pendingMerge && (0, import_obsidian11.normalizePath)(pendingMerge.localPath) === normalizedLocalPath) {
+    if (pendingMerge && (0, import_obsidian10.normalizePath)(pendingMerge.localPath) === normalizedLocalPath) {
       return true;
     }
     return false;
@@ -22480,15 +22587,15 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     if (remoteEntry.deleted || remoteEntry.kind !== "binary") {
       return false;
     }
-    const normalizedLocalPath = (0, import_obsidian11.normalizePath)(pendingWrite.localPath);
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(pendingWrite.localPath);
     if (this.wasPathRecentlyObservedAsRemote(workspaceId, normalizedLocalPath)) {
       return true;
     }
     const cachedEntry = this.findPersistedBinaryCacheEntry(remoteEntry.id);
-    if (cachedEntry && (0, import_obsidian11.normalizePath)(cachedEntry.filePath) === normalizedLocalPath) {
+    if (cachedEntry && (0, import_obsidian10.normalizePath)(cachedEntry.filePath) === normalizedLocalPath) {
       return true;
     }
-    if (!pendingWrite.entryId && !remoteEntry.blob && (0, import_obsidian11.normalizePath)(pendingWrite.serverPath) === (0, import_obsidian11.normalizePath)(remoteEntry.path)) {
+    if (!pendingWrite.entryId && !remoteEntry.blob && (0, import_obsidian10.normalizePath)(pendingWrite.serverPath) === (0, import_obsidian10.normalizePath)(remoteEntry.path)) {
       return true;
     }
     return false;
@@ -22564,14 +22671,14 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   }
   async hydrateMarkdownFileFromState(workspaceId, entry, localPath, nextState, previousState) {
     const localFile = this.app.vault.getAbstractFileByPath(localPath);
-    if (!(localFile instanceof import_obsidian11.TFile) || localFile.extension !== "md") {
+    if (!(localFile instanceof import_obsidian10.TFile) || localFile.extension !== "md") {
       return false;
     }
     if (this.hasPendingLocalCreate(workspaceId, entry.path)) {
       this.recordLog("crdt", `[${workspaceId}] Skipped preload overwrite for ${entry.path} because a local create is still pending.`);
       return false;
     }
-    if (this.data.pendingMarkdownCreates[(0, import_obsidian11.normalizePath)(localPath)]) {
+    if (this.data.pendingMarkdownCreates[(0, import_obsidian10.normalizePath)(localPath)]) {
       this.recordLog("crdt", `[${workspaceId}] Skipped preload overwrite for ${entry.path} because a local markdown create replay is pending.`);
       return false;
     }
@@ -22609,7 +22716,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       localPath: this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path
     })).filter(({ localPath }) => {
       const localFile = this.app.vault.getAbstractFileByPath(localPath);
-      return localFile instanceof import_obsidian11.TFile && localFile.extension === "md" && getMarkdownViewsForFile(this.app, localPath).length === 0;
+      return localFile instanceof import_obsidian10.TFile && localFile.extension === "md" && getMarkdownViewsForFile(this.app, localPath).length === 0;
     });
     await this.fetchMarkdownTargetsFromBootstrap(workspaceId, targets, reason, true);
   }
@@ -22629,12 +22736,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     if (!roomStore) {
       return;
     }
-    const normalizedOldPath = (0, import_obsidian11.normalizePath)(oldPath);
-    const normalizedNewPath = (0, import_obsidian11.normalizePath)(file.path);
+    const normalizedOldPath = (0, import_obsidian10.normalizePath)(oldPath);
+    const normalizedNewPath = (0, import_obsidian10.normalizePath)(file.path);
     const targets = roomStore.getEntries().filter(
       (entry) => !entry.deleted && entry.kind === "markdown" && (entry.path === oldServerPath || entry.path.startsWith(`${oldServerPath}/`))
     ).map((entry) => {
-      const oldLocalPath = (0, import_obsidian11.normalizePath)(this.fileBridge.toLocalPath(room.workspaceId, entry.path) ?? entry.path);
+      const oldLocalPath = (0, import_obsidian10.normalizePath)(this.fileBridge.toLocalPath(room.workspaceId, entry.path) ?? entry.path);
       if (oldLocalPath !== normalizedOldPath && !oldLocalPath.startsWith(`${normalizedOldPath}/`)) {
         return null;
       }
@@ -22735,7 +22842,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   }
   persistCrdtStateIfChanged(entryId, filePath, state) {
     const existing = this.findPersistedCrdtCacheEntry(entryId);
-    if (existing && (0, import_obsidian11.normalizePath)(existing.filePath) === (0, import_obsidian11.normalizePath)(filePath) && areUint8ArraysEqual(decodeBase64(existing.encodedState), state)) {
+    if (existing && (0, import_obsidian10.normalizePath)(existing.filePath) === (0, import_obsidian10.normalizePath)(filePath) && areUint8ArraysEqual(decodeBase64(existing.encodedState), state)) {
       return false;
     }
     this.persistCrdtState(entryId, filePath, state);
@@ -23093,7 +23200,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       return true;
     }
     try {
-      return await this.app.vault.adapter.exists((0, import_obsidian11.normalizePath)(path));
+      return await this.app.vault.adapter.exists((0, import_obsidian10.normalizePath)(path));
     } catch {
       return false;
     }
@@ -23256,7 +23363,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       throw new Error(`Too many markdown rename retries for ${originalServerPath}.`);
     }
     const localFile = this.app.vault.getAbstractFileByPath(originalLocalPath);
-    if (!(localFile instanceof import_obsidian11.TFile) || localFile.extension !== "md") {
+    if (!(localFile instanceof import_obsidian10.TFile) || localFile.extension !== "md") {
       this.clearPendingMarkdownCreate(originalLocalPath);
       this.recordLog(
         "ops",
@@ -23278,7 +23385,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     });
     const conflictMessage = `[${workspaceId}] Local markdown ${originalServerPath} conflicted with an existing server path. Renamed local file to ${replacementServerPath} so both copies survive.`;
     this.recordLog("ops", conflictMessage, "error");
-    new import_obsidian11.Notice(`Rolay kept your offline note as ${replacementServerPath}.`);
+    new import_obsidian10.Notice(`Rolay kept your offline note as ${replacementServerPath}.`);
     const latestLocalContent = await this.readLocalMarkdownContent(replacementLocalPath, fallbackLocalContent);
     await this.rememberPendingMarkdownCreate(
       workspaceId,
@@ -23305,7 +23412,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     );
     for (const pendingCreate of pendingCreates) {
       const currentFile = this.app.vault.getAbstractFileByPath(pendingCreate.localPath);
-      if (!(currentFile instanceof import_obsidian11.TFile) || currentFile.extension !== "md") {
+      if (!(currentFile instanceof import_obsidian10.TFile) || currentFile.extension !== "md") {
         this.clearPendingMarkdownCreate(pendingCreate.localPath);
         this.recordLog(
           "ops",
@@ -23381,7 +23488,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     );
     for (const pendingMerge of pendingMerges) {
       const currentFile = this.app.vault.getAbstractFileByPath(pendingMerge.localPath);
-      if (!(currentFile instanceof import_obsidian11.TFile) || currentFile.extension !== "md") {
+      if (!(currentFile instanceof import_obsidian10.TFile) || currentFile.extension !== "md") {
         this.clearPendingMarkdownMerge(pendingMerge.entryId);
         this.recordLog(
           "crdt",
@@ -23432,7 +23539,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     }
   }
   async queueBinaryWrite(workspaceId, serverPath, localContent, existingEntry) {
-    const localPath = (0, import_obsidian11.normalizePath)(this.fileBridge.toLocalPath(workspaceId, serverPath) ?? serverPath);
+    const localPath = (0, import_obsidian10.normalizePath)(this.fileBridge.toLocalPath(workspaceId, serverPath) ?? serverPath);
     if (!this.isRoomSyncActive(workspaceId)) {
       this.recordLog(
         "blob",
@@ -23471,7 +23578,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     );
   }
   async syncBinaryWrite(workspaceId, initialLocalPath, fallbackServerPath, initialEntryId, token, initialContent) {
-    let finalLocalPath = (0, import_obsidian11.normalizePath)(initialLocalPath);
+    let finalLocalPath = (0, import_obsidian10.normalizePath)(initialLocalPath);
     let finalServerPath = fallbackServerPath;
     let finalEntryId = initialEntryId;
     let createdPlaceholderEntry = null;
@@ -23485,7 +23592,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       }
       finalLocalPath = currentLocalPath;
       const currentFile = this.app.vault.getAbstractFileByPath(currentLocalPath);
-      if (!(currentFile instanceof import_obsidian11.TFile) || !isBinaryPath(currentFile.path)) {
+      if (!(currentFile instanceof import_obsidian10.TFile) || !isBinaryPath(currentFile.path)) {
         await this.clearPendingBinaryWriteForLocalPath(currentLocalPath, false);
         return;
       }
@@ -23499,7 +23606,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         return;
       }
       finalServerPath = currentServerPath;
-      const binaryContent = initialContent && (0, import_obsidian11.normalizePath)(initialLocalPath) === currentLocalPath ? initialContent : await this.readLocalBinaryContent(currentLocalPath);
+      const binaryContent = initialContent && (0, import_obsidian10.normalizePath)(initialLocalPath) === currentLocalPath ? initialContent : await this.readLocalBinaryContent(currentLocalPath);
       const sizeBytes = binaryContent.byteLength;
       const hash = await sha256Hash(binaryContent);
       const mimeType = guessMimeTypeFromPath(currentLocalPath);
@@ -23832,7 +23939,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         this.recordLog("blob", `[${workspaceId}] Binary sync failed for ${finalLocalPath}: ${message}`, "error");
         this.handleError(`Binary sync failed for ${finalLocalPath}`, error, false);
       }
-      const transfer = this.binaryTransferState.get((0, import_obsidian11.normalizePath)(finalLocalPath));
+      const transfer = this.binaryTransferState.get((0, import_obsidian10.normalizePath)(finalLocalPath));
       if (transfer) {
         this.updateBinaryTransferState(finalLocalPath, {
           status: "failed",
@@ -23847,8 +23954,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
       if (this.isUnloading) {
         return;
       }
-      const transfer = this.binaryTransferState.get((0, import_obsidian11.normalizePath)(finalLocalPath));
-      const normalizedFinalLocalPath = (0, import_obsidian11.normalizePath)(finalLocalPath);
+      const transfer = this.binaryTransferState.get((0, import_obsidian10.normalizePath)(finalLocalPath));
+      const normalizedFinalLocalPath = (0, import_obsidian10.normalizePath)(finalLocalPath);
       const shouldRerun = Boolean(transfer?.rerunRequested) || this.pendingBinarySyncReruns.has(normalizedFinalLocalPath);
       this.pendingBinarySyncReruns.delete(normalizedFinalLocalPath);
       if (!shouldRerun && transfer?.status !== "failed") {
@@ -23858,10 +23965,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
         this.clearBinaryTransferState(finalLocalPath);
         const currentFile = this.app.vault.getAbstractFileByPath(finalLocalPath);
         const currentServerPath = this.resolvePendingMarkdownServerPath(workspaceId, finalLocalPath, fallbackServerPath);
-        const entry = this.data.pendingBinaryWrites[(0, import_obsidian11.normalizePath)(finalLocalPath)]?.entryId ? this.getRoomStore(workspaceId)?.getEntryById(
-          this.data.pendingBinaryWrites[(0, import_obsidian11.normalizePath)(finalLocalPath)]?.entryId ?? ""
+        const entry = this.data.pendingBinaryWrites[(0, import_obsidian10.normalizePath)(finalLocalPath)]?.entryId ? this.getRoomStore(workspaceId)?.getEntryById(
+          this.data.pendingBinaryWrites[(0, import_obsidian10.normalizePath)(finalLocalPath)]?.entryId ?? ""
         ) ?? null : currentServerPath ? this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null : null;
-        if (currentFile instanceof import_obsidian11.TFile && isBinaryPath(currentFile.path) && currentServerPath) {
+        if (currentFile instanceof import_obsidian10.TFile && isBinaryPath(currentFile.path) && currentServerPath) {
           await this.queueBinaryWrite(
             workspaceId,
             currentServerPath,
@@ -23874,7 +23981,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   }
   async resolveBinaryWritePathConflict(workspaceId, originalServerPath, originalLocalPath, suggestedPath, token) {
     const localFile = this.app.vault.getAbstractFileByPath(originalLocalPath);
-    if (!(localFile instanceof import_obsidian11.TFile) || !isBinaryPath(localFile.path)) {
+    if (!(localFile instanceof import_obsidian10.TFile) || !isBinaryPath(localFile.path)) {
       await this.clearPendingBinaryWriteForLocalPath(originalLocalPath, false);
       this.recordLog(
         "blob",
@@ -23897,9 +24004,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     this.moveBinarySyncToken(originalLocalPath, replacementLocalPath);
     const conflictMessage = `[${workspaceId}] Local binary ${originalServerPath} conflicted with an existing server path. Renamed local file to ${replacementServerPath} so both copies survive.`;
     this.recordLog("blob", conflictMessage, "error");
-    new import_obsidian11.Notice(`Rolay kept your local file as ${replacementServerPath}.`);
+    new import_obsidian10.Notice(`Rolay kept your local file as ${replacementServerPath}.`);
     const currentFile = this.app.vault.getAbstractFileByPath(replacementLocalPath);
-    if (!(currentFile instanceof import_obsidian11.TFile)) {
+    if (!(currentFile instanceof import_obsidian10.TFile)) {
       return;
     }
     await this.queueBinaryWrite(
@@ -23920,7 +24027,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     );
     for (const pendingWrite of pendingWrites) {
       const currentFile = this.app.vault.getAbstractFileByPath(pendingWrite.localPath);
-      if (!(currentFile instanceof import_obsidian11.TFile) || !isBinaryPath(currentFile.path)) {
+      if (!(currentFile instanceof import_obsidian10.TFile) || !isBinaryPath(currentFile.path)) {
         await this.clearPendingBinaryWriteForLocalPath(pendingWrite.localPath, false);
         this.recordLog(
           "blob",
@@ -24022,7 +24129,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     if (entry.deleted || entry.kind !== "binary" || !entry.blob) {
       return;
     }
-    const localPath = (0, import_obsidian11.normalizePath)(this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path);
+    const localPath = (0, import_obsidian10.normalizePath)(this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path);
     const pendingWrite = this.data.pendingBinaryWrites[localPath];
     if (pendingWrite) {
       if (this.shouldDropPendingBinaryWriteAsRemoteEcho(workspaceId, pendingWrite, entry)) {
@@ -24047,14 +24154,14 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     const cached = this.findPersistedBinaryCacheEntry(entry.id);
     const remoteSize = entry.blob.sizeBytes;
     const remoteMimeType = entry.blob.mimeType || entry.mimeType || "application/octet-stream";
-    if (localFile instanceof import_obsidian11.TFile && cached?.hash === remoteHash) {
-      if ((0, import_obsidian11.normalizePath)(cached.filePath) !== localPath) {
+    if (localFile instanceof import_obsidian10.TFile && cached?.hash === remoteHash) {
+      if ((0, import_obsidian10.normalizePath)(cached.filePath) !== localPath) {
         this.persistBinaryCacheEntry(entry.id, localPath, remoteHash, remoteSize, remoteMimeType);
       }
       await this.clearBinaryDownloadPart(workspaceId, entry.id, remoteHash);
       return;
     }
-    if (localFile instanceof import_obsidian11.TFile) {
+    if (localFile instanceof import_obsidian10.TFile) {
       const localBytes = await this.app.vault.readBinary(localFile);
       const localHash = await sha256Hash(localBytes);
       if (localHash === remoteHash) {
@@ -24248,7 +24355,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     }
     const existingLocalFile = this.app.vault.getAbstractFileByPath(localPath);
     const cached = this.findPersistedBinaryCacheEntry(entry.id);
-    if (existingLocalFile instanceof import_obsidian11.TFile) {
+    if (existingLocalFile instanceof import_obsidian10.TFile) {
       const currentLocalBytes = await this.app.vault.readBinary(existingLocalFile);
       const currentLocalHash = await sha256Hash(currentLocalBytes);
       if (currentLocalHash === computedHash) {
@@ -24271,7 +24378,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   }
   async resolveBinaryDownloadConflict(workspaceId, entry, originalLocalPath) {
     const localFile = this.app.vault.getAbstractFileByPath(originalLocalPath);
-    if (!(localFile instanceof import_obsidian11.TFile) || !isBinaryPath(localFile.path)) {
+    if (!(localFile instanceof import_obsidian10.TFile) || !isBinaryPath(localFile.path)) {
       return;
     }
     const replacementServerPath = this.findAvailableBinaryConflictPath(workspaceId, entry.path);
@@ -24284,9 +24391,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     });
     const conflictMessage = `[${workspaceId}] Local binary ${entry.path} diverged from the incoming remote blob. Renamed local file to ${replacementServerPath} so both copies survive.`;
     this.recordLog("blob", conflictMessage, "error");
-    new import_obsidian11.Notice(`Rolay kept your local file as ${replacementServerPath}.`);
+    new import_obsidian10.Notice(`Rolay kept your local file as ${replacementServerPath}.`);
     const replacementFile = this.app.vault.getAbstractFileByPath(replacementLocalPath);
-    if (replacementFile instanceof import_obsidian11.TFile) {
+    if (replacementFile instanceof import_obsidian10.TFile) {
       await this.queueBinaryWrite(
         workspaceId,
         replacementServerPath,
@@ -24451,12 +24558,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     throw new Error(`No free conflict-safe path is available for ${desiredServerPath}.`);
   }
   async readLocalMarkdownContent(localPath, fallback = "") {
-    const activeView = this.app.workspace.getActiveViewOfType(import_obsidian11.MarkdownView);
+    const activeView = this.app.workspace.getActiveViewOfType(import_obsidian10.MarkdownView);
     if (activeView?.file?.path === localPath) {
       return activeView.editor.getValue();
     }
     const localFile = this.app.vault.getAbstractFileByPath(localPath);
-    if (!(localFile instanceof import_obsidian11.TFile) || localFile.extension !== "md") {
+    if (!(localFile instanceof import_obsidian10.TFile) || localFile.extension !== "md") {
       return fallback;
     }
     try {
@@ -24472,7 +24579,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
   }
   async readLocalBinaryContent(localPath, fallback = new ArrayBuffer(0)) {
     const localFile = this.app.vault.getAbstractFileByPath(localPath);
-    if (!(localFile instanceof import_obsidian11.TFile) || !isBinaryPath(localFile.path)) {
+    if (!(localFile instanceof import_obsidian10.TFile) || !isBinaryPath(localFile.path)) {
       return fallback;
     }
     try {
@@ -24493,7 +24600,7 @@ _RolayPlugin.MAX_PERSISTED_CRDT_DOCS = 1e4;
 _RolayPlugin.MAX_PERSISTED_BINARY_ENTRIES = 1e4;
 _RolayPlugin.ENABLE_BLOB_TRANSFER_TRACE = true;
 _RolayPlugin.BINARY_TRANSFER_PARTS_FOLDER = "transfers";
-_RolayPlugin.BINARY_UPLOAD_CHUNK_SIZE = (import_obsidian11.Platform.isMobileApp ? 1 : 4) * 1024 * 1024;
+_RolayPlugin.BINARY_UPLOAD_CHUNK_SIZE = (import_obsidian10.Platform.isMobileApp ? 1 : 4) * 1024 * 1024;
 _RolayPlugin.MAX_BINARY_UPLOAD_OFFSET_RECOVERY_ATTEMPTS = 8;
 _RolayPlugin.LOG_FILE_RETENTION_MS = 48 * 60 * 60 * 1e3;
 _RolayPlugin.MAX_LOG_FILE_BYTES = 256 * 1024;
@@ -24506,12 +24613,13 @@ _RolayPlugin.REMOTE_MARKDOWN_SETTLE_TTL_MS = 15e3;
 // full-room closed-note fallback calm so large vaults are not downloaded in a tight loop.
 _RolayPlugin.ROOM_MARKDOWN_REFRESH_INTERVAL_MS = 6e4;
 _RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS = 15e3;
-_RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = import_obsidian11.Platform.isMobileApp ? 4 : 8;
-_RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = (import_obsidian11.Platform.isMobileApp ? 256 : 512) * 1024;
-_RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY = import_obsidian11.Platform.isMobileApp ? 1 : 2;
+_RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = import_obsidian10.Platform.isMobileApp ? 4 : 8;
+_RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = (import_obsidian10.Platform.isMobileApp ? 256 : 512) * 1024;
+_RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY = import_obsidian10.Platform.isMobileApp ? 1 : 2;
 _RolayPlugin.PENDING_DELETE_GUARD_MS = 10 * 6e4;
 _RolayPlugin.STARTUP_BOOTSTRAP_DELAY_MS = 1500;
 _RolayPlugin.STARTUP_ROOM_CONNECT_STAGGER_MS = 900;
+_RolayPlugin.PLUGIN_UPDATE_QUIET_WINDOW_MS = 5e3;
 var RolayPlugin = _RolayPlugin;
 function normalizeSettingsEventEnvelope(event) {
   const rawData = isRecord3(event.data) ? event.data : {};
@@ -25037,16 +25145,16 @@ function getTextByteLength(text2) {
   return new TextEncoder().encode(text2).byteLength;
 }
 function getRuntimePlatformLabel() {
-  if (import_obsidian11.Platform.isAndroidApp) {
+  if (import_obsidian10.Platform.isAndroidApp) {
     return "android";
   }
-  if (import_obsidian11.Platform.isIosApp) {
+  if (import_obsidian10.Platform.isIosApp) {
     return "ios";
   }
-  if (import_obsidian11.Platform.isDesktopApp) {
+  if (import_obsidian10.Platform.isDesktopApp) {
     return "desktop";
   }
-  if (import_obsidian11.Platform.isMobile) {
+  if (import_obsidian10.Platform.isMobile) {
     return "mobile-ui";
   }
   return "unknown";

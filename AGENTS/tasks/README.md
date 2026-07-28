@@ -7,8 +7,8 @@ belongs in `README.md` and `docs/*`; product ideas that are not being implemente
 ## Active
 
 - [Self update](self-update.md)
-  Server-authoritative update discovery and verified force-update are deployed; a live two-version
-  Obsidian test remains.
+  Server-authoritative automatic discovery/install and bounded retries are implemented; a live
+  two-version Obsidian test remains.
 - [Mobile transport foundation](mobile-transport-foundation.md)
   Verify HTTPS/WSS, browser SSE/blob fallbacks, lifecycle recovery, and updater behavior on real
   Android/mobile before simplifying healthy-state UI.

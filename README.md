@@ -127,18 +127,22 @@ the plugin checks the Rolay server itself and BRAT is no longer required for lat
 6. Confirm installation.
 7. Install the latest Rolay release.
 
-Updater-enabled builds check shortly after startup and then hourly. When a newer version
-exists, Rolay shows a download indicator in the Obsidian ribbon and an update banner in settings.
-Clicking `Force update` downloads and verifies `main.js`, `manifest.json`, and `styles.css`, preserves
-all local plugin data, and attempts a soft plugin reload. If Obsidian cannot reload the plugin
-safely, Rolay asks for an Obsidian restart.
+Updater-enabled builds check shortly after startup, every 15 minutes, and immediately after network
+connectivity returns. A newer release is downloaded, verified, and installed automatically after
+active tree operations, transfers, Markdown preload, and room reconciliation reach a safe idle
+window. Rolay preserves all local plugin data and attempts a soft plugin reload. There are no
+manual refresh/check/install actions. Healthy update work stays hidden; the ribbon/settings UI is
+shown only when Obsidian must be restarted or repeated automatic retries keep failing.
 
 Notes:
 
 - If the repository is public, users usually only need the repository URL.
 - If the repository is private, BRAT distribution becomes less convenient because every user needs access to that repository. For a small group, the simplest setup is usually a public repository that is just not advertised widely.
 - Builds older than the first self-updater release still need one final BRAT or manual update. Old code cannot discover an updater that it does not contain.
-- After that transition, users may remove BRAT if they do not use it for other plugins.
+- Transitional builds `1.2.17` and `1.2.18` can discover releases but still use the old explicit
+  installer. Updating them once to `1.2.19` enables the fully automatic flow for later releases.
+- After that transition, users may remove Rolay from BRAT (and remove BRAT itself if they do not use
+  it for other plugins), avoiding two independent updaters touching the same runtime files.
 - Executable update files and normal sync traffic use `https://rolay.ru`, but update discovery remains
   a separate unauthenticated, read-only API surface.
 

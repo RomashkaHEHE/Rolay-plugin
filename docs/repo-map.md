@@ -19,7 +19,8 @@ The plugin is split into a few strong boundaries:
 - `src/api/client.ts`
   Shared authenticated HTTP and blob transport lives here. If the bug smells like request shape, auth headers, refresh handling, upload/download transport, or status-code handling, start here. Long-lived SSE lifecycle lives in `src/sync/*`.
 - `src/update/plugin-updater.ts`
-  Non-blocking update checks, semver comparison, release-file verification, staging, backup/rollback, installation, and best-effort Obsidian soft reload.
+  Automatic non-blocking update checks/retries, semver comparison, release-file verification,
+  safe-idle scheduling, staging, backup/rollback, installation, and best-effort Obsidian soft reload.
 - `src/obsidian/file-bridge.ts`
   Translates authoritative room tree state into local vault files/folders and translates local vault mutations back into server operations. This is the first place to inspect echo-loops, create/rename/delete races, and "server said create, client sent create back" style bugs.
 - `src/realtime/crdt-session.ts`
@@ -36,8 +37,6 @@ The plugin is split into a few strong boundaries:
   Tree SSE, settings SSE, note-presence SSE, tree store, operations queue, and local/server path mapping.
 - `src/types/protocol.ts`
   TypeScript view of the current server contract.
-- `src/ui/plugin-update-modal.ts`
-  Confirmation and progress/restart messaging for the explicit force-update action.
 
 ## Module Map
 
@@ -92,6 +91,8 @@ Search here for:
 What it does:
 
 - checks the public Rolay update manifest without authentication
+- installs newer releases automatically after the main runtime reports a safe idle window
+- retries temporary check/download/install failures with bounded backoff
 - validates exact file allowlist, semver, sizes, hashes, plugin ID, and Obsidian compatibility
 - stages all files before touching the installed plugin
 - keeps local backups and rolls back partial replacement
@@ -250,9 +251,6 @@ Search here for:
   Binary/base64 conversion shared by CRDT and blob payload handling.
 - `ui/text-input-modal.ts`
   Shared local-folder/name prompt.
-- `ui/plugin-update-modal.ts`
-  Update confirmation, progress, and restart messaging.
-
 ## Typical Bug Entry Points
 
 ### "Plugin forgot my room folder after restart"

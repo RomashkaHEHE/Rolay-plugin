@@ -20,6 +20,7 @@ export class OperationsQueue {
   private readonly onTrace?: (workspaceId: string, operation: TreeOperation, reason: string, meta: ApiResponseMeta) => void;
   private readonly onAfterApply?: (workspaceId: string, reason: string) => Promise<void> | void;
   private chain: Promise<void> = Promise.resolve();
+  private pendingCount = 0;
 
   constructor(config: OperationsQueueConfig) {
     this.apiClient = config.apiClient;
@@ -34,6 +35,7 @@ export class OperationsQueue {
     operation: Omit<TreeOperation, "opId">,
     reason: string
   ): Promise<BatchOperationsResponse> {
+    this.pendingCount += 1;
     const queued = async (): Promise<BatchOperationsResponse> => {
       const opWithId: TreeOperation = {
         ...operation,
@@ -64,8 +66,15 @@ export class OperationsQueue {
     };
 
     const task = this.chain.then(queued, queued);
-    this.chain = task.then(() => undefined, () => undefined);
-    return task;
+    const trackedTask = task.finally(() => {
+      this.pendingCount = Math.max(0, this.pendingCount - 1);
+    });
+    this.chain = trackedTask.then(() => undefined, () => undefined);
+    return trackedTask;
+  }
+
+  isIdle(): boolean {
+    return this.pendingCount === 0;
   }
 
   async waitForIdle(): Promise<void> {

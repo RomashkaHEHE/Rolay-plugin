@@ -6,7 +6,8 @@ Last updated: 2026-07-28
 
 ## Goal
 
-Let installed Rolay clients detect a newer plugin release without BRAT, show a persistent outdated-version indicator, and install a verified update on explicit user action.
+Let installed Rolay clients discover, verify, and install newer releases without BRAT or any manual
+refresh/check/install action.
 
 ## Current Understanding
 
@@ -19,6 +20,10 @@ Let installed Rolay clients detect a newer plugin release without BRAT, show a p
 - Files must be downloaded to staging, then checked for plugin ID, version, size, and SHA-256 before installation.
 - A running `main.js` remains in memory after the file on disk changes. A best-effort soft reload may use Obsidian's internal plugin manager, with an explicit restart fallback.
 - Update checks must start after plugin load and must not delay Obsidian startup.
+- Expected update work must be invisible and autonomous. Only restart-required or persistent retry
+  failure is exceptional enough to surface.
+- Installation must wait for active sync/preload/reconciliation and recent editor/vault activity to
+  settle, then persist local state before replacing runtime files.
 
 ## Relevant Files
 
@@ -34,9 +39,24 @@ Let installed Rolay clients detect a newer plugin release without BRAT, show a p
 ## Progress Notes
 
 - 2026-07-28: Chose a server-authoritative, public read-only update manifest and file proxy. The client will never execute an unverified or partial download.
-- 2026-07-28: Implemented hourly non-blocking checks against the dedicated HTTPS authority `https://rolay.ru`.
+- 2026-07-28: Initially implemented hourly non-blocking discovery against the dedicated HTTPS
+  authority `https://rolay.ru`; the automatic-install revision shortened the normal interval to
+  15 minutes and added connectivity-triggered checks.
 - 2026-07-28: Added strict manifest validation, byte-size/SHA-256 checks, staging, on-disk verification, two retained backups, partial-install rollback, and `manifest.json`-last replacement.
-- 2026-07-28: Added a hidden-until-stale ribbon indicator, settings banner, General version/check card, confirmation modal, progress, and restart-required state.
+- 2026-07-28: Replaced the explicit force-update flow with automatic discovery every 15 minutes,
+  automatic verified install in a safe idle window, connectivity-triggered checks, and bounded
+  retry backoff.
+- 2026-07-28: Removed the update modal and all refresh/check/install buttons. Healthy checks,
+  downloads, waiting, and installation stay hidden; settings/ribbon surface only persistent errors
+  and restart-required state.
+- 2026-07-28: Added an explicit safe-install gate for active operation queue work, binary transport,
+  startup/recovery, room snapshot/background reconciliation, Markdown preload, and recent
+  editor/vault activity. Failed pending records remain durable across reload and do not permanently
+  starve an updater that may contain their fix.
+- 2026-07-28: Automatic retries use bounded backoff and accelerate after connectivity/mobile resume.
+  A deliberately offline client does not turn normal offline state into a persistent update error.
+- 2026-07-28: `1.2.19` type-check, production build, bundle string audit, `git diff --check`, and
+  `npm audit` pass locally.
 - 2026-07-28: Added best-effort soft reload only when Obsidian exposes `disablePlugin`, `loadManifests`, and `enablePlugin`; otherwise the installed update waits for restart.
 - 2026-07-28: `npm run check` and `npm run build` pass.
 - 2026-07-28: Deployed server update distribution in commit `978f311`; the public production
@@ -48,18 +68,22 @@ Let installed Rolay clients detect a newer plugin release without BRAT, show a p
 
 - Obsidian's programmatic plugin reload API is internal and may differ by version. Installation must remain successful even when reload is unavailable.
 - Reload must not discard local state. Persist state before replacement and let the normal plugin unload lifecycle stop streams/transfers.
-- A live two-version Obsidian update still needs to confirm the internal soft-reload path. Restart fallback is already implemented.
+- A live two-version Obsidian update still needs to confirm the automatic safe-idle install and
+  internal soft-reload path. Restart fallback is already implemented.
 
 ## Next Steps
 
-1. Install/update to `1.2.17` through BRAT on the existing desktop and Android clients.
-2. Publish a second test release and verify stale indicator, force update, soft reload, and restart fallback in Obsidian.
+1. Publish `1.2.19` and allow an existing `1.2.18` client to perform the final manual bootstrap
+   update; `1.2.18` still contains the old explicit installer.
+2. Publish a later test release and verify automatic discovery, safe-idle waiting, download,
+   installation, retry, soft reload, and restart fallback in Obsidian.
 3. Mark this task `DONE` after the live two-version test.
 
 ## Exit Criteria
 
 - An older updater-enabled build detects a newer release without login.
-- The ribbon/settings UI clearly reports that the version is outdated.
-- Clicking the action downloads and verifies all files before replacing anything.
+- A newer release downloads and installs without any user action.
+- Active sync work is allowed to finish before runtime replacement/reload.
 - Hash/size/plugin-ID/version failures leave the installed plugin untouched.
+- Temporary failures retry automatically without notices or buttons.
 - Successful installation either reloads Rolay or clearly asks for an Obsidian restart.

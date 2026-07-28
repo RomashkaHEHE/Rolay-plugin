@@ -39,8 +39,9 @@ The plugin therefore stores:
 
 Expected client order:
 
-1. After plugin load, schedule the public update check without blocking Obsidian workspace startup
-   or waiting for authentication.
+1. After plugin load, schedule automatic public update discovery without blocking Obsidian
+   workspace startup or waiting for authentication. Newer verified files install automatically
+   after local sync reaches a safe idle window.
 2. Authenticate with `login` or `refresh`.
 3. Fetch `GET /v1/auth/me`.
 4. Load room list from `GET /v1/rooms`.
@@ -83,6 +84,13 @@ The plugin must reject the update before replacing anything if:
 - downloaded `manifest.json` is invalid or requires a newer Obsidian version
 
 `data.json`, logs, caches, transfer parts, and room bindings are never update assets.
+
+The client checks this API shortly after startup, every 15 minutes, and after connectivity returns.
+Temporary discovery/download/install failures use automatic backoff. The client exposes no manual
+check or install action. Before replacing runtime files and attempting a soft reload, it waits for
+active tree operations, binary transfers, Markdown preload, snapshot reconciliation, and recent
+vault/editor activity to settle, then persists plugin state. Only persistent retry failure or a
+required Obsidian restart becomes visible to the user.
 
 ### Auth
 

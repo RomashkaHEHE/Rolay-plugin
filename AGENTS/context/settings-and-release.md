@@ -36,6 +36,13 @@ Why:
 
 The server is the update authority even when GitHub stores the artifacts. The client accepts only `main.js`, `manifest.json`, and `styles.css`, verifies their hashes and release metadata, and never replaces `data.json` or local sync state.
 
+Ongoing updates are deliberately autonomous. Updater-enabled clients check shortly after startup,
+every 15 minutes, and after connectivity recovery; they download and verify a newer release,
+wait for sync/editor activity to reach a safe idle window, persist local state, install, and retry
+temporary failures without a user action. Do not add `Refresh`, `Check for updates`, `Force update`,
+or equivalent install controls back to the product UI. Normal update work is silent. Only a
+required Obsidian restart or a persistent automatic-retry failure should attract attention.
+
 Executable update traffic and normal sync now use `https://rolay.ru`. Update discovery is still a
 separate public read-only surface, while room/auth/tree/blob APIs remain authenticated. The client
 must reject insecure update, CRDT, or blob fallback targets rather than silently downgrading.

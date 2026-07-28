@@ -15,6 +15,7 @@ import type {
   WorkspaceRole
 } from "../types/protocol";
 import { openTextInputModal } from "../ui/text-input-modal";
+import { hasPersistentPluginUpdateError } from "../update/plugin-updater";
 import type { RolayPluginSettings } from "./data";
 
 type SettingsView = "account" | "general" | "rooms" | "admin";
@@ -214,12 +215,8 @@ export class RolaySettingTab extends PluginSettingTab {
 
   private renderPluginUpdateBanner(containerEl: HTMLElement): void {
     const state = this.rolay.getPluginUpdateState();
-    const shouldShow =
-      state.status === "available" ||
-      state.status === "downloading" ||
-      state.status === "installing" ||
-      state.status === "restart-required" ||
-      (state.status === "error" && this.rolay.hasPluginUpdateAvailable());
+    const persistentError = hasPersistentPluginUpdateError(state);
+    const shouldShow = state.status === "restart-required" || persistentError;
     if (!shouldShow) {
       return;
     }
@@ -232,48 +229,21 @@ export class RolaySettingTab extends PluginSettingTab {
       icon,
       state.status === "restart-required"
         ? "refresh-cw"
-        : state.status === "downloading" || state.status === "installing"
-          ? "loader-circle"
-          : "download"
+        : "alert-triangle"
     );
     const copy = banner.createDiv({ cls: "rolay-update-banner-copy" });
     copy.createDiv({
       cls: "rolay-update-banner-title",
       text: state.status === "restart-required"
         ? "Rolay update installed"
-        : state.status === "error"
-          ? "Rolay update needs attention"
-          : state.status === "downloading" || state.status === "installing"
-            ? `Updating Rolay: ${state.progressPercent}%`
-            : `Rolay ${state.latestVersion} is available`
+        : "Rolay update is retrying"
     });
     copy.createDiv({
       cls: "rolay-update-banner-detail",
       text: state.status === "restart-required"
         ? "Restart Obsidian to load the new plugin files."
-        : state.status === "error"
-          ? state.lastError ?? "The update could not be installed."
-          : `Installed version: ${state.currentVersion}`
+        : `${state.lastError ?? "The update service is temporarily unavailable."} No action is required; Rolay will retry automatically.`
     });
-
-    if (state.status === "downloading" || state.status === "installing") {
-      const progress = banner.createEl("progress", {
-        cls: "rolay-update-banner-progress"
-      });
-      progress.max = 100;
-      progress.value = state.progressPercent;
-      return;
-    }
-    if (state.status === "restart-required") {
-      return;
-    }
-
-    const action = banner.createEl("button", {
-      cls: "mod-cta rolay-update-action"
-    });
-    setIcon(action, "download");
-    action.createSpan({ text: "Force update" });
-    action.addEventListener("click", () => this.rolay.openPluginUpdateDialog());
   }
 
   private renderAccountView(
@@ -448,29 +418,21 @@ export class RolaySettingTab extends PluginSettingTab {
     const statusLabel = state.status === "current"
       ? "up to date"
       : state.status === "available"
-        ? "update available"
+        ? "update scheduled"
+        : state.status === "waiting"
+          ? "waiting for sync to settle"
         : state.status === "downloading" || state.status === "installing"
-          ? `${state.progressPercent}%`
+          ? `updating automatically (${state.progressPercent}%)`
           : state.status === "restart-required"
             ? "restart required"
             : state.status === "error"
-              ? "check failed"
+              ? "retrying automatically"
               : state.status;
     this.createInfoBlock(card.body, [
       ["Installed", state.currentVersion],
       ["Latest", state.latestVersion ?? "not checked"],
       ["Status", statusLabel]
     ]);
-
-    const actions = this.createActionRow(card.body);
-    const checkButton = this.createActionButton(actions, "Check now", "", async () => {
-      await this.rolay.checkForPluginUpdate();
-      this.requestRender();
-    });
-    checkButton.disabled =
-      state.status === "checking" ||
-      state.status === "downloading" ||
-      state.status === "installing";
   }
 
   private renderRoomsView(

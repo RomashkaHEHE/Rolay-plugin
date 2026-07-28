@@ -19,6 +19,7 @@ export type PluginUpdateStatus =
   | "checking"
   | "current"
   | "available"
+  | "waiting"
   | "downloading"
   | "installing"
   | "restart-required"
@@ -32,12 +33,9 @@ export interface PluginUpdateState {
   progressPercent: number;
   lastCheckedAt: string | null;
   lastError: string | null;
-}
-
-export interface PluginUpdateInstallResult {
-  version: string;
-  reloaded: boolean;
-  restartRequired: boolean;
+  consecutiveFailures: number;
+  nextRetryAt: string | null;
+  waitingReason: string | null;
 }
 
 interface PluginUpdaterConfig {
@@ -45,7 +43,8 @@ interface PluginUpdaterConfig {
   apiClient: RolayApiClient;
   pluginId: string;
   currentVersion: string;
-  prepareForInstall: () => Promise<void>;
+  getInstallBlockers: () => string[];
+  prepareForInstall: () => Promise<boolean>;
   onStateChange: (state: PluginUpdateState) => void;
   log: (message: string, error?: boolean) => void;
 }
@@ -53,6 +52,11 @@ interface PluginUpdaterConfig {
 interface DownloadedUpdateFile {
   descriptor: PluginUpdateFileDescriptor;
   data: ArrayBuffer;
+}
+
+interface VerifiedUpdateDownload {
+  version: string;
+  files: Map<PluginUpdateFileName, DownloadedUpdateFile>;
 }
 
 interface InstalledFileRecord {
@@ -79,17 +83,34 @@ const INSTALL_ORDER: readonly PluginUpdateFileName[] = [
 ];
 const PLAIN_SEMVER_PATTERN = /^\d+\.\d+\.\d+$/;
 const INITIAL_CHECK_DELAY_MS = 8_000;
-const CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const CHECK_INTERVAL_MS = 15 * 60 * 1000;
+const INSTALL_RETRY_DELAY_MS = 5_000;
+const RETRY_DELAYS_MS = [
+  30_000,
+  2 * 60_000,
+  5 * 60_000,
+  15 * 60_000,
+  30 * 60_000
+] as const;
+const PERSISTENT_ERROR_THRESHOLD = 3;
+const BLOCKER_LOG_INTERVAL_MS = 60_000;
 const BACKUPS_TO_KEEP = 2;
 
 export class PluginUpdater {
   private readonly config: PluginUpdaterConfig;
   private state: PluginUpdateState;
   private latestManifest: PluginUpdateManifest | null = null;
-  private initialCheckHandle: number | null = null;
-  private checkIntervalHandle: number | null = null;
+  private verifiedDownload: VerifiedUpdateDownload | null = null;
+  private checkHandle: number | null = null;
+  private checkScheduledAt: number | null = null;
+  private installHandle: number | null = null;
+  private installScheduledAt: number | null = null;
   private checkPromise: Promise<PluginUpdateState> | null = null;
-  private installPromise: Promise<PluginUpdateInstallResult> | null = null;
+  private installPromise: Promise<void> | null = null;
+  private failurePhase: "check" | "installation" | null = null;
+  private lastBlockerSignature = "";
+  private lastBlockerLoggedAt = 0;
+  private started = false;
   private stopped = false;
 
   constructor(config: PluginUpdaterConfig) {
@@ -101,77 +122,250 @@ export class PluginUpdater {
       releasedAt: null,
       progressPercent: 0,
       lastCheckedAt: null,
-      lastError: null
+      lastError: null,
+      consecutiveFailures: 0,
+      nextRetryAt: null,
+      waitingReason: null
     };
   }
 
   start(): void {
-    if (this.initialCheckHandle !== null || this.checkIntervalHandle !== null) {
+    if (this.started) {
       return;
     }
+    this.started = true;
     this.stopped = false;
-
-    this.initialCheckHandle = window.setTimeout(() => {
-      this.initialCheckHandle = null;
-      void this.checkForUpdates().catch(() => undefined);
-    }, INITIAL_CHECK_DELAY_MS);
-    this.checkIntervalHandle = window.setInterval(() => {
-      void this.checkForUpdates().catch(() => undefined);
-    }, CHECK_INTERVAL_MS);
+    this.scheduleCheck(INITIAL_CHECK_DELAY_MS);
   }
 
   stop(): void {
     this.stopped = true;
-    if (this.initialCheckHandle !== null) {
-      window.clearTimeout(this.initialCheckHandle);
-      this.initialCheckHandle = null;
+    this.started = false;
+    if (this.checkHandle !== null) {
+      window.clearTimeout(this.checkHandle);
+      this.checkHandle = null;
+      this.checkScheduledAt = null;
     }
-    if (this.checkIntervalHandle !== null) {
-      window.clearInterval(this.checkIntervalHandle);
-      this.checkIntervalHandle = null;
+    if (this.installHandle !== null) {
+      window.clearTimeout(this.installHandle);
+      this.installHandle = null;
+      this.installScheduledAt = null;
     }
+    this.verifiedDownload = null;
   }
 
   getState(): PluginUpdateState {
     return { ...this.state };
   }
 
-  checkForUpdates(): Promise<PluginUpdateState> {
-    if (this.stopped) {
-      return Promise.resolve(this.getState());
+  notifyConnectivityRestored(): void {
+    if (!this.started || this.stopped || this.state.status === "restart-required") {
+      return;
     }
-    if (this.checkPromise) {
-      return this.checkPromise;
+    if (isPluginUpdateAvailable(this.state)) {
+      this.scheduleInstall(0);
     }
-    if (this.installPromise) {
-      return Promise.resolve(this.getState());
-    }
-
-    this.checkPromise = this.runCheck().finally(() => {
-      this.checkPromise = null;
-    });
-    return this.checkPromise;
+    this.scheduleCheck(2_000);
   }
 
-  installAvailableUpdate(): Promise<PluginUpdateInstallResult> {
-    if (this.stopped) {
-      return Promise.reject(new Error("Rolay unloaded before the update could start."));
-    }
-    if (this.installPromise) {
-      return this.installPromise;
+  private scheduleCheck(delayMs: number): void {
+    if (!this.started || this.stopped || this.state.status === "restart-required") {
+      return;
     }
 
-    this.installPromise = this.runInstall().finally(() => {
-      this.installPromise = null;
+    const scheduledAt = Date.now() + Math.max(0, delayMs);
+    if (
+      this.checkHandle !== null &&
+      this.checkScheduledAt !== null &&
+      this.checkScheduledAt <= scheduledAt
+    ) {
+      return;
+    }
+    if (this.checkHandle !== null) {
+      window.clearTimeout(this.checkHandle);
+    }
+
+    this.checkScheduledAt = scheduledAt;
+    this.checkHandle = window.setTimeout(() => {
+      this.checkHandle = null;
+      this.checkScheduledAt = null;
+      void this.runAutomaticCheck();
+    }, Math.max(0, delayMs));
+  }
+
+  private scheduleInstall(delayMs: number): void {
+    if (
+      !this.started ||
+      this.stopped ||
+      this.state.status === "restart-required"
+    ) {
+      return;
+    }
+
+    const scheduledAt = Date.now() + Math.max(0, delayMs);
+    if (
+      this.installHandle !== null &&
+      this.installScheduledAt !== null &&
+      this.installScheduledAt <= scheduledAt
+    ) {
+      return;
+    }
+    if (this.installHandle !== null) {
+      window.clearTimeout(this.installHandle);
+    }
+
+    this.installScheduledAt = scheduledAt;
+    this.installHandle = window.setTimeout(() => {
+      this.installHandle = null;
+      this.installScheduledAt = null;
+      void this.runAutomaticInstall();
+    }, Math.max(0, delayMs));
+  }
+
+  private async runAutomaticCheck(): Promise<void> {
+    if (this.stopped || this.state.status === "restart-required") {
+      return;
+    }
+    if (navigator.onLine === false) {
+      this.scheduleCheck(CHECK_INTERVAL_MS);
+      return;
+    }
+    if (this.checkPromise || this.installPromise) {
+      this.scheduleCheck(CHECK_INTERVAL_MS);
+      return;
+    }
+
+    const check = this.runCheck();
+    this.checkPromise = check;
+    try {
+      const state = await check;
+      if (isPluginUpdateAvailable(state)) {
+        this.scheduleInstall(0);
+      }
+      this.scheduleCheck(CHECK_INTERVAL_MS);
+    } catch (error) {
+      if (!this.stopped) {
+        const retryDelay = this.recordFailure("check", error);
+        this.scheduleCheck(retryDelay);
+      }
+    } finally {
+      if (this.checkPromise === check) {
+        this.checkPromise = null;
+      }
+    }
+  }
+
+  private async runAutomaticInstall(): Promise<void> {
+    if (
+      this.stopped ||
+      this.state.status === "restart-required" ||
+      this.installPromise
+    ) {
+      return;
+    }
+    if (!this.latestManifest || !isPluginUpdateAvailable(this.state)) {
+      this.scheduleCheck(0);
+      return;
+    }
+
+    const blockers = this.config.getInstallBlockers();
+    if (blockers.length > 0) {
+      this.updateWaitingState(blockers);
+      this.scheduleInstall(INSTALL_RETRY_DELAY_MS);
+      return;
+    }
+
+    const install = this.runInstall();
+    this.installPromise = install;
+    try {
+      await install;
+    } catch (error) {
+      if (!this.stopped) {
+        const retryDelay = this.recordFailure("installation", error);
+        this.scheduleInstall(retryDelay);
+      }
+    } finally {
+      if (this.installPromise === install) {
+        this.installPromise = null;
+      }
+    }
+  }
+
+  private updateWaitingState(blockers: string[]): void {
+    const waitingReason = blockers.length > 0
+      ? blockers.join(", ")
+      : "sync activity is still settling";
+    const progressPercent = this.verifiedDownload ? 90 : 0;
+    if (
+      this.state.status !== "waiting" ||
+      this.state.progressPercent !== progressPercent ||
+      this.state.waitingReason !== waitingReason
+    ) {
+      this.updateState({
+        status: "waiting",
+        progressPercent,
+        lastError: null,
+        nextRetryAt: null,
+        waitingReason
+      });
+    }
+
+    const signature = blockers.join("|");
+    const now = Date.now();
+    if (
+      signature !== this.lastBlockerSignature ||
+      now - this.lastBlockerLoggedAt >= BLOCKER_LOG_INTERVAL_MS
+    ) {
+      this.lastBlockerSignature = signature;
+      this.lastBlockerLoggedAt = now;
+      this.log(
+        `Plugin update ${this.latestManifest?.latestVersion ?? ""} is waiting for a safe idle window: ${waitingReason}.`
+      );
+    }
+  }
+
+  private recordFailure(phase: "check" | "installation", error: unknown): number {
+    const message = describeError(error);
+    const consecutiveFailures = this.state.consecutiveFailures + 1;
+    const retryDelay = getRetryDelay(consecutiveFailures);
+    this.failurePhase = phase;
+    this.updateState({
+      status: "error",
+      progressPercent: this.verifiedDownload ? 90 : 0,
+      lastCheckedAt: phase === "check"
+        ? new Date().toISOString()
+        : this.state.lastCheckedAt,
+      lastError: message,
+      consecutiveFailures,
+      nextRetryAt: new Date(Date.now() + retryDelay).toISOString(),
+      waitingReason: null
     });
-    return this.installPromise;
+    this.log(
+      `Plugin update ${phase} failed (attempt ${consecutiveFailures}); retrying automatically: ${message}`,
+      true
+    );
+    return retryDelay;
+  }
+
+  private clearScheduledWork(): void {
+    if (this.checkHandle !== null) {
+      window.clearTimeout(this.checkHandle);
+      this.checkHandle = null;
+      this.checkScheduledAt = null;
+    }
+    if (this.installHandle !== null) {
+      window.clearTimeout(this.installHandle);
+      this.installHandle = null;
+      this.installScheduledAt = null;
+    }
   }
 
   private async runCheck(): Promise<PluginUpdateState> {
+    const previousLatestVersion = this.latestManifest?.latestVersion ?? null;
+    const previousLastError = this.state.lastError;
     this.updateState({
       status: "checking",
-      progressPercent: 0,
-      lastError: null
+      progressPercent: 0
     });
 
     try {
@@ -183,86 +377,106 @@ export class PluginUpdater {
         manifest.latestVersion,
         this.config.currentVersion
       ) > 0;
+      const preserveInstallFailures =
+        updateAvailable &&
+        this.failurePhase === "installation" &&
+        previousLatestVersion === manifest.latestVersion;
+      const shouldLogCheckResult =
+        previousLatestVersion === null ||
+        previousLatestVersion !== manifest.latestVersion ||
+        this.failurePhase === "check";
+      if (
+        this.verifiedDownload &&
+        (
+          !updateAvailable ||
+          this.verifiedDownload.version !== manifest.latestVersion
+        )
+      ) {
+        this.verifiedDownload = null;
+      }
       this.updateState({
         status: updateAvailable ? "available" : "current",
         latestVersion: manifest.latestVersion,
         releasedAt: manifest.releasedAt,
         progressPercent: updateAvailable ? 0 : 100,
         lastCheckedAt: new Date().toISOString(),
-        lastError: null
+        lastError: preserveInstallFailures ? previousLastError : null,
+        consecutiveFailures: preserveInstallFailures
+          ? this.state.consecutiveFailures
+          : 0,
+        nextRetryAt: null,
+        waitingReason: null
       });
-      this.log(
-        updateAvailable
-          ? `Plugin update ${manifest.latestVersion} is available (current ${this.config.currentVersion}).`
-          : `Plugin version ${this.config.currentVersion} is current.`
-      );
+      if (!preserveInstallFailures) {
+        this.failurePhase = null;
+      }
+      if (shouldLogCheckResult) {
+        this.log(
+          updateAvailable
+            ? `Plugin update ${manifest.latestVersion} is available (current ${this.config.currentVersion}).`
+            : `Plugin version ${this.config.currentVersion} is current.`
+        );
+      }
       return this.getState();
     } catch (error) {
       if (this.stopped) {
         return this.getState();
       }
-      const message = describeError(error);
-      this.updateState({
-        status: "error",
-        progressPercent: 0,
-        lastCheckedAt: new Date().toISOString(),
-        lastError: message
-      });
-      this.log(`Plugin update check failed: ${message}`, true);
       throw error;
     }
   }
 
-  private async runInstall(): Promise<PluginUpdateInstallResult> {
-    let manifest = this.latestManifest;
+  private async runInstall(): Promise<void> {
+    const manifest = this.latestManifest;
     if (!manifest || compareSemver(manifest.latestVersion, this.config.currentVersion) <= 0) {
-      await this.checkForUpdates();
-      manifest = this.latestManifest;
-    }
-    if (!manifest || compareSemver(manifest.latestVersion, this.config.currentVersion) <= 0) {
-      throw new Error("No newer Rolay plugin version is available.");
+      return;
     }
 
-    try {
+    let verifiedDownload = this.verifiedDownload;
+    if (!verifiedDownload || verifiedDownload.version !== manifest.latestVersion) {
       const files = await this.downloadAndVerifyFiles(manifest);
-      this.assertRunning();
-      await this.config.prepareForInstall();
-      this.assertRunning();
-      this.updateState({
-        status: "installing",
-        progressPercent: 95,
-        lastError: null
-      });
-      await this.installFiles(manifest, files);
-      this.updateState({
-        status: "restart-required",
-        progressPercent: 100,
-        lastError: null
-      });
-      this.log(
-        `Plugin update ${manifest.latestVersion} was installed. Attempting a soft reload.`
-      );
-
-      const reloadScheduled = this.scheduleSoftReload();
-      if (!reloadScheduled) {
-        this.log(
-          `Plugin update ${manifest.latestVersion} is on disk; Obsidian restart is required.`
-        );
-      }
-      return {
+      verifiedDownload = {
         version: manifest.latestVersion,
-        reloaded: reloadScheduled,
-        restartRequired: !reloadScheduled
+        files
       };
-    } catch (error) {
-      const message = describeError(error);
-      this.updateState({
-        status: "error",
-        progressPercent: 0,
-        lastError: message
-      });
-      this.log(`Plugin update installation failed: ${message}`, true);
-      throw error;
+      this.verifiedDownload = verifiedDownload;
+    }
+
+    this.assertRunning();
+    if (!(await this.config.prepareForInstall())) {
+      this.updateWaitingState(this.config.getInstallBlockers());
+      this.scheduleInstall(INSTALL_RETRY_DELAY_MS);
+      return;
+    }
+    this.assertRunning();
+    this.updateState({
+      status: "installing",
+      progressPercent: 95,
+      lastError: null,
+      nextRetryAt: null,
+      waitingReason: null
+    });
+    await this.installFiles(manifest, verifiedDownload.files);
+    this.verifiedDownload = null;
+    this.failurePhase = null;
+    this.updateState({
+      status: "restart-required",
+      progressPercent: 100,
+      lastError: null,
+      consecutiveFailures: 0,
+      nextRetryAt: null,
+      waitingReason: null
+    });
+    this.log(
+      `Plugin update ${manifest.latestVersion} was installed automatically. Attempting a soft reload.`
+    );
+
+    this.clearScheduledWork();
+    const reloadScheduled = this.scheduleSoftReload();
+    if (!reloadScheduled) {
+      this.log(
+        `Plugin update ${manifest.latestVersion} is on disk; Obsidian restart is required.`
+      );
     }
   }
 
@@ -272,7 +486,9 @@ export class PluginUpdater {
     this.updateState({
       status: "downloading",
       progressPercent: 0,
-      lastError: null
+      lastError: null,
+      nextRetryAt: null,
+      waitingReason: null
     });
 
     const downloaded = new Map<PluginUpdateFileName, DownloadedUpdateFile>();
@@ -436,6 +652,11 @@ export function isPluginUpdateAvailable(state: PluginUpdateState): boolean {
     state.latestVersion &&
     compareSemver(state.latestVersion, state.currentVersion) > 0
   );
+}
+
+export function hasPersistentPluginUpdateError(state: PluginUpdateState): boolean {
+  return state.status === "error" &&
+    state.consecutiveFailures >= PERSISTENT_ERROR_THRESHOLD;
 }
 
 export function compareSemver(left: string, right: string): number {
@@ -640,4 +861,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function getRetryDelay(consecutiveFailures: number): number {
+  const index = Math.min(
+    Math.max(0, consecutiveFailures - 1),
+    RETRY_DELAYS_MS.length - 1
+  );
+  return RETRY_DELAYS_MS[index];
 }

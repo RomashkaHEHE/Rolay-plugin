@@ -63,10 +63,9 @@ import type {
   User
 } from "./types/protocol";
 import { openTextInputModal } from "./ui/text-input-modal";
-import { PluginUpdateModal } from "./ui/plugin-update-modal";
 import {
+  hasPersistentPluginUpdateError,
   PluginUpdater,
-  isPluginUpdateAvailable,
   type PluginUpdateState
 } from "./update/plugin-updater";
 import { isBinaryPath, isMarkdownPath, guessMimeTypeFromPath } from "./utils/file-kind";
@@ -246,6 +245,7 @@ export default class RolayPlugin extends Plugin {
   private static readonly PENDING_DELETE_GUARD_MS = 10 * 60_000;
   private static readonly STARTUP_BOOTSTRAP_DELAY_MS = 1_500;
   private static readonly STARTUP_ROOM_CONNECT_STAGGER_MS = 900;
+  private static readonly PLUGIN_UPDATE_QUIET_WINDOW_MS = 5_000;
   private data!: RolayPluginData;
   private apiClient!: RolayApiClient;
   private crdtManager!: CrdtSessionManager;
@@ -287,10 +287,12 @@ export default class RolayPlugin extends Plugin {
   private settingsEventStreamStatus: WorkspaceEventStreamStatus = "stopped";
   private settingsStreamRecoveryInFlight = false;
   private startupBootstrapHandle: number | null = null;
+  private startupBootstrapInFlight = false;
   private readonly startupRoomResumeHandles = new Set<number>();
   private lifecycleRecoveryHandle: number | null = null;
   private lifecycleRecoveryInFlight = false;
   private mobileHiddenAt: number | null = null;
+  private lastPluginUpdateActivityAt = Date.now();
   private profileDraftDisplayName = "";
   private passwordChangeDraft: PasswordChangeDraft = {
     currentPassword: "",
@@ -339,8 +341,9 @@ export default class RolayPlugin extends Plugin {
       apiClient: this.apiClient,
       pluginId: this.manifest.id,
       currentVersion: this.manifest.version,
+      getInstallBlockers: () => this.getPluginUpdateInstallBlockers(),
       prepareForInstall: async () => {
-        await this.prepareForPluginUpdate();
+        return this.prepareForPluginUpdate();
       },
       onStateChange: () => {
         this.updatePluginUpdateUi();
@@ -352,8 +355,8 @@ export default class RolayPlugin extends Plugin {
     });
     this.updateRibbonEl = this.addRibbonIcon(
       "download",
-      "Rolay update",
-      () => this.openPluginUpdateDialog()
+      "Rolay update status",
+      () => this.showPluginUpdateStatus()
     );
     this.updateRibbonEl.classList.add("rolay-update-ribbon");
     this.updatePluginUpdateUi();
@@ -426,11 +429,13 @@ export default class RolayPlugin extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on("file-open", (file) => {
+        this.notePluginUpdateActivity();
         void this.handleFileOpen(file);
       })
     );
     this.registerEvent(
       this.app.workspace.on("editor-change", (editor, info) => {
+        this.notePluginUpdateActivity();
         if (info instanceof MarkdownView) {
           this.crdtManager.handleEditorChange(editor, info);
         }
@@ -444,6 +449,7 @@ export default class RolayPlugin extends Plugin {
       })
     );
     this.registerDomEvent(window, "online", () => {
+      this.pluginUpdater.notifyConnectivityRestored();
       this.scheduleLiveTransportRecovery("network-online");
     });
     if (Platform.isMobileApp) {
@@ -451,16 +457,19 @@ export default class RolayPlugin extends Plugin {
         this.handleMobileVisibilityChange();
       });
       this.registerDomEvent(window, "pageshow", () => {
+        this.pluginUpdater.notifyConnectivityRestored();
         this.scheduleLiveTransportRecovery("mobile-pageshow");
       });
     }
     this.ensureExplorerMutationObserver();
     this.registerDomEvent(this.app.workspace.containerEl, "click", (event) => {
+      this.notePluginUpdateActivity();
       if (this.isExplorerFolderInteractionTarget(event.target)) {
         this.refreshExplorerDecorationsAfterFolderToggle();
       }
     }, true);
     this.registerDomEvent(this.app.workspace.containerEl, "keydown", (event) => {
+      this.notePluginUpdateActivity();
       if (
         (event.key === "ArrowLeft" || event.key === "ArrowRight" || event.key === "Enter" || event.key === " ") &&
         this.isExplorerFolderInteractionTarget(event.target)
@@ -470,21 +479,25 @@ export default class RolayPlugin extends Plugin {
     }, true);
     this.registerEvent(
       this.app.vault.on("create", (file) => {
+        this.notePluginUpdateActivity();
         void this.handleVaultCreate(file);
       })
     );
     this.registerEvent(
       this.app.vault.on("rename", (file, oldPath) => {
+        this.notePluginUpdateActivity();
         void this.handleVaultRename(file, oldPath);
       })
     );
     this.registerEvent(
       this.app.vault.on("modify", (file) => {
+        this.notePluginUpdateActivity();
         void this.handleVaultModify(file);
       })
     );
     this.registerEvent(
       this.app.vault.on("delete", (file) => {
+        this.notePluginUpdateActivity();
         void this.handleVaultDelete(file);
       })
     );
@@ -582,58 +595,20 @@ export default class RolayPlugin extends Plugin {
     return this.pluginUpdater.getState();
   }
 
-  hasPluginUpdateAvailable(): boolean {
-    return isPluginUpdateAvailable(this.pluginUpdater.getState());
-  }
-
-  async checkForPluginUpdate(showNotice = true): Promise<void> {
-    try {
-      const state = await this.pluginUpdater.checkForUpdates();
-      if (this.isUnloading || !showNotice) {
-        return;
-      }
-      if (isPluginUpdateAvailable(state)) {
-        new Notice(`Rolay ${state.latestVersion} is available.`);
-      } else {
-        new Notice(`Rolay ${state.currentVersion} is up to date.`);
-      }
-    } catch (error) {
-      if (this.isUnloading) {
-        return;
-      }
-      this.handleError("Rolay update check failed", error, showNotice);
+  private showPluginUpdateStatus(): void {
+    const state = this.pluginUpdater.getState();
+    if (state.status === "restart-required") {
+      new Notice(
+        `Rolay ${state.latestVersion ?? ""} is installed. Restart Obsidian to load it.`,
+        10_000
+      );
+      return;
     }
-  }
-
-  openPluginUpdateDialog(): void {
-    new PluginUpdateModal(this.app, {
-      getState: () => this.pluginUpdater.getState(),
-      startInstall: async () => {
-        await this.forcePluginUpdate();
-      }
-    }).open();
-  }
-
-  async forcePluginUpdate(): Promise<void> {
-    try {
-      new Notice("Downloading and verifying the Rolay update.");
-      const result = await this.pluginUpdater.installAvailableUpdate();
-      if (this.isUnloading) {
-        return;
-      }
-      if (result.restartRequired) {
-        new Notice(
-          `Rolay ${result.version} is installed. Restart Obsidian to apply it.`,
-          10_000
-        );
-      } else {
-        new Notice(`Rolay was updated to ${result.version}.`);
-      }
-    } catch (error) {
-      if (this.isUnloading) {
-        return;
-      }
-      this.handleError("Rolay update failed", error);
+    if (hasPersistentPluginUpdateError(state)) {
+      new Notice(
+        `Rolay update is retrying automatically. ${state.lastError ?? "The update service is unavailable."}`,
+        10_000
+      );
     }
   }
 
@@ -2050,12 +2025,18 @@ export default class RolayPlugin extends Plugin {
       );
       return;
     }
+    if (this.startupBootstrapInFlight) {
+      return;
+    }
 
+    this.startupBootstrapInFlight = true;
     try {
       await this.ensureAuthenticated(true, !reason.includes("startup"));
       await this.resumeDownloadedRooms(reason);
     } catch (error) {
       this.handleError("Startup sync failed", error, false);
+    } finally {
+      this.startupBootstrapInFlight = false;
     }
   }
 
@@ -2110,6 +2091,7 @@ export default class RolayPlugin extends Plugin {
       ? null
       : Math.max(0, Date.now() - this.mobileHiddenAt);
     this.mobileHiddenAt = null;
+    this.pluginUpdater.notifyConnectivityRestored();
     this.scheduleLiveTransportRecovery(
       hiddenDurationMs === null
         ? "mobile-visible"
@@ -5121,21 +5103,10 @@ export default class RolayPlugin extends Plugin {
     }
 
     const state = this.pluginUpdater.getState();
-    const updateAvailable = isPluginUpdateAvailable(state);
-    const visible =
-      updateAvailable ||
-      state.status === "downloading" ||
-      state.status === "installing" ||
-      state.status === "restart-required";
+    const persistentError = hasPersistentPluginUpdateError(state);
+    const visible = persistentError || state.status === "restart-required";
     this.updateRibbonEl.hidden = !visible;
-    this.updateRibbonEl.classList.toggle(
-      "is-busy",
-      state.status === "downloading" || state.status === "installing"
-    );
-    this.updateRibbonEl.classList.toggle(
-      "is-error",
-      state.status === "error" && updateAvailable
-    );
+    this.updateRibbonEl.classList.toggle("is-error", persistentError);
     this.updateRibbonEl.classList.toggle(
       "is-restart-required",
       state.status === "restart-required"
@@ -5147,36 +5118,110 @@ export default class RolayPlugin extends Plugin {
 
     const label = state.status === "restart-required"
       ? `Rolay ${state.latestVersion ?? ""} installed; restart Obsidian`
-      : state.status === "downloading" || state.status === "installing"
-        ? `Updating Rolay: ${state.progressPercent}%`
-        : state.status === "error"
-          ? `Rolay update failed; click to retry ${state.latestVersion ?? ""}`
-          : `Rolay ${state.latestVersion ?? ""} available; click to force update`;
+      : `Rolay update is retrying automatically: ${state.lastError ?? "temporary failure"}`;
     this.updateRibbonEl.setAttribute("aria-label", label.trim());
     this.updateRibbonEl.setAttribute("data-tooltip-position", "right");
     setIcon(
       this.updateRibbonEl,
       state.status === "restart-required"
         ? "refresh-cw"
-        : state.status === "downloading" || state.status === "installing"
-          ? "loader-circle"
-          : "download"
+        : "alert-triangle"
     );
   }
 
-  private async prepareForPluginUpdate(): Promise<void> {
-    let timeoutHandle: number | null = null;
-    const timeout = new Promise<void>((resolve) => {
-      timeoutHandle = window.setTimeout(resolve, 3_000);
-    });
-    await Promise.race([
-      this.operationsQueue.waitForIdle(),
-      timeout
-    ]);
-    if (timeoutHandle !== null) {
-      window.clearTimeout(timeoutHandle);
+  private notePluginUpdateActivity(): void {
+    this.lastPluginUpdateActivityAt = Date.now();
+  }
+
+  private getPluginUpdateInstallBlockers(): string[] {
+    const blockers: string[] = [];
+    if (this.isUnloading) {
+      blockers.push("plugin unload is in progress");
+    }
+    if (
+      Date.now() - this.lastPluginUpdateActivityAt <
+      RolayPlugin.PLUGIN_UPDATE_QUIET_WINDOW_MS
+    ) {
+      blockers.push("recent user or vault activity");
+    }
+    if (!this.operationsQueue.isIdle()) {
+      blockers.push("tree operations are pending");
+    }
+    if (
+      this.startupBootstrapHandle !== null ||
+      this.startupBootstrapInFlight ||
+      this.startupRoomResumeHandles.size > 0
+    ) {
+      blockers.push("startup sync is still settling");
+    }
+    if (this.lifecycleRecoveryHandle !== null || this.lifecycleRecoveryInFlight) {
+      blockers.push("transport recovery is in progress");
+    }
+
+    const hasActiveBinaryTransfer = [...this.binaryTransferState.values()].some(
+      (transfer) =>
+        transfer.status !== "done" &&
+        transfer.status !== "failed" &&
+        (
+          transfer.abortController !== null ||
+          this.binarySyncTokens.has(normalizePath(transfer.localPath))
+        )
+    );
+    if (
+      hasActiveBinaryTransfer ||
+      this.binarySyncTokens.size > 0 ||
+      this.pendingBinarySyncReruns.size > 0
+    ) {
+      blockers.push("binary transfers are active");
+    }
+    // Failed pending records are durable recovery state. Blocking on them would
+    // prevent an update from ever delivering the fix that may unblock replay.
+    if (
+      Object.values(this.data.pendingBinaryWrites).some(
+        (pendingWrite) => pendingWrite.lastError === null
+      )
+    ) {
+      blockers.push("binary writes are pending");
+    }
+    if (
+      Object.values(this.data.pendingMarkdownMerges).some(
+        (pendingMerge) => pendingMerge.lastError === null
+      )
+    ) {
+      blockers.push("markdown changes are pending");
+    }
+
+    for (const runtime of this.roomRuntime.values()) {
+      if (
+        runtime.snapshotRefreshHandle !== null ||
+        runtime.snapshotRefreshInFlight ||
+        runtime.backgroundMarkdownRefreshInFlight
+      ) {
+        blockers.push("room reconciliation is in progress");
+        break;
+      }
+    }
+    if (
+      [...this.roomRuntime.values()].some(
+        (runtime) => runtime.markdownBootstrap.status === "loading"
+      )
+    ) {
+      blockers.push("markdown preload is in progress");
+    }
+
+    return blockers;
+  }
+
+  private async prepareForPluginUpdate(): Promise<boolean> {
+    if (this.getPluginUpdateInstallBlockers().length > 0) {
+      return false;
+    }
+    await this.operationsQueue.waitForIdle();
+    if (this.getPluginUpdateInstallBlockers().length > 0) {
+      return false;
     }
     await this.persistNow();
+    return this.getPluginUpdateInstallBlockers().length === 0;
   }
 
   private async refreshOwnerRoomInvites(logActivity = true): Promise<void> {

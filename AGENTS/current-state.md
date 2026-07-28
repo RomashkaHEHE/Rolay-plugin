@@ -4,8 +4,8 @@ Last updated: 2026-07-28
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.18`
-- Release baseline: `1.2.18` primary-vault integrity and closed-note refresh fix
+- Plugin version: `1.2.19`
+- Release baseline: `1.2.19` autonomous verified self-update
 
 ## Current Priorities
 
@@ -50,6 +50,9 @@ These should be treated as high-confidence truths unless code/docs are intention
 - An HTTPS authority must not return insecure `ws:` CRDT or `http:` blob fallback targets; the client
   rejects them instead of downgrading.
 - Self-update may replace only `main.js`, `manifest.json`, and `styles.css` after complete size/hash/manifest verification. It must preserve `data.json`, logs, caches, room bindings, and vault content.
+- Self-update is autonomous: no refresh/check/install buttons. Discovery runs after startup, every
+  15 minutes, and after network recovery; install waits for a safe sync/editor idle window and
+  temporary failures retry with backoff. Only restart-required or persistent retry failure is shown.
 - Persistent `rolay-sync.log` is intentionally short-lived: entries older than 48 hours are removed, and noisy files are capped to a compact recent tail.
 - Startup sync is deferred until after Obsidian workspace layout is ready; downloaded rooms then resume with a small stagger so auth/snapshot/preload work does not block the plugin loading screen.
 - Room Disconnect is a hard per-room pause: it stops room SSE/presence, cancels scheduled snapshot/background markdown work, aborts active binary transfers for that workspace, invalidates in-flight upload tokens, and ignores late snapshot/bootstrap/download results without affecting other connected rooms.
@@ -131,11 +134,12 @@ Summary:
 
 - Rolay is moving from BRAT-managed updates to a server-authoritative self-updater.
 - The plugin must check without blocking startup or requiring authentication.
-- Stale clients get a persistent indicator and an explicit verified force-update action.
+- Updater-enabled clients discover, verify, wait for a safe idle window, and install without user
+  action. Normal update work stays invisible.
 - `1.2.17` is the final BRAT/manual bootstrap release that delivers the updater to existing
   installations.
-- Client/server code, release artifacts, and automated validation are complete; a live two-version
-  Obsidian update test remains.
+- The automatic client flow is implemented; `1.2.19` release validation and a later live
+  two-version Obsidian update test remain.
 
 Task file:
 
@@ -198,6 +202,8 @@ These are important because future regressions will often land in these areas:
 - Verified a primary-vault import path-by-path and byte-by-byte against production, then reduced
   no-op full-room Markdown polling from a tight five-second loop to a burst-coalesced one-minute
   fallback
+- Replaced manual self-update controls with silent automatic discovery, verified safe-idle install,
+  connectivity-aware retry/backoff, and exception-only restart/error UI
 
 ## First Places To Look By Task Type
 
