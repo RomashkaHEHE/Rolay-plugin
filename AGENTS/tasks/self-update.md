@@ -10,7 +10,8 @@ Let installed Rolay clients detect a newer plugin release without BRAT, show a p
 
 ## Current Understanding
 
-- Existing clients need one final BRAT/manual release containing the updater. Older code cannot discover a feature it does not have.
+- `1.2.17` is the final BRAT/manual bootstrap release containing the updater. Clients older than
+  that cannot discover a feature they do not have.
 - Update discovery must work before authentication.
 - The Rolay server is the update authority and proxies a strict allowlist of GitHub Release assets.
 - Only `main.js`, `manifest.json`, and `styles.css` may be replaced.
@@ -40,6 +41,8 @@ Let installed Rolay clients detect a newer plugin release without BRAT, show a p
 - 2026-07-28: `npm run check` and `npm run build` pass.
 - 2026-07-28: Deployed server update distribution in commit `978f311`; the public production
   endpoint successfully verifies and serves release `1.2.16`.
+- 2026-07-28: Published stable plain-semver release `1.2.17` from commit `2017faa`; workflow,
+  manifest, standalone BRAT assets, and archive contents were verified.
 
 ## Open Questions / Risks
 
@@ -49,7 +52,7 @@ Let installed Rolay clients detect a newer plugin release without BRAT, show a p
 
 ## Next Steps
 
-1. Publish `1.2.17` as the final BRAT-delivered updater-enabled bootstrap release.
+1. Install/update to `1.2.17` through BRAT on the existing desktop and Android clients.
 2. Publish a second test release and verify stale indicator, force update, soft reload, and restart fallback in Obsidian.
 3. Mark this task `DONE` after the live two-version test.
 

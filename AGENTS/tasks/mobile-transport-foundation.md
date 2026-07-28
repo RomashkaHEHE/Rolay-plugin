@@ -69,6 +69,8 @@ desktop and Android/mobile before healthy-state indicators are made quieter.
   plugin typecheck/build pass.
 - 2026-07-28: Deployed server commit `978f311`; live readiness, update discovery, allowed-origin
   response, preflight, and rejected-origin probes all passed.
+- 2026-07-28: Released plugin `1.2.17` from commit `2017faa`; GitHub Actions and all BRAT/runtime
+  release assets were verified.
 
 ## Open Questions / Risks
 
@@ -85,15 +87,14 @@ desktop and Android/mobile before healthy-state indicators are made quieter.
 
 ## Next Steps
 
-1. Publish updater-enabled HTTPS plugin release `1.2.17`.
-2. Run the diagnostic build on a real Android device and confirm the actual origin and
+1. Run release `1.2.17` on a real Android device and confirm the actual origin and
    `transport=fetch` SSE opens.
-3. Verify HTTPS routes for durable SSE, settings SSE, note-presence SSE, blob upload/download, and
+2. Verify HTTPS routes for durable SSE, settings SSE, note-presence SSE, blob upload/download, and
    CRDT token/WSS from Android.
-4. Exercise cold launch, offline launch, network switch, suspend/resume, process kill during partial
+3. Exercise cold launch, offline launch, network switch, suspend/resume, process kill during partial
    transfer, CRDT reconnect, disconnect isolation, and updater restart fallback on desktop and
    Android.
-5. Keep raw `3000/tcp` ingress available until older plugin builds have updated; close it only after
+4. Keep raw `3000/tcp` ingress available until older plugin builds have updated; close it only after
    rollout verification.
 
 ## Exit Criteria

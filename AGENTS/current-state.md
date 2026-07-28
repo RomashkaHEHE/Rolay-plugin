@@ -62,7 +62,7 @@ These should be treated as high-confidence truths unless code/docs are intention
 
 ## Current Reliability And Experience Initiative
 
-Status: `IMPLEMENTING / DEVICE VERIFICATION`
+Status: `DEVICE VERIFICATION`
 
 Product intent:
 
@@ -113,7 +113,7 @@ Summary:
 - The first reliability/experience slice is a verified HTTPS/WSS and mobile lifecycle foundation.
 - HTTPS authority migration, server CORS, reconnect lifecycle, and diagnostics are implemented and
   pass automated checks.
-- Plugin `1.2.17` release and real Android SSE/blob/CRDT/updater verification remain.
+- Plugin `1.2.17` is released; real Android SSE/blob/CRDT/updater verification remains.
 - Do not make the healthy-state UI quieter until its underlying mobile health signals are trustworthy.
 
 Task file:
@@ -129,9 +129,10 @@ Summary:
 - Rolay is moving from BRAT-managed updates to a server-authoritative self-updater.
 - The plugin must check without blocking startup or requiring authentication.
 - Stale clients get a persistent indicator and an explicit verified force-update action.
-- One final BRAT/manual release is still required to deliver the updater to existing installations.
-- Client/server code and automated validation are complete; the updater-enabled `1.2.17` release and
-  a live two-version Obsidian test remain.
+- `1.2.17` is the final BRAT/manual bootstrap release that delivers the updater to existing
+  installations.
+- Client/server code, release artifacts, and automated validation are complete; a live two-version
+  Obsidian update test remains.
 
 Task file:
 

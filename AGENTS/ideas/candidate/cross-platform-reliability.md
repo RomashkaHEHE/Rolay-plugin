@@ -32,8 +32,8 @@ transport/lifecycle matrix instead of assuming desktop behavior transfers to mob
 - The updater uses `DataAdapter`, but soft reload uses internal Obsidian plugin APIs and needs mobile
   verification.
 
-The server side is now a production fact; the HTTPS/mobile plugin client still needs release and
-real-device verification.
+The server side and HTTPS/mobile plugin release `1.2.17` are now production facts; real-device
+verification remains.
 
 Initial live probe on 2026-07-28:
 
@@ -116,7 +116,6 @@ Document and test each row on desktop and Android/mobile:
 
 ## First Implementation Slice
 
-1. Release the HTTPS/mobile client through the final BRAT bootstrap release.
-2. Capture the real Android origin and transport identity from diagnostics.
-3. Verify SSE, blob transfer/resume, WSS, and update behavior on the device.
-4. Run cold launch, suspend/resume, reconnect, transfer-abort, and CRDT checks on desktop and Android.
+1. Capture the real Android origin and transport identity from release `1.2.17` diagnostics.
+2. Verify SSE, blob transfer/resume, WSS, and update behavior on the device.
+3. Run cold launch, suspend/resume, reconnect, transfer-abort, and CRDT checks on desktop and Android.
