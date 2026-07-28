@@ -775,6 +775,7 @@ export class RolayApiClient {
     body: unknown,
     accessToken?: string
   ): Promise<RequestUrlResponse> {
+    const requestBody = normalizeJsonRequestBody(method, body);
     const headers: Record<string, string> = {
       Accept: "application/json",
       ...this.getClientHeaders()
@@ -788,8 +789,8 @@ export class RolayApiClient {
       url: this.buildUrl(path),
       method,
       headers,
-      contentType: body === undefined ? undefined : "application/json",
-      body: body === undefined ? undefined : JSON.stringify(body),
+      contentType: requestBody === undefined ? undefined : "application/json",
+      body: requestBody === undefined ? undefined : JSON.stringify(requestBody),
       throw: false
     });
   }
@@ -1144,6 +1145,22 @@ export class RolayApiClient {
       response.headers.get("X-Rolay-Request-Id"),
       "fetch"
     );
+  }
+}
+
+function normalizeJsonRequestBody(method: string, body: unknown): unknown {
+  if (body !== undefined) {
+    return body;
+  }
+
+  switch (method.toUpperCase()) {
+    case "POST":
+    case "PUT":
+    case "PATCH":
+    case "DELETE":
+      return {};
+    default:
+      return undefined;
   }
 }
 

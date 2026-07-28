@@ -71,6 +71,15 @@ desktop and Android/mobile before healthy-state indicators are made quieter.
   response, preflight, and rejected-origin probes all passed.
 - 2026-07-28: Released plugin `1.2.17` from commit `2017faa`; GitHub Actions and all BRAT/runtime
   release assets were verified.
+- 2026-07-28: First real Android room install reached production successfully for auth, tree,
+  Markdown bootstrap, update discovery, and SSE preflight. Production logs isolated the visible
+  server/CRDT errors to Obsidian Mobile wrapping requests without an explicit body as an unsupported
+  media type: `blob/download-ticket` and `crdt-token` were rejected before route logic.
+- 2026-07-28: The plugin now normalizes bodyless JSON mutations to an explicit `{}` body. Deployed
+  server commit `4fe1f0b` accepts the legacy `text/plain` wrapper for already-installed clients,
+  preserves genuine Fastify `4xx` statuses instead of converting them to `500`, and keeps
+  `text/plain` raw blob uploads byte-streamed. Plugin check/build and all 34 server integration
+  tests pass.
 
 ## Open Questions / Risks
 
@@ -82,15 +91,14 @@ desktop and Android/mobile before healthy-state indicators are made quieter.
 - How aggressively does Android suspend timers, sockets, and active transfers in the background?
 - Does mobile expose enough internal plugin-manager API for soft reload, or should restart be the
   normal updater outcome there?
-- The plugin and server worktrees already contain uncommitted self-update and documentation changes;
-  do not mix a release or broad refactor into the transport migration.
+- Server compatibility commit `4fe1f0b` is deployed and production probes pass. The matching plugin
+  fix is included in `1.2.20`.
 
 ## Next Steps
 
-1. Run release `1.2.17` on a real Android device and confirm the actual origin and
-   `transport=fetch` SSE opens.
-2. Verify HTTPS routes for durable SSE, settings SSE, note-presence SSE, blob upload/download, and
-   CRDT token/WSS from Android.
+1. Release plugin `1.2.20`.
+2. Repeat the same Android room install and verify `crdt-token`, WSS, download tickets, and actual
+   XHR/fetch byte downloads complete without retries.
 3. Exercise cold launch, offline launch, network switch, suspend/resume, process kill during partial
    transfer, CRDT reconnect, disconnect isolation, and updater restart fallback on desktop and
    Android.

@@ -158,6 +158,13 @@ export class PluginUpdater {
     return { ...this.state };
   }
 
+  checkNow(): void {
+    if (!this.started || this.stopped || this.state.status === "restart-required") {
+      return;
+    }
+    this.scheduleCheck(0);
+  }
+
   notifyConnectivityRestored(): void {
     if (!this.started || this.stopped || this.state.status === "restart-required") {
       return;

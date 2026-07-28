@@ -6,8 +6,8 @@ Last updated: 2026-07-28
 
 ## Goal
 
-Let installed Rolay clients discover, verify, and install newer releases without BRAT or any manual
-refresh/check/install action.
+Let installed Rolay clients discover, verify, and install newer releases without BRAT or requiring
+any manual refresh/check/install action.
 
 ## Current Understanding
 
@@ -47,9 +47,12 @@ refresh/check/install action.
 - 2026-07-28: Replaced the explicit force-update flow with automatic discovery every 15 minutes,
   automatic verified install in a safe idle window, connectivity-triggered checks, and bounded
   retry backoff.
-- 2026-07-28: Removed the update modal and all refresh/check/install buttons. Healthy checks,
-  downloads, waiting, and installation stay hidden; settings/ribbon surface only persistent errors
-  and restart-required state.
+- 2026-07-28: Removed the update modal and the old force-install flow. Healthy checks, downloads,
+  waiting, and installation stay hidden; settings/ribbon surface only persistent errors and
+  restart-required state.
+- 2026-07-28: Added a compact optional check-now icon to `General -> Plugin Version` for release
+  testing. It only schedules the existing automatic check immediately; verification, safe-idle
+  waiting, install, retries, and reload behavior remain identical to background discovery.
 - 2026-07-28: Added an explicit safe-install gate for active operation queue work, binary transport,
   startup/recovery, room snapshot/background reconciliation, Markdown preload, and recent
   editor/vault activity. Failed pending records remain durable across reload and do not permanently
@@ -68,6 +71,9 @@ refresh/check/install action.
   `30353663231` passed; all five release assets, the zip contents, tag blobs, production proxy bytes,
   sizes, and canonical SHA-256 values were verified. `https://rolay.ru/v1/plugin-updates/latest`
   now reports `1.2.19`.
+- 2026-07-28: Prepared `1.2.20` with the optional same-pipeline check-now diagnostic and Android
+  bodyless-request normalization. This release is the first intended live test of autonomous
+  `1.2.19 -> 1.2.20` installation.
 
 ## Open Questions / Risks
 
@@ -80,8 +86,8 @@ refresh/check/install action.
 
 1. Move existing `1.2.17`/`1.2.18` clients to `1.2.19` once through their existing explicit updater
    or BRAT.
-2. Publish `1.2.20` (or a later test release) and verify automatic discovery, safe-idle waiting, download,
-   installation, retry, soft reload, and restart fallback in Obsidian.
+2. Verify automatic `1.2.19 -> 1.2.20` discovery, safe-idle waiting, download, installation, retry,
+   soft reload, and restart fallback in Obsidian.
 3. Mark this task `DONE` after the live two-version test.
 
 ## Exit Criteria

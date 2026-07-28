@@ -131,8 +131,10 @@ Updater-enabled builds check shortly after startup, every 15 minutes, and immedi
 connectivity returns. A newer release is downloaded, verified, and installed automatically after
 active tree operations, transfers, Markdown preload, and room reconciliation reach a safe idle
 window. Rolay preserves all local plugin data and attempts a soft plugin reload. There are no
-manual refresh/check/install actions. Healthy update work stays hidden; the ribbon/settings UI is
-shown only when Obsidian must be restarted or repeated automatic retries keep failing.
+required refresh/check/install actions. Healthy update work stays hidden; the ribbon/settings UI is
+shown only when Obsidian must be restarted or repeated automatic retries keep failing. For release
+testing and diagnostics, `General -> Plugin Version` has an optional refresh icon that starts the
+same automatic check immediately; it does not bypass verification or force installation.
 
 Notes:
 
@@ -197,6 +199,8 @@ Tag note:
 - On Android/mobile, REST uses Obsidian `requestUrl`, SSE uses browser streaming `fetch`, binary
   transfer uses XHR/fetch, and Markdown realtime uses WSS. The server exposes a narrow CORS
   allowlist for Obsidian app origins and the exact auth/range/client headers those transports need.
+- JSON API mutations without fields still send an explicit `{}` body. This avoids Obsidian Mobile
+  wrapping bodyless `requestUrl` requests as unsupported plain text.
 - Mobile uses smaller Markdown bootstrap batches, `1 MiB` upload chunks, and one concurrent binary
   download to reduce memory/network pressure without changing convergence order.
 - When the mobile app moves to the background, the active CRDT session clears its viewer presence

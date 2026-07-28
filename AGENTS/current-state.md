@@ -4,8 +4,8 @@ Last updated: 2026-07-28
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.19`
-- Release baseline: `1.2.19` autonomous verified self-update
+- Plugin version: `1.2.20`
+- Release baseline: `1.2.20` mobile request compatibility and optional immediate update check
 
 ## Current Priorities
 
@@ -50,9 +50,11 @@ These should be treated as high-confidence truths unless code/docs are intention
 - An HTTPS authority must not return insecure `ws:` CRDT or `http:` blob fallback targets; the client
   rejects them instead of downgrading.
 - Self-update may replace only `main.js`, `manifest.json`, and `styles.css` after complete size/hash/manifest verification. It must preserve `data.json`, logs, caches, room bindings, and vault content.
-- Self-update is autonomous: no refresh/check/install buttons. Discovery runs after startup, every
+- Self-update is autonomous: no update action is required. Discovery runs after startup, every
   15 minutes, and after network recovery; install waits for a safe sync/editor idle window and
-  temporary failures retry with backoff. Only restart-required or persistent retry failure is shown.
+  temporary failures retry with backoff. `General -> Plugin Version` may expose an optional
+  check-now diagnostic for release testing, but it must use the same verified pipeline and never
+  become a force-install bypass. Only restart-required or persistent retry failure is shown.
 - Persistent `rolay-sync.log` is intentionally short-lived: entries older than 48 hours are removed, and noisy files are capped to a compact recent tail.
 - Startup sync is deferred until after Obsidian workspace layout is ready; downloaded rooms then resume with a small stagger so auth/snapshot/preload work does not block the plugin loading screen.
 - Room Disconnect is a hard per-room pause: it stops room SSE/presence, cancels scheduled snapshot/background markdown work, aborts active binary transfers for that workspace, invalidates in-flight upload tokens, and ignores late snapshot/bootstrap/download results without affecting other connected rooms.
@@ -87,19 +89,24 @@ Implemented in the current worktrees:
 - mobile background CRDT presence cleanup and active-note rebind
 - lower mobile batch/chunk/download concurrency
 - updated WebSocket dependencies with zero remaining plugin `npm audit` findings
+- explicit `{}` JSON bodies for bodyless API mutations so Android `requestUrl` cannot turn CRDT
+  token and blob download-ticket requests into unsupported plain-text requests
 
 Remaining risks before claiming mobile parity:
 
 - mobile lacks the preferred Electron/Node SSE and blob transports
 - SSE therefore uses browser streaming fetch, and blob transfer uses XHR/fetch fallbacks
 - actual Android origin, browser streaming behavior, CRDT WSS, app suspend/resume, network switching,
-  interrupted transfers, and updater reload still need real-device verification
+  interrupted transfers, and updater reload still need complete real-device verification
 
 Production rollout `978f311` on 2026-07-28 confirmed that `https://rolay.ru/v1/auth/me` reaches the
 authenticated API (`401` without credentials), `app://obsidian.md` receives the required CORS and
 preflight headers, unknown origins receive no CORS permission, and
 `https://rolay.ru/v1/plugin-updates/latest` serves the verified current release. SSE/blob/WSS
-behavior on a real mobile client remains unverified.
+behavior on a real mobile client remains partially verified. The first Android install of room
+`main` reached tree/SSE/bootstrap successfully, but exposed bodyless request failures before CRDT
+WSS and blob byte download could start. Compatible client/server fixes pass locally and await
+rollout.
 
 This is captured in:
 
@@ -119,7 +126,9 @@ Summary:
 - The first reliability/experience slice is a verified HTTPS/WSS and mobile lifecycle foundation.
 - HTTPS authority migration, server CORS, reconnect lifecycle, and diagnostics are implemented and
   pass automated checks.
-- Plugin `1.2.19` is released; real Android SSE/blob/CRDT/updater verification remains.
+- Server mobile request compatibility is deployed in commit `4fe1f0b`; plugin `1.2.20` carries the
+  matching explicit-JSON client fix. Android SSE/blob/CRDT/updater verification remains incomplete
+  until the release is exercised on the phone.
 - Do not make the healthy-state UI quieter until its underlying mobile health signals are trustworthy.
 
 Task file:

@@ -8941,6 +8941,7 @@ var RolayApiClient = class {
     return response;
   }
   async performRequest(method, path, body, accessToken) {
+    const requestBody = normalizeJsonRequestBody(method, body);
     const headers = {
       Accept: "application/json",
       ...this.getClientHeaders()
@@ -8952,8 +8953,8 @@ var RolayApiClient = class {
       url: this.buildUrl(path),
       method,
       headers,
-      contentType: body === void 0 ? void 0 : "application/json",
-      body: body === void 0 ? void 0 : JSON.stringify(body),
+      contentType: requestBody === void 0 ? void 0 : "application/json",
+      body: requestBody === void 0 ? void 0 : JSON.stringify(requestBody),
       throw: false
     });
   }
@@ -9236,6 +9237,20 @@ var RolayApiClient = class {
     );
   }
 };
+function normalizeJsonRequestBody(method, body) {
+  if (body !== void 0) {
+    return body;
+  }
+  switch (method.toUpperCase()) {
+    case "POST":
+    case "PUT":
+    case "PATCH":
+    case "DELETE":
+      return {};
+    default:
+      return void 0;
+  }
+}
 function xhrBinaryRequest(options) {
   return new Promise((resolve, reject) => {
     const request = new XMLHttpRequest();
@@ -14893,6 +14908,12 @@ var PluginUpdater = class {
   getState() {
     return { ...this.state };
   }
+  checkNow() {
+    if (!this.started || this.stopped || this.state.status === "restart-required") {
+      return;
+    }
+    this.scheduleCheck(0);
+  }
   notifyConnectivityRestored() {
     if (!this.started || this.stopped || this.state.status === "restart-required") {
       return;
@@ -15796,6 +15817,20 @@ var RolaySettingTab = class extends import_obsidian9.PluginSettingTab {
       ["Latest", state.latestVersion ?? "not checked"],
       ["Status", statusLabel]
     ]);
+    const actions = this.createActionRow(card.body);
+    const checkButton = actions.createEl("button", {
+      cls: "rolay-settings-icon-button",
+      attr: {
+        type: "button",
+        "aria-label": "Check for plugin updates now",
+        title: "Check for updates now"
+      }
+    });
+    (0, import_obsidian9.setIcon)(checkButton, "refresh-cw");
+    checkButton.disabled = state.status === "checking" || state.status === "downloading" || state.status === "installing" || state.status === "restart-required";
+    checkButton.addEventListener("click", () => {
+      this.rolay.checkForPluginUpdateNow();
+    });
   }
   renderRoomsView(containerEl, currentUser, rooms) {
     const topGrid = this.createGrid(containerEl);
@@ -18260,6 +18295,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
   }
   getPluginUpdateState() {
     return this.pluginUpdater.getState();
+  }
+  checkForPluginUpdateNow() {
+    this.pluginUpdater.checkNow();
   }
   showPluginUpdateStatus() {
     const state = this.pluginUpdater.getState();

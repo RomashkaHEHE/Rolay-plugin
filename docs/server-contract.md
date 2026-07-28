@@ -86,8 +86,9 @@ The plugin must reject the update before replacing anything if:
 `data.json`, logs, caches, transfer parts, and room bindings are never update assets.
 
 The client checks this API shortly after startup, every 15 minutes, and after connectivity returns.
-Temporary discovery/download/install failures use automatic backoff. The client exposes no manual
-check or install action. Before replacing runtime files and attempting a soft reload, it waits for
+Temporary discovery/download/install failures use automatic backoff. No manual action is required.
+An optional settings diagnostic can request the same check immediately, but there is no separate
+force-install path. Before replacing runtime files and attempting a soft reload, it waits for
 active tree operations, binary transfers, Markdown preload, snapshot reconciliation, and recent
 vault/editor activity to settle, then persists plugin state. Only persistent retry failure or a
 required Obsidian restart becomes visible to the user.
@@ -290,6 +291,11 @@ The response provides:
 - `expiresAt`
 
 The websocket transport is standard Yjs-compatible transport, not a custom binary protocol. The plugin first fills local CRDT cache via `/markdown/bootstrap`, then still uses `crdt-token` for live collaborative editing.
+
+For JSON API methods that have no request fields, including `crdt-token` and
+`blob/download-ticket`, the plugin sends `{}` with `Content-Type: application/json`. This is
+intentional mobile compatibility: some Obsidian Mobile `requestUrl` implementations otherwise wrap
+a bodyless request as plain text.
 
 For server-side note presence aggregation, the plugin now also publishes a `viewer` awareness field:
 

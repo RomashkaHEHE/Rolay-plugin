@@ -433,6 +433,25 @@ export class RolaySettingTab extends PluginSettingTab {
       ["Latest", state.latestVersion ?? "not checked"],
       ["Status", statusLabel]
     ]);
+
+    const actions = this.createActionRow(card.body);
+    const checkButton = actions.createEl("button", {
+      cls: "rolay-settings-icon-button",
+      attr: {
+        type: "button",
+        "aria-label": "Check for plugin updates now",
+        title: "Check for updates now"
+      }
+    });
+    setIcon(checkButton, "refresh-cw");
+    checkButton.disabled =
+      state.status === "checking" ||
+      state.status === "downloading" ||
+      state.status === "installing" ||
+      state.status === "restart-required";
+    checkButton.addEventListener("click", () => {
+      this.rolay.checkForPluginUpdateNow();
+    });
   }
 
   private renderRoomsView(

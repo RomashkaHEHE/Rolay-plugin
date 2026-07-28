@@ -595,6 +595,10 @@ export default class RolayPlugin extends Plugin {
     return this.pluginUpdater.getState();
   }
 
+  checkForPluginUpdateNow(): void {
+    this.pluginUpdater.checkNow();
+  }
+
   private showPluginUpdateStatus(): void {
     const state = this.pluginUpdater.getState();
     if (state.status === "restart-required") {

@@ -56,6 +56,9 @@ Current expectation:
 - resuming restarts only rooms that were already active
 - a manually disconnected room remains stopped
 - browser SSE/blob failures should be checked against the server CORS allowlist and response headers
+- repeated `500` responses for both `crdt-token` and `blob/download-ticket` can indicate a stale
+  mobile client sending bodyless JSON requests as `text/plain`; current clients send `{}` as JSON
+  and the compatible server accepts the legacy wrapper
 
 ### Cursor jitters when text is inserted before it
 
