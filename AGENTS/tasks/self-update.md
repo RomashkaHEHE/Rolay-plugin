@@ -71,9 +71,15 @@ any manual refresh/check/install action.
   `30353663231` passed; all five release assets, the zip contents, tag blobs, production proxy bytes,
   sizes, and canonical SHA-256 values were verified. `https://rolay.ru/v1/plugin-updates/latest`
   now reports `1.2.19`.
-- 2026-07-28: Prepared `1.2.20` with the optional same-pipeline check-now diagnostic and Android
-  bodyless-request normalization. This release is the first intended live test of autonomous
-  `1.2.19 -> 1.2.20` installation.
+- 2026-07-28: Published plain-semver release `1.2.20` from commit `48418f7`. GitHub Actions run
+  `30381604566` passed. The five release assets and four-file archive match the tag; the production
+  endpoint reports `1.2.20` and serves exact bytes for all three updater files.
+- 2026-07-28: Canonical release SHA-256 values are
+  `0cdf9aa7b8f5fd91e50d86d70508145331a1a398d0284ca7a3351b76acc42483` (`main.js`),
+  `0dbaea63b5567a68a979f8ddb3a93522b17631cebd8f9a98a1d895b334ca9301`
+  (`manifest.json`), and
+  `2e2bc5dc2ca433f2e7951d267f5fefbbf3ddb068cf563858d4ec32912215db22`
+  (`styles.css`).
 
 ## Open Questions / Risks
 

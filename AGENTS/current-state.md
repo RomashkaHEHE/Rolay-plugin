@@ -105,8 +105,10 @@ preflight headers, unknown origins receive no CORS permission, and
 `https://rolay.ru/v1/plugin-updates/latest` serves the verified current release. SSE/blob/WSS
 behavior on a real mobile client remains partially verified. The first Android install of room
 `main` reached tree/SSE/bootstrap successfully, but exposed bodyless request failures before CRDT
-WSS and blob byte download could start. Compatible client/server fixes pass locally and await
-rollout.
+WSS and blob byte download could start. Server compatibility commit `4fe1f0b` is deployed, plugin
+release `1.2.20` is published from commit `48418f7`, and authenticated production probes now return
+valid CRDT and blob download tickets. A repeat Android install is still required to verify the
+device-side WSS and byte-transfer paths end to end.
 
 This is captured in:
 
@@ -147,8 +149,8 @@ Summary:
   action. Normal update work stays invisible.
 - `1.2.17` first delivered update discovery. Transitional `1.2.17`/`1.2.18` clients still need one
   explicit update to `1.2.19`; old running code cannot retroactively install automatically.
-- Automatic client release `1.2.19`, GitHub assets/archive, and the production server proxy are
-  byte-verified. A later live `1.2.19 -> 1.2.20` Obsidian update test remains.
+- Automatic client release `1.2.20`, GitHub assets/archive, and the production server proxy are
+  byte-verified. The live `1.2.19 -> 1.2.20` Obsidian update and reload test remains.
 
 Task file:
 
@@ -213,6 +215,8 @@ These are important because future regressions will often land in these areas:
   fallback
 - Replaced manual self-update controls with silent automatic discovery, verified safe-idle install,
   connectivity-aware retry/backoff, and exception-only restart/error UI
+- Released `1.2.20` with Android bodyless-request compatibility and the optional same-pipeline
+  check-now diagnostic; GitHub release assets and production update-proxy bytes were verified
 
 ## First Places To Look By Task Type
 

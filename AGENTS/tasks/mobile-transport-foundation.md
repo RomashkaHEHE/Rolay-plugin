@@ -80,6 +80,12 @@ desktop and Android/mobile before healthy-state indicators are made quieter.
   preserves genuine Fastify `4xx` statuses instead of converting them to `500`, and keeps
   `text/plain` raw blob uploads byte-streamed. Plugin check/build and all 34 server integration
   tests pass.
+- 2026-07-28: Production authenticated probes against real room `main` entries returned `200` for
+  both the legacy-wrapped CRDT-token and blob download-ticket requests; CRDT advertised secure
+  `wss://rolay.ru/v1/crdt`, and no new parser failures or `500` responses appeared.
+- 2026-07-28: Released plugin `1.2.20` from commit `48418f7`. GitHub Actions run `30381604566`
+  passed, all release files and archive contents match the tag, and the production update proxy
+  serves byte-verified `1.2.20`.
 
 ## Open Questions / Risks
 
@@ -91,18 +97,17 @@ desktop and Android/mobile before healthy-state indicators are made quieter.
 - How aggressively does Android suspend timers, sockets, and active transfers in the background?
 - Does mobile expose enough internal plugin-manager API for soft reload, or should restart be the
   normal updater outcome there?
-- Server compatibility commit `4fe1f0b` is deployed and production probes pass. The matching plugin
-  fix is included in `1.2.20`.
+- The server/client compatibility path passes direct production probes, but an actual Android room
+  install must still verify the device's WSS and XHR/fetch transfer behavior.
 
 ## Next Steps
 
-1. Release plugin `1.2.20`.
-2. Repeat the same Android room install and verify `crdt-token`, WSS, download tickets, and actual
+1. Repeat the same Android room install and verify `crdt-token`, WSS, download tickets, and actual
    XHR/fetch byte downloads complete without retries.
-3. Exercise cold launch, offline launch, network switch, suspend/resume, process kill during partial
+2. Exercise cold launch, offline launch, network switch, suspend/resume, process kill during partial
    transfer, CRDT reconnect, disconnect isolation, and updater restart fallback on desktop and
    Android.
-4. Keep raw `3000/tcp` ingress available until older plugin builds have updated; close it only after
+3. Keep raw `3000/tcp` ingress available until older plugin builds have updated; close it only after
    rollout verification.
 
 ## Exit Criteria
