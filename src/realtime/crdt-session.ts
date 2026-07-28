@@ -100,6 +100,12 @@ export class CrdtSessionManager {
     });
   }
 
+  async reconnectActiveSession(reason: string): Promise<void> {
+    return this.runSessionOperation(async () => {
+      await this.activeSession?.reconnectTransport(reason);
+    });
+  }
+
   async disconnect(): Promise<void> {
     return this.runSessionOperation(async () => {
       this.detachActiveSession();
@@ -528,6 +534,21 @@ class BoundCrdtSession {
     this.provider?.disconnect();
     this.status = "offline";
     this.log(`CRDT session moved offline for ${this.file.path}.`);
+  }
+
+  async reconnectTransport(reason: string): Promise<void> {
+    if (!this.provider || this.status === "offline") {
+      return;
+    }
+
+    this.log(`Reconnecting CRDT transport for ${this.file.path} after ${reason}.`);
+    if (this.status !== "synced") {
+      this.status = "connecting";
+    }
+    await this.provider.connect();
+    this.publishLocalUserPresence();
+    this.publishLocalViewerPresence();
+    this.syncEditorContext();
   }
 
   updateLocalPresence(editor: Editor, focused: boolean): void {

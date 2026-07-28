@@ -1,52 +1,52 @@
-# Rolay Plugin Roadmap Notes
+# Rolay Future Work Navigation
 
-This file is intentionally short and practical. It tracks the next non-trivial improvements that matter for correctness and product maturity.
+Stable runtime behavior belongs in `README.md` and the other files under `docs/`. Volatile product
+priority, user feedback, and branch/task handoff state live under `AGENTS/` so this document does not
+silently compete with the active backlog.
 
-## Current Priority
+## Live Backlog
 
-### 1. Multi-Pane Note Presence
+- [AGENTS idea index](../AGENTS/ideas/index.md)
+  Prioritized candidate, needs-discovery, and rejected/deferred ideas.
+- [Current state](../AGENTS/current-state.md)
+  Active implementation tasks and recent regression-sensitive work.
 
-Current state:
+The current product direction is general-purpose, low-friction synchronization:
 
-- note presence works for the active markdown note in a client/window
-- invisible tabs do not count as viewers, which is correct
+- healthy solo sync should be almost invisible
+- expected retries, preload, reconnects, and updates should be automatic
+- collaboration and progress should appear contextually when useful
+- Android/mobile parity must be verified explicitly
 
-Known limit:
+The rationale and implementation ordering live in:
 
-- two simultaneously visible panes in one Obsidian window do not yet publish two independent viewer presences
+- [Ambient sync experience](../AGENTS/context/ambient-sync-experience.md)
+- [Cross-platform reliability](../AGENTS/ideas/candidate/cross-platform-reliability.md)
+- [Ambient sync indicators](../AGENTS/ideas/candidate/ambient-sync-indicators.md)
 
-## Recently Completed
+Multi-pane note presence and Conflict Center remain intentionally deferred. They are not current
+implementation priorities.
 
-### Resumable Binary Upload/Download And Crash Recovery
+## Implemented Foundations
 
-- active binary transfers are persisted in plugin data
-- uploads resume from `upload-ticket.uploadedBytes`
-- downloads resume from `.part` files plus ranged `GET /blob/content`
-- final binary materialization happens only after full size/hash verification
+- Binary upload/download is byte-resumable across retries and restarts.
+- Uploads continue from `upload-ticket.uploadedBytes`.
+- Downloads continue from `.part` files plus ranged `GET /blob/content`.
+- Final binary materialization happens only after complete size/hash verification.
+- The working client uses HTTPS/WSS, has mobile-specific network limits, and restarts active live
+  transports after Android resume/network recovery.
+- The working server has a narrow Obsidian-origin CORS policy for browser SSE/blob fallbacks.
 
-## Next Candidates
+## Durable Technical Debt
 
-### 2. Hardening Session Storage
+These are known directions, not approved implementation tasks:
 
-Current state:
+- session credentials still live in plugin data; secure storage needs platform and migration design
+- HTTPS browser-fallback SSE/blob paths and lifecycle recovery still need a real Android device audit
+- large-room scheduling needs more selective preload and active-work prioritization
+- ordinary transfer/reconnect failures should gain conservative automatic stuck-work recovery
+- temporary blob transfer tracing should eventually be gated or reduced once transport stability is
+  established
 
-- session credentials still live in plugin data for MVP speed
-
-Desired direction:
-
-- move secrets to OS-level secure storage or another safer desktop-backed store
-
-### 3. Large-Room Scaling
-
-Potential work:
-
-- smarter background scheduling for heavy binary rooms
-- more selective preload policies
-- better prioritization between active note work and bulk room hydration
-
-### 4. Conflict Center
-
-Potential work:
-
-- explicit surfacing of saved conflict copies
-- clearer recovery/compare tools when local and remote binary revisions diverge
+Before implementing any item, check `AGENTS/ideas/*` and create/update an `AGENTS/tasks/*` handoff
+file according to [the task protocol](../AGENTS/task-protocol.md).

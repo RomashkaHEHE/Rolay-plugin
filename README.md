@@ -4,7 +4,7 @@ Obsidian plugin for connecting a vault to a Rolay server with room-aware auth, m
 
 The current MVP is built against the live Rolay `v1` contract and now follows the newer room model:
 
-- fixed Rolay server URL (`http://46.16.36.87:3000`)
+- fixed HTTPS Rolay server URL (`https://rolay.ru`)
 - configurable `syncRoot`
 - username/password login plus refresh-token recovery
 - current-user bootstrap via `GET /v1/auth/me`
@@ -22,6 +22,7 @@ The current MVP is built against the live Rolay `v1` contract and now follows th
 - separate in-settings admin tab that appears only for logged-in admins
 - settings/admin live updates through `GET /v1/events/settings`
 - room-level markdown note presence through `GET /v1/workspaces/{workspaceId}/note-presence/events`
+- public plugin update discovery through `GET /v1/plugin-updates/latest`
 - CRDT bootstrap for markdown files through `crdt-token` and Yjs/Hocuspocus
 - room-level markdown bootstrap through `POST /v1/workspaces/{workspaceId}/markdown/bootstrap`
 - binary/blob sync for every non-markdown file through upload/download tickets and `commit_blob_revision`
@@ -40,6 +41,7 @@ The plugin treats Rolay as a layered sync system:
 - Room-level note presence for markdown viewer chips, anonymous public-site viewer indicators, and explorer badges uses `GET /v1/workspaces/{workspaceId}/note-presence/events`
 - Password change lives under `PATCH /v1/auth/me/password` and rotates the active session
 - Room publication lives under `GET/PATCH /v1/rooms/{workspaceId}/publication`
+- Plugin update discovery and verified release files live under public read-only `/v1/plugin-updates/...` routes
 
 Important product rules reflected in the plugin:
 
@@ -82,7 +84,7 @@ Start here when entering the project without chat history:
 - [docs/debug-playbook.md](docs/debug-playbook.md)
   Fast triage guide for the most common sync failures and where to inspect them in code.
 - [docs/roadmap.md](docs/roadmap.md)
-  Short list of the next substantial product/architecture steps, including resumable file transfer work.
+  Navigation to durable technical debt and the live `AGENTS/ideas/*` backlog.
 
 ## Development
 
@@ -112,7 +114,8 @@ npm run dev
 
 ## Install And Update For The Group
 
-The easiest path for your academic group is `BRAT` plus GitHub Releases.
+BRAT remains useful for initial installation. Once an updater-enabled Rolay release is installed,
+the plugin checks the Rolay server itself and BRAT is no longer required for later updates.
 
 ### For End Users
 
@@ -122,14 +125,22 @@ The easiest path for your academic group is `BRAT` plus GitHub Releases.
 4. Use `Add Beta plugin`.
 5. Paste the URL of this repository.
 6. Confirm installation.
-7. Turn on BRAT auto-updates if you want new releases to arrive automatically.
+7. Install the latest Rolay release.
 
-After that, users usually only need BRAT to pull the next GitHub release. They do not need to manually copy `main.js`, `manifest.json`, or `styles.css`.
+Updater-enabled builds check shortly after startup and then hourly. When a newer version
+exists, Rolay shows a download indicator in the Obsidian ribbon and an update banner in settings.
+Clicking `Force update` downloads and verifies `main.js`, `manifest.json`, and `styles.css`, preserves
+all local plugin data, and attempts a soft plugin reload. If Obsidian cannot reload the plugin
+safely, Rolay asks for an Obsidian restart.
 
 Notes:
 
 - If the repository is public, users usually only need the repository URL.
 - If the repository is private, BRAT distribution becomes less convenient because every user needs access to that repository. For a small group, the simplest setup is usually a public repository that is just not advertised widely.
+- Builds older than the first self-updater release still need one final BRAT or manual update. Old code cannot discover an updater that it does not contain.
+- After that transition, users may remove BRAT if they do not use it for other plugins.
+- Executable update files and normal sync traffic use `https://rolay.ru`, but update discovery remains
+  a separate unauthenticated, read-only API surface.
 
 ### For Maintainers
 
@@ -151,7 +162,12 @@ The workflow then:
 - uploads `manifest.json`, `main.js`, `styles.css`, `versions.json`
 - uploads a release zip for convenience
 
-BRAT can consume the release assets directly, so this is enough for one-click updates inside the group.
+BRAT can consume the release assets directly. The Rolay server also reads the same stable GitHub
+Release, validates the three runtime files, and exposes their exact sizes and SHA-256 hashes to the
+self-updater.
+
+For the first self-updater rollout, deploy the server update API before publishing the
+updater-enabled plugin release.
 
 Tag note:
 
@@ -162,7 +178,7 @@ Tag note:
 
 - The plugin no longer stores a single `activeRoomId`.
 - The server URL, device label, and startup auto-connect behavior are fixed in the plugin instead of being user-configurable.
-- Each room can be bound to its own local folder name. The default is the room name, not `workspace.id`.
+- Each room can be bound to its own local folder name. The default is the room name, not `workspace.id`; an installed room can later rename/move its local folder without renaming the server room.
 - Installing a room is explicit. Until `Install` is pressed, no local folder is materialized for that room.
 - Install is rejected if the target room folder already exists in the vault.
 - Downloaded rooms sync in parallel: each downloaded room maintains its own snapshot cursor and SSE stream.
@@ -171,6 +187,15 @@ Tag note:
 - After each authoritative room snapshot, the plugin first fetches byte metadata for room markdown bootstrap and then downloads Yjs state in HTTP batches. This keeps offline-safe cache bootstrap separate from live websocket sync and gives the UI a more honest byte-based preload progress.
 - After each room connect/snapshot, the plugin preloads markdown content for the whole downloaded room in the background instead of waiting for each note to be opened one by one.
 - On Obsidian startup, auth recovery, room resume, snapshots, and preload are deferred until after the workspace layout is ready, then downloaded rooms resume with a small stagger. Manual Connect/Install still runs immediately.
+- On Android/mobile, REST uses Obsidian `requestUrl`, SSE uses browser streaming `fetch`, binary
+  transfer uses XHR/fetch, and Markdown realtime uses WSS. The server exposes a narrow CORS
+  allowlist for Obsidian app origins and the exact auth/range/client headers those transports need.
+- Mobile uses smaller Markdown bootstrap batches, `1 MiB` upload chunks, and one concurrent binary
+  download to reduce memory/network pressure without changing convergence order.
+- When the mobile app moves to the background, the active CRDT session clears its viewer presence
+  and moves offline. Returning to the app or receiving a network-online event immediately restarts
+  already-active SSE transports, refreshes their snapshots, and rebinds the active Markdown note.
+  Rooms manually set to Disconnect remain stopped.
 - Disconnect is a hard per-room pause: active transfers, scheduled snapshots, background markdown refresh, and late snapshot/bootstrap/download results for that room are stopped/ignored without affecting other connected rooms.
 - Non-markdown files now follow a separate blob flow: initial room snapshot materializes their paths, then the plugin downloads actual bytes through blob download tickets and keeps them updated from authoritative room snapshots/events.
 - Markdown files that are still waiting for safe preload are temporarily protected from local move/rename/delete, and the Files pane marks those notes and their parent folders in red until the room has finished loading them safely.
@@ -181,7 +206,7 @@ Tag note:
 - If a locally created offline markdown note collides with a server path on reconnect, the plugin keeps both by renaming the local file to the next free name such as `file(1).md` before retrying the create.
 - When a markdown file with existing local text is created or moved into a room, the plugin now turns that text into a reusable Yjs update, persists it locally, and retries CRDT merge until the remote document has absorbed it. This avoids the old "empty file first, content only after reopen" race.
 - Non-markdown local creates and modifications now upload through `create_binary_placeholder -> upload-ticket -> PUT /v1/files/{entryId}/blob/uploads/{uploadId}/content -> commit_blob_revision`, with byte-based room progress and cancel support. Blob hashes are normalized to canonical `sha256:<base64>`, while legacy hex hashes are still accepted on read. The legacy raw `upload.url` is kept only as a fallback, not the main path.
-- Current binary crash recovery is replay-based, not yet true byte-offset resume: after restart the plugin can retry pending uploads/downloads from authoritative state, but resumable transfer sessions are future work and tracked in [docs/roadmap.md](docs/roadmap.md).
+- Binary crash recovery is byte-resumable: uploads continue from `upload-ticket.uploadedBytes`, downloads continue from persisted `.part` files with HTTP `Range`, and the final vault file is materialized only after complete size/hash verification.
 - If a local binary file conflicts with an already existing remote path or with a newer incoming blob revision, the plugin renames the local file to the next free Explorer-style filename such as `file(1).pdf` so both copies survive.
 - Room note presence now drives viewer chips above notes and minimal-visible-parent explorer badges: a visible note gets its own badge, while hidden notes roll up only to the deepest visible collapsed folder inside the downloaded room root.
 - Remote markdown patches preserve the local viewport while applying incoming CRDT text, so active collaboration should not yank the local reader/editor to the bottom of the document.

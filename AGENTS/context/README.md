@@ -19,9 +19,10 @@ Use these files when you need to change the system without blindly preserving ev
 ## Read Order
 
 1. [product-and-priorities.md](product-and-priorities.md)
-2. [sync-and-safety.md](sync-and-safety.md)
-3. [collaboration-ux.md](collaboration-ux.md)
-4. [settings-and-release.md](settings-and-release.md)
+2. [ambient-sync-experience.md](ambient-sync-experience.md)
+3. [sync-and-safety.md](sync-and-safety.md)
+4. [collaboration-ux.md](collaboration-ux.md)
+5. [settings-and-release.md](settings-and-release.md)
 
 ## Rule Of Thumb
 

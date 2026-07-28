@@ -20,6 +20,7 @@ export class NotePresenceEventStream {
   private reconnectHandle: number | null = null;
   private workspaceId: string | null = null;
   private handlers: NotePresenceStreamHandlers | null = null;
+  private connectionGeneration = 0;
 
   constructor(apiClient: RolayApiClient, log: (message: string) => void) {
     this.apiClient = apiClient;
@@ -36,6 +37,7 @@ export class NotePresenceEventStream {
 
   stop(): void {
     this.stopped = true;
+    this.connectionGeneration += 1;
     this.workspaceId = null;
     this.handlers?.onStatusChange?.("stopped");
     this.abortController?.abort();
@@ -47,26 +49,54 @@ export class NotePresenceEventStream {
     }
   }
 
+  reconnectNow(reason: string): void {
+    if (this.stopped || !this.workspaceId || !this.handlers) {
+      return;
+    }
+
+    this.log(`Restarting note presence SSE after ${reason}.`);
+    this.abortController?.abort();
+    this.abortController = null;
+    if (this.reconnectHandle !== null) {
+      window.clearTimeout(this.reconnectHandle);
+      this.reconnectHandle = null;
+    }
+    this.reconnectAttempt = Math.max(1, this.reconnectAttempt);
+    this.handlers.onStatusChange?.("reconnecting");
+    void this.connect();
+  }
+
   private async connect(): Promise<void> {
     if (this.stopped || !this.workspaceId || !this.handlers) {
       return;
     }
 
+    const generation = this.connectionGeneration + 1;
+    this.connectionGeneration = generation;
     this.handlers.onStatusChange?.(this.reconnectAttempt === 0 ? "connecting" : "reconnecting");
-    this.abortController = new AbortController();
+    const abortController = new AbortController();
+    this.abortController = abortController;
 
     try {
-      const response = await this.openAuthorizedStream(this.workspaceId, this.abortController.signal);
+      const response = await this.openAuthorizedStream(this.workspaceId, abortController.signal);
+      if (generation !== this.connectionGeneration || this.stopped) {
+        closeStreamResponse(response);
+        return;
+      }
       this.reconnectAttempt = 0;
       this.handlers.onStatusChange?.("open");
       this.handlers.onOpen?.();
-      await this.consumeStream(response, this.abortController.signal);
+      await this.consumeStream(response, abortController.signal);
 
-      if (!this.stopped) {
+      if (!this.stopped && generation === this.connectionGeneration) {
         this.scheduleReconnect();
       }
     } catch (error) {
-      if (this.stopped || isAbortError(error)) {
+      if (
+        this.stopped ||
+        generation !== this.connectionGeneration ||
+        isAbortError(error)
+      ) {
         return;
       }
 
@@ -83,6 +113,11 @@ export class NotePresenceEventStream {
   }
 
   private async consumeStream(response: Response | IncomingMessage, signal: AbortSignal): Promise<void> {
+    if (signal.aborted) {
+      closeStreamResponse(response);
+      throw createAbortError();
+    }
+
     const parser = createParser({
       onEvent: (message) => {
         void this.handleMessage(message);
@@ -92,22 +127,38 @@ export class NotePresenceEventStream {
     if (isNodeResponse(response)) {
       response.setEncoding("utf8");
       await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+          signal.removeEventListener("abort", abortHandler);
+          response.removeListener("end", endHandler);
+          response.removeListener("error", errorHandler);
+        };
+        const settle = (callback: () => void) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          callback();
+        };
         const abortHandler = () => {
-          reject(createAbortError());
+          const abortError = createAbortError();
+          response.destroy(abortError);
+          settle(() => reject(abortError));
+        };
+        const endHandler = () => {
+          settle(resolve);
+        };
+        const errorHandler = (error: Error) => {
+          settle(() => reject(error));
         };
 
         signal.addEventListener("abort", abortHandler, { once: true });
         response.on("data", (chunk: string) => {
           parser.feed(chunk);
         });
-        response.on("end", () => {
-          signal.removeEventListener("abort", abortHandler);
-          resolve();
-        });
-        response.on("error", (error: Error) => {
-          signal.removeEventListener("abort", abortHandler);
-          reject(error);
-        });
+        response.on("end", endHandler);
+        response.on("error", errorHandler);
       });
       return;
     }
@@ -119,7 +170,7 @@ export class NotePresenceEventStream {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
 
-    while (!this.stopped) {
+    while (!this.stopped && !signal.aborted) {
       const { done, value } = await reader.read();
       if (done) {
         break;
@@ -171,6 +222,7 @@ export class NotePresenceEventStream {
     let response = await this.openStream(workspaceId, accessToken, signal);
 
     if (getResponseStatus(response) === 401) {
+      closeStreamResponse(response);
       await this.apiClient.refresh();
       const refreshedToken = await this.apiClient.getValidAccessToken();
       response = await this.openStream(workspaceId, refreshedToken, signal);
@@ -194,9 +246,13 @@ export class NotePresenceEventStream {
     );
     const nodeRequire = getNodeRequire();
     if (nodeRequire) {
+      this.log(
+        `Opening note presence SSE transport=node-${getUrlProtocolName(url)} authority=${new URL(url).origin}.`
+      );
       return openNodeRequest(url, accessToken, signal, nodeRequire, this.apiClient.getClientHeaders());
     }
 
+    this.log(`Opening note presence SSE transport=fetch authority=${new URL(url).origin}.`);
     return fetch(url, {
       method: "GET",
       headers: {
@@ -240,6 +296,20 @@ function isNodeResponse(response: Response | IncomingMessage): response is Incom
 
 function getResponseStatus(response: Response | IncomingMessage): number {
   return isNodeResponse(response) ? response.statusCode ?? 0 : response.status;
+}
+
+function closeStreamResponse(response: Response | IncomingMessage): void {
+  if (isNodeResponse(response)) {
+    response.destroy();
+    return;
+  }
+  if (response.body) {
+    void response.body.cancel().catch(() => undefined);
+  }
+}
+
+function getUrlProtocolName(url: string): string {
+  return new URL(url).protocol.replace(/:$/, "");
 }
 
 function createAbortError(): Error {

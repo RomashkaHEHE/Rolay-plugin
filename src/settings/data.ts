@@ -2,8 +2,9 @@ import { Platform } from "obsidian";
 import type { GlobalRole, User } from "../types/protocol";
 import { normalizeSha256Hash } from "../utils/sha256";
 
-export const ROLAY_SERVER_URL = "http://46.16.36.87:3000";
-export const ROLAY_DEVICE_NAME = Platform.isMobile ? "Obsidian Mobile" : "Obsidian Desktop";
+export const ROLAY_SERVER_URL = "https://rolay.ru";
+export const ROLAY_UPDATE_SERVER_URL = "https://rolay.ru";
+export const ROLAY_DEVICE_NAME = Platform.isMobileApp ? "Obsidian Mobile" : "Obsidian Desktop";
 export const ROLAY_AUTO_CONNECT = true;
 
 export interface RolayRoomBindingSettings {
@@ -177,7 +178,7 @@ export function normalizeServerUrl(serverUrl: string): string {
     return trimmed;
   }
 
-  return `http://${trimmed}`;
+  return `https://${trimmed}`;
 }
 
 export function createDefaultPluginData(): RolayPluginData {

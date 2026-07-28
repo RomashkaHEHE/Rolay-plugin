@@ -1,6 +1,6 @@
 # Idea Index
 
-Last updated: 2026-04-22
+Last updated: 2026-07-28
 
 This file is the navigator for the future-work backlog.
 
@@ -10,36 +10,45 @@ See also:
 
 ## Current Guidance
 
-When choosing the next substantial product feature, prefer this order unless the user says otherwise:
+The current direction is general-purpose, low-friction synchronization. Prefer this order unless the
+user says otherwise:
 
-1. Strong UX wins with clear benefit and low ambiguity
-2. File/sync features that improve safety or observability
-3. Performance or diagnostics ideas that need more proof
-4. Previously rejected ideas only if the workflow changes materially
+1. Cross-platform correctness, safety, and automatic recovery
+2. Startup/resume speed and useful-work-first scheduling
+3. Quiet contextual sync/collaboration indicators
+4. Additional collaboration features
+5. Diagnostics or rejected ideas only when evidence/workflow changes justify them
 
 ## Near-Term Candidate Ideas
 
-These are the most promising ideas from the current conversation.
+These form the current reliability and experience initiative.
 
-1. [Unread remote changes](candidate/unread-remote-changes.md)
-2. [Follow mode](candidate/follow-mode.md)
-3. [Room install progress panel](candidate/room-install-progress-panel.md)
-4. [Queue panel](candidate/queue-panel.md)
-5. [Per-file status detail](candidate/per-file-status-detail.md)
-6. [Safer move warnings](candidate/safer-move-warnings.md)
-7. [Room health badge](candidate/room-health-badge.md)
+1. [Cross-platform reliability](candidate/cross-platform-reliability.md)
+2. [Ambient sync indicators](candidate/ambient-sync-indicators.md)
+3. [Automatic stuck-transfer recovery](candidate/automatic-stuck-transfer-recovery.md)
+4. [Adaptive preload](candidate/adaptive-preload.md)
+5. [Active-note-first scheduling](candidate/active-note-first-scheduling.md)
+6. [Room health badge](candidate/room-health-badge.md)
+7. [Explicit degraded mode](candidate/explicit-degraded-mode.md)
 8. [Notification polish](candidate/notification-polish.md)
 
-## Recommended Parallel Branch Batch
+## Recommended Implementation Order
 
-If the team wants to develop several ideas in parallel, start with:
+Treat these as one initiative with explicit boundaries:
 
-1. [Unread remote changes](candidate/unread-remote-changes.md)
-2. [Follow mode](candidate/follow-mode.md)
-3. [Room install progress panel](candidate/room-install-progress-panel.md)
+1. Verify the mobile-safe HTTPS/WSS transport foundation.
+2. Establish automatic recovery and useful-work-first scheduling.
+3. Simplify healthy-state indicators once their underlying health signals are trustworthy.
+
+Discovery and measurements can run on parallel branches, but coordinate implementation touching
+`src/main.ts`, `src/api/client.ts`, and `styles.css` according to
+[parallel-workflow.md](parallel-workflow.md).
 
 ## Candidate Ideas
 
+- [Cross-platform reliability](candidate/cross-platform-reliability.md)
+- [Ambient sync indicators](candidate/ambient-sync-indicators.md)
+- [Active-note-first scheduling](candidate/active-note-first-scheduling.md)
 - [Unread remote changes](candidate/unread-remote-changes.md)
 - [Follow mode](candidate/follow-mode.md)
 - [Queue panel](candidate/queue-panel.md)
@@ -71,7 +80,6 @@ If the team wants to develop several ideas in parallel, start with:
 - [Secure session storage](needs-discovery/secure-session-storage.md)
 - [Structured diagnostics export](needs-discovery/structured-diagnostics-export.md)
 - [Feature flags for risky systems](needs-discovery/feature-flags-for-risky-systems.md)
-- [Active-note-first scheduling](needs-discovery/active-note-first-scheduling.md)
 - [Presence throttling](needs-discovery/presence-throttling.md)
 - [Large-room virtualized diagnostics](needs-discovery/large-room-virtualized-diagnostics.md)
 - [Avatar initials](needs-discovery/avatar-initials.md)

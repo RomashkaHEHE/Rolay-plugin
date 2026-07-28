@@ -436,3 +436,19 @@ export interface NotePresenceUpdatedPayload {
 }
 
 export type NotePresenceStreamEvent<TPayload = unknown> = WorkspaceEvent<TPayload>;
+
+export type PluginUpdateFileName = "main.js" | "manifest.json" | "styles.css";
+
+export interface PluginUpdateFileDescriptor {
+  name: PluginUpdateFileName;
+  url: string;
+  sizeBytes: number;
+  sha256: string;
+}
+
+export interface PluginUpdateManifest {
+  pluginId: "rolay";
+  latestVersion: string;
+  releasedAt: string;
+  files: PluginUpdateFileDescriptor[];
+}

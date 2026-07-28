@@ -2,16 +2,20 @@
 
 ## Main UX Goal
 
-Users should understand collaboration state without opening developer tools or reading logs.
+Collaboration state should become obvious when collaboration is happening, but it should not dominate
+ordinary solo synchronization.
 
-That is why the plugin deliberately exposes collaboration status in the interface:
+The presentation target is:
 
-- cursor colors
-- cursor labels
-- note presence chips
-- explorer presence badges
-- file loading/upload colors
-- room connection indicators
+- healthy solo use: only a subtle room health mark
+- another authenticated presence instance: relevant viewer chips, explorer badges, and cursors
+- anonymous public viewers: separate gray eye indicators
+- active transfer: contextual progress on the file or deepest visible collapsed parent
+- degraded/action-required state: progressively stronger room/file UI and, only when justified, a
+  notification
+
+The underlying presence and transfer models remain complete even when a quiet state is visually
+suppressed.
 
 ## Viewer Presence Intent
 
@@ -24,6 +28,9 @@ That is why note presence is split:
 - room-level note presence stream for who is in a note
 - per-document awareness for detailed cursor/selection rendering
 
+The current local presence instance should still be published immediately and optimistically. Quiet
+solo presentation is a rendering decision, not permission to omit or delay awareness.
+
 ## Explorer Badge Intent
 
 Explorer decorations are not decorative fluff. They are operational UI:
@@ -32,6 +39,11 @@ Explorer decorations are not decorative fluff. They are operational UI:
 - red loading state answers "is this fully here yet?"
 - yellow upload state answers "is this still being sent?"
 - room indicators answer "is this room connected?"
+
+Operational does not mean permanently prominent. A self-only authenticated presence badge can be
+suppressed in healthy solo mode because it adds no new information; remote sessions, duplicate live
+instances from another device/window, and anonymous viewers remain meaningful and should reveal the
+relevant UI.
 
 Presence and transfer progress should avoid noisy ancestor spam. Use the minimal visible parent rule:
 
@@ -65,10 +77,12 @@ So remote text apply must preserve the local viewport unless there is an intenti
 
 ## Implication For Future Agents
 
-When changing collaboration UI, judge it by whether a non-technical user can answer these quickly:
+When changing collaboration UI, judge it by both calmness and discoverability:
 
-- Who is in this note?
-- Is this file still downloading?
-- Is this file still uploading?
-- Am I connected?
-- Did the system just move me somewhere unexpectedly?
+- Does a healthy solo vault still look and feel like ordinary Obsidian?
+- When someone else arrives, is that visible at the relevant note?
+- While work is active, can the user tell what is happening without opening settings?
+- When something is degraded, is detail available from the nearest indicator?
+- Did the system move the viewport or demand an avoidable manual action?
+
+See [ambient-sync-experience.md](ambient-sync-experience.md) for the full attention hierarchy.

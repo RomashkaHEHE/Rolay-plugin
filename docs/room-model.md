@@ -22,7 +22,8 @@ There are two role layers:
 The plugin uses them differently:
 
 - `user.globalRole` and `user.isAdmin` gate global UI such as room creation and admin sections.
-- `room.membershipRole` gates room-local UI such as invite controls.
+- `room.membershipRole` gates room-local UI such as invite and publication controls; a global admin
+  can also manage publication.
 
 ## Invite Lifecycle
 
@@ -41,7 +42,8 @@ Each room is bound to its own local folder name.
 - Default folder name: room name
 - `workspace.id` is not the standard folder name
 - The user can change the folder name before download
-- After download, the folder binding is treated as locked by the current MVP
+- After download, the user can rename the installed room folder; the plugin moves the vault folder
+  and updates the local binding without renaming the server room
 - Download is rejected if the target folder already exists in the vault
 
 The resulting local projection path is:

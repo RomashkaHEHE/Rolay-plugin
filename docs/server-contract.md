@@ -4,14 +4,15 @@ This repository keeps the essential server handoff context in normal project doc
 
 ## Data Modes
 
-Rolay `v1` splits sync into three layers:
+Rolay `v1` splits sync into five cooperating surfaces:
 
 1. Room management
    Human-facing room list, invite lifecycle, and membership/admin management.
 2. Room tree
    Server-authoritative folder/file index under `/v1/workspaces/{workspaceId}/...`.
-3. Markdown content
-   Yjs document synced over Hocuspocus-compatible websocket transport.
+3. File content
+   Markdown uses Yjs over Hocuspocus-compatible websocket transport; every non-Markdown file uses
+   blob transfer.
 4. Settings/admin realtime
    Dedicated SSE stream for profile, room-list, invite, and admin management UI.
 5. Room note presence
@@ -38,21 +39,50 @@ The plugin therefore stores:
 
 Expected client order:
 
-1. Authenticate with `login` or `refresh`.
-2. Fetch `GET /v1/auth/me`.
-3. Load room list from `GET /v1/rooms`.
-4. When settings open, fetch the settings/admin snapshot by REST and then open `GET /v1/events/settings`.
-5. Resume sync only for rooms that were previously downloaded.
-6. For each downloaded room:
-   fetch `GET /v1/workspaces/{workspaceId}/tree`
+1. After plugin load, schedule the public update check without blocking Obsidian workspace startup
+   or waiting for authentication.
+2. Authenticate with `login` or `refresh`.
+3. Fetch `GET /v1/auth/me`.
+4. Load room list from `GET /v1/rooms`.
+5. When settings open, fetch the settings/admin snapshot by REST and then open `GET /v1/events/settings`.
+6. After Obsidian workspace layout is ready, resume sync only for rooms that were previously downloaded.
 7. For each downloaded room:
+   fetch `GET /v1/workspaces/{workspaceId}/tree`
+8. For each downloaded room:
    open `GET /v1/workspaces/{workspaceId}/events?cursor=...`
-8. For each connected/downloaded room:
+9. For each connected/downloaded room:
    open `GET /v1/workspaces/{workspaceId}/note-presence/events`
-9. For opened markdown files inside downloaded room folders:
+10. For opened markdown files inside downloaded room folders:
    request a `crdt-token` and connect a Yjs provider.
 
 ## REST Endpoints Used By The MVP
+
+### Plugin Updates
+
+- `GET /v1/plugin-updates/latest`
+- `GET /v1/plugin-updates/{version}/files/{fileName}`
+
+These routes are public read-only endpoints. Update discovery must work without a valid Rolay
+session so logged-out clients and clients with expired credentials can still receive fixes.
+The plugin uses the HTTPS authority `https://rolay.ru` for both these routes and normal room sync.
+Update discovery remains unauthenticated and logically isolated from authenticated sync APIs.
+
+The latest manifest contains:
+
+- `pluginId`, which must be `rolay`
+- `latestVersion` in plain `x.y.z` form
+- `releasedAt`
+- exactly three file descriptors: `main.js`, `manifest.json`, and `styles.css`
+- an immutable same-server download path, `sizeBytes`, and canonical base64 `sha256` for each file
+
+The plugin must reject the update before replacing anything if:
+
+- the plugin ID or version does not match
+- an expected file is missing or an extra file is present
+- a size or SHA-256 differs
+- downloaded `manifest.json` is invalid or requires a newer Obsidian version
+
+`data.json`, logs, caches, transfer parts, and room bindings are never update assets.
 
 ### Auth
 
@@ -60,6 +90,7 @@ Expected client order:
 - `POST /v1/auth/refresh`
 - `GET /v1/auth/me`
 - `PATCH /v1/auth/me/profile`
+- `PATCH /v1/auth/me/password`
 
 `login` returns `accessToken`, `refreshToken`, and `user`. `refresh` rotates only tokens, so the plugin follows it with `GET /v1/auth/me` when rebuilding authoritative user state.
 
@@ -68,6 +99,7 @@ Expected client order:
 - `GET /v1/rooms`
 - `POST /v1/rooms`
 - `POST /v1/rooms/join`
+- `GET /v1/rooms/{workspaceId}/members`
 - `GET /v1/rooms/{workspaceId}/invite`
 - `PATCH /v1/rooms/{workspaceId}/invite`
 - `POST /v1/rooms/{workspaceId}/invite/regenerate`
@@ -281,9 +313,9 @@ Binary upload contract:
 5. resumable upload uses `Content-Range: bytes start-end/total`
 6. if the server returns `blob_offset_mismatch`, the client should continue from `error.details.expectedOffset`
 7. publish the new revision through `commit_blob_revision`
+8. if the new API endpoint is unavailable, the plugin may still fall back to the legacy raw `upload.url`, but that is no longer the primary flow
 
 The plugin normalizes blob hashes to canonical `sha256:<base64>` before upload, commit, download verification, and local cache comparisons.
-8. if the new API endpoint is unavailable, the plugin may still fall back to the legacy raw `upload.url`, but that is no longer the primary flow
 
 Important upload fields:
 
@@ -334,9 +366,17 @@ Supported server operation types:
 
 ## Implementation Assumptions In This Repo
 
-- The plugin uses the fixed live server URL `http://46.16.36.87:3000`.
+- The plugin uses the fixed live server URL `https://rolay.ru`.
+- When Electron/Node transport is unavailable, SSE and blob browser fallbacks rely on the server's
+  narrow Obsidian-origin CORS policy. Required request headers include bearer auth, `Range`,
+  `Content-Range`, `Last-Event-ID`, and Rolay client/version headers; transfer metadata headers are
+  exposed to browser code.
+- An HTTPS server must return `wss:` CRDT URLs and `https:` blob fallback URLs. The client rejects
+  insecure transport targets instead of silently downgrading.
 - The plugin keeps local state around `workspace.id`, not room name.
 - Each room has its own local folder binding chosen by the user. The default folder name is the room name.
+- An installed room folder can be renamed locally; this moves the vault folder and updates only the
+  local binding, not the server room name.
 - Local room files are projected under `syncRoot/<room-folder-name>/...`.
 - A room is not materialized locally until the user explicitly downloads it.
 - Download is rejected if the target folder already exists in the vault.

@@ -15,6 +15,11 @@ Those two files usually tell you:
 - whether the plugin forgot a room, or only failed to render it
 - whether a snapshot, SSE, CRDT, or blob step failed first
 
+Start mobile/network triage with `platform/info`, `lifecycle/info`, and the relevant `sse`,
+`settings-sse`, `presence`, `crdt`, or `blob-trace` lines. The startup platform line records the
+platform, runtime origin, HTTPS authority, expected transport chain, download concurrency, and upload chunk size;
+each SSE open records its actual `node-http(s)` or `fetch` transport without logging credentials.
+
 ## Common Symptoms
 
 ### Room folder looks forgotten after restart
@@ -28,6 +33,29 @@ Check:
    - `getDownloadedRooms`
    - `getDownloadedFolderName`
    - `reconcileLocalRoomFolders`
+
+### Android resume or network switching does not recover live state
+
+Check:
+
+1. the startup `platform/info` line says `platform=android` and `server=https://rolay.ru`
+2. `lifecycle/info` shows `mobile-resume-*`, `mobile-pageshow`, or `network-online`
+3. each active SSE scope logs `Restarting ...` followed by `transport=fetch`
+4. `crdt/info` shows the background transition and active-note reconnect
+5. [src/main.ts](../src/main.ts):
+   - `handleMobileVisibilityChange`
+   - `scheduleLiveTransportRecovery`
+   - `recoverLiveTransports`
+6. [src/sync/event-stream.ts](../src/sync/event-stream.ts), [src/sync/settings-stream.ts](../src/sync/settings-stream.ts), and [src/sync/note-presence-stream.ts](../src/sync/note-presence-stream.ts):
+   - `reconnectNow`
+   - generation guards around late stream completion
+
+Current expectation:
+
+- backgrounding clears active Markdown viewer presence instead of leaving a hidden Android app online
+- resuming restarts only rooms that were already active
+- a manually disconnected room remains stopped
+- browser SSE/blob failures should be checked against the server CORS allowlist and response headers
 
 ### Cursor jitters when text is inserted before it
 
@@ -134,7 +162,7 @@ Check:
 1. whether `binaryTransfers` in `data.json` still contains the task
 2. whether `pendingBinaryWrites` in `data.json` still points at the local upload file
 3. whether the `.part` file exists for downloads in `.obsidian/plugins/rolay/transfers/`
-3. [src/main.ts](../src/main.ts):
+4. [src/main.ts](../src/main.ts):
    - `rememberPendingBinaryWrite`
    - `reconcilePendingBinaryWrites`
    - `syncBinaryEntriesFromSnapshot`
@@ -202,7 +230,7 @@ Current expectation:
 - persistent CRDT cache must be large enough to retain room-wide markdown preload state
 - if the cache cap is too small, downloaded notes are pruned and later treated as still loading
 - red markdown explorer state should only mean the note is genuinely missing/unhydrated/protected, not that its cached bootstrap state was evicted
-- folder percentages during markdown preload should aggregate the whole active bootstrap target set; if folders stay at `0%` until they disappear, check `addMarkdownBootstrapFolderProgress` and exact-vs-ancestor transfer badge aggregation
+- folder percentages during markdown preload should aggregate the whole active bootstrap target set; if folders stay at `0%` until they disappear, check `addMarkdownBootstrapVisibleProgress` and exact-vs-ancestor transfer badge aggregation
 
 ### Settings UI looks stale
 

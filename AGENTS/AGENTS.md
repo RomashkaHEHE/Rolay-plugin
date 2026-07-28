@@ -16,13 +16,13 @@ When starting cold, read in this order:
 
 1. [current-state.md](current-state.md)
 2. [task-protocol.md](task-protocol.md)
-3. [context/README.md](context/README.md)
-4. [ideas/README.md](ideas/README.md)
-5. [ideas/index.md](ideas/index.md)
+3. [tasks/README.md](tasks/README.md)
+4. The specific active task file, if one exists
+5. [context/README.md](context/README.md) and only the context files relevant to the task
 6. [../README.md](../README.md)
 7. [../docs/repo-map.md](../docs/repo-map.md)
-8. [../docs/server-contract.md](../docs/server-contract.md)
-9. Relevant files in [tasks](tasks)
+8. [../docs/server-contract.md](../docs/server-contract.md) for sync/API work
+9. [ideas/index.md](ideas/index.md) only when exploring or selecting future work
 10. [../docs/debug-playbook.md](../docs/debug-playbook.md) if the task is bug-fixing or incident triage
 
 ## What AGENTS Must Contain
@@ -66,6 +66,12 @@ It must help a new agent answer all of these quickly:
   Template for future task files.
 - [tasks](tasks)
   One file per meaningful multi-step task or ongoing thread.
+
+## Companion Repository
+
+The Rolay server is normally available as the sibling repository `../server`. For cross-repository
+protocol work, read its `AGENTS/AGENTS.md`, canonical `openapi.yaml`, and relevant task file before
+changing either side. Keep client and server handoff state synchronized when a task spans both.
 
 ## Important Constraint
 

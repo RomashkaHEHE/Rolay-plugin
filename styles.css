@@ -5,6 +5,127 @@
   margin-top: 1rem;
 }
 
+.rolay-update-ribbon {
+  color: var(--text-accent);
+  position: relative;
+}
+
+.rolay-update-ribbon[hidden] {
+  display: none !important;
+}
+
+.rolay-update-ribbon:not([hidden])::after {
+  background: var(--color-orange, #d97706);
+  border: 1px solid var(--background-primary);
+  border-radius: 50%;
+  content: "";
+  height: 7px;
+  position: absolute;
+  right: 5px;
+  top: 5px;
+  width: 7px;
+}
+
+.rolay-update-ribbon.is-error:not([hidden])::after {
+  background: var(--color-red, #dc4c4c);
+}
+
+.rolay-update-ribbon.is-restart-required:not([hidden])::after {
+  background: var(--color-green, #3f9d68);
+}
+
+.rolay-update-ribbon.is-busy svg,
+.rolay-update-banner-downloading .rolay-update-banner-icon svg,
+.rolay-update-banner-installing .rolay-update-banner-icon svg {
+  animation: rolay-update-spin 1s linear infinite;
+}
+
+.rolay-update-banner {
+  align-items: center;
+  background: color-mix(in srgb, var(--interactive-accent) 11%, var(--background-secondary));
+  border: 1px solid color-mix(in srgb, var(--interactive-accent) 38%, var(--background-modifier-border));
+  border-radius: 5px;
+  display: grid;
+  gap: 0.7rem;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  padding: 0.7rem 0.8rem;
+}
+
+.rolay-update-banner-error {
+  background: color-mix(in srgb, var(--color-red) 8%, var(--background-secondary));
+  border-color: color-mix(in srgb, var(--color-red) 35%, var(--background-modifier-border));
+}
+
+.rolay-update-banner-icon {
+  align-items: center;
+  color: var(--text-accent);
+  display: inline-flex;
+  justify-content: center;
+}
+
+.rolay-update-banner-icon svg {
+  height: 18px;
+  width: 18px;
+}
+
+.rolay-update-banner-copy {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+}
+
+.rolay-update-banner-title {
+  color: var(--text-normal);
+  font-size: var(--font-ui-small);
+  font-weight: 650;
+}
+
+.rolay-update-banner-detail,
+.rolay-update-modal-note {
+  color: var(--text-muted);
+  font-size: var(--font-ui-smaller);
+  overflow-wrap: anywhere;
+}
+
+.rolay-update-banner-progress {
+  max-width: 150px;
+  width: 100%;
+}
+
+.rolay-update-action {
+  align-items: center;
+  display: inline-flex;
+  gap: 0.4rem;
+  justify-content: center;
+}
+
+.rolay-update-action svg {
+  height: 15px;
+  width: 15px;
+}
+
+.rolay-update-modal {
+  max-width: min(520px, calc(100vw - 2rem));
+}
+
+.rolay-update-modal-error {
+  background: color-mix(in srgb, var(--color-red) 9%, transparent);
+  border-left: 2px solid var(--color-red);
+  color: var(--text-error);
+  overflow-wrap: anywhere;
+  padding: 0.55rem 0.65rem;
+}
+
+.rolay-update-modal-progress {
+  width: 100%;
+}
+
+@keyframes rolay-update-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .rolay-settings-shell {
   display: grid;
   gap: 0.85rem;
@@ -666,6 +787,17 @@
 }
 
 @media (max-width: 820px) {
+  .rolay-update-banner {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .rolay-update-banner > button,
+  .rolay-update-banner > progress {
+    grid-column: 1 / -1;
+    max-width: none;
+    width: 100%;
+  }
+
   .rolay-settings-tabs {
     display: grid;
     grid-template-columns: repeat(2, minmax(0, 1fr));

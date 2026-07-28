@@ -17,6 +17,6 @@ Count a user as present in multiple simultaneously visible notes/panes in one Ob
 
 - Only revisit if the workflow changes enough that simultaneous note watching becomes normal.
 
-## Related Task
+## Implementation Status
 
-- [AGENTS/tasks/multi-pane-note-presence.md](../../tasks/multi-pane-note-presence.md)
+There is no active implementation task. Create one only if the user explicitly reopens this idea.

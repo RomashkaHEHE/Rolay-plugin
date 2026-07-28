@@ -25,13 +25,22 @@ That is why:
 
 ## Distribution Intent
 
-The plugin is distributed internally via GitHub Releases and BRAT.
+The plugin uses GitHub Releases as the release artifact source. Existing installations currently use BRAT, but the intended steady state is a Rolay self-updater backed by the Rolay server.
 
 Why:
 
 - the audience is known and limited
 - fast iteration matters more than public plugin-catalog workflow
 - maintainers need low-friction release steps
+- clients should receive update availability without requiring every user to configure BRAT
+
+The server is the update authority even when GitHub stores the artifacts. The client accepts only `main.js`, `manifest.json`, and `styles.css`, verifies their hashes and release metadata, and never replaces `data.json` or local sync state.
+
+Executable update traffic and normal sync now use `https://rolay.ru`. Update discovery is still a
+separate public read-only surface, while room/auth/tree/blob APIs remain authenticated. The client
+must reject insecure update, CRDT, or blob fallback targets rather than silently downgrading.
+
+There is an unavoidable bootstrap boundary: clients older than the first updater-enabled release need one final BRAT or manual update.
 
 ## Release Convention Intent
 

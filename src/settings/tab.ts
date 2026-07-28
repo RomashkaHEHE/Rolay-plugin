@@ -21,6 +21,7 @@ type SettingsView = "account" | "general" | "rooms" | "admin";
 type DetailMode = "room" | "admin-room";
 type StatusSnapshot = ReturnType<RolayPlugin["getStatusSnapshot"]>;
 type RoomCardState = ReturnType<RolayPlugin["getRoomCardStates"]>[number];
+type PluginUpdateState = ReturnType<RolayPlugin["getPluginUpdateState"]>;
 
 interface CardElements {
   card: HTMLDivElement;
@@ -124,6 +125,7 @@ export class RolaySettingTab extends PluginSettingTab {
 
     const shell = containerEl.createDiv({ cls: "rolay-settings-shell" });
     this.renderHero(shell, currentUser);
+    this.renderPluginUpdateBanner(shell);
 
     if (this.activeDetail) {
       const activeRoom = roomCards.find((room) => room.room.workspace.id === this.activeDetail?.roomId) ?? null;
@@ -208,6 +210,70 @@ export class RolaySettingTab extends PluginSettingTab {
       this.activeView = view;
       this.render();
     });
+  }
+
+  private renderPluginUpdateBanner(containerEl: HTMLElement): void {
+    const state = this.rolay.getPluginUpdateState();
+    const shouldShow =
+      state.status === "available" ||
+      state.status === "downloading" ||
+      state.status === "installing" ||
+      state.status === "restart-required" ||
+      (state.status === "error" && this.rolay.hasPluginUpdateAvailable());
+    if (!shouldShow) {
+      return;
+    }
+
+    const banner = containerEl.createDiv({
+      cls: `rolay-update-banner rolay-update-banner-${state.status}`
+    });
+    const icon = banner.createDiv({ cls: "rolay-update-banner-icon" });
+    setIcon(
+      icon,
+      state.status === "restart-required"
+        ? "refresh-cw"
+        : state.status === "downloading" || state.status === "installing"
+          ? "loader-circle"
+          : "download"
+    );
+    const copy = banner.createDiv({ cls: "rolay-update-banner-copy" });
+    copy.createDiv({
+      cls: "rolay-update-banner-title",
+      text: state.status === "restart-required"
+        ? "Rolay update installed"
+        : state.status === "error"
+          ? "Rolay update needs attention"
+          : state.status === "downloading" || state.status === "installing"
+            ? `Updating Rolay: ${state.progressPercent}%`
+            : `Rolay ${state.latestVersion} is available`
+    });
+    copy.createDiv({
+      cls: "rolay-update-banner-detail",
+      text: state.status === "restart-required"
+        ? "Restart Obsidian to load the new plugin files."
+        : state.status === "error"
+          ? state.lastError ?? "The update could not be installed."
+          : `Installed version: ${state.currentVersion}`
+    });
+
+    if (state.status === "downloading" || state.status === "installing") {
+      const progress = banner.createEl("progress", {
+        cls: "rolay-update-banner-progress"
+      });
+      progress.max = 100;
+      progress.value = state.progressPercent;
+      return;
+    }
+    if (state.status === "restart-required") {
+      return;
+    }
+
+    const action = banner.createEl("button", {
+      cls: "mod-cta rolay-update-action"
+    });
+    setIcon(action, "download");
+    action.createSpan({ text: "Force update" });
+    action.addEventListener("click", () => this.rolay.openPluginUpdateDialog());
   }
 
   private renderAccountView(
@@ -349,6 +415,8 @@ export class RolaySettingTab extends PluginSettingTab {
       }
     });
 
+    this.renderPluginUpdateCard(grid, this.rolay.getPluginUpdateState());
+
     const debugCard = this.createCard(grid, "Debug");
     const debugDetails = debugCard.body.createEl("details", { cls: "rolay-settings-details" });
     debugDetails.createEl("summary", {
@@ -370,6 +438,39 @@ export class RolaySettingTab extends PluginSettingTab {
       cls: "rolay-settings-log",
       text: status.recentLogs.length > 0 ? status.recentLogs.join("\n") : "No sync activity recorded yet."
     });
+  }
+
+  private renderPluginUpdateCard(
+    containerEl: HTMLElement,
+    state: PluginUpdateState
+  ): void {
+    const card = this.createCard(containerEl, "Plugin Version");
+    const statusLabel = state.status === "current"
+      ? "up to date"
+      : state.status === "available"
+        ? "update available"
+        : state.status === "downloading" || state.status === "installing"
+          ? `${state.progressPercent}%`
+          : state.status === "restart-required"
+            ? "restart required"
+            : state.status === "error"
+              ? "check failed"
+              : state.status;
+    this.createInfoBlock(card.body, [
+      ["Installed", state.currentVersion],
+      ["Latest", state.latestVersion ?? "not checked"],
+      ["Status", statusLabel]
+    ]);
+
+    const actions = this.createActionRow(card.body);
+    const checkButton = this.createActionButton(actions, "Check now", "", async () => {
+      await this.rolay.checkForPluginUpdate();
+      this.requestRender();
+    });
+    checkButton.disabled =
+      state.status === "checking" ||
+      state.status === "downloading" ||
+      state.status === "installing";
   }
 
   private renderRoomsView(

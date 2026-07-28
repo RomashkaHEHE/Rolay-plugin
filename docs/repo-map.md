@@ -4,10 +4,11 @@ This document is the quickest way for a new agent or developer to orient inside 
 
 ## Where To Start
 
-1. Read [README.md](../README.md) for product-level behavior and supported flows.
-2. Read [server-contract.md](./server-contract.md) for the current API and protocol assumptions.
-3. Open [src/main.ts](../src/main.ts) to see the runtime orchestration.
-4. Use the module map below to jump to the right subsystem.
+1. For current priorities or unfinished work, start at [AGENTS/AGENTS.md](../AGENTS/AGENTS.md).
+2. Read [README.md](../README.md) for product-level behavior and supported flows.
+3. Read [server-contract.md](./server-contract.md) for the current API and protocol assumptions.
+4. Open [src/main.ts](../src/main.ts) to see the runtime orchestration.
+5. Use the module map below to jump to the right subsystem.
 
 ## Top-Level Runtime Architecture
 
@@ -16,7 +17,9 @@ The plugin is split into a few strong boundaries:
 - `src/main.ts`
   Main orchestrator. Owns plugin lifecycle, persisted state, room runtime state, snapshot refresh, binary/markdown preload, settings SSE, and most cross-module coordination.
 - `src/api/client.ts`
-  All server HTTP/SSE/blob transport calls live here. If the bug smells like request shape, auth headers, refresh handling, upload/download transport, or status-code handling, start here.
+  Shared authenticated HTTP and blob transport lives here. If the bug smells like request shape, auth headers, refresh handling, upload/download transport, or status-code handling, start here. Long-lived SSE lifecycle lives in `src/sync/*`.
+- `src/update/plugin-updater.ts`
+  Non-blocking update checks, semver comparison, release-file verification, staging, backup/rollback, installation, and best-effort Obsidian soft reload.
 - `src/obsidian/file-bridge.ts`
   Translates authoritative room tree state into local vault files/folders and translates local vault mutations back into server operations. This is the first place to inspect echo-loops, create/rename/delete races, and "server said create, client sent create back" style bugs.
 - `src/realtime/crdt-session.ts`
@@ -33,6 +36,8 @@ The plugin is split into a few strong boundaries:
   Tree SSE, settings SSE, note-presence SSE, tree store, operations queue, and local/server path mapping.
 - `src/types/protocol.ts`
   TypeScript view of the current server contract.
+- `src/ui/plugin-update-modal.ts`
+  Confirmation and progress/restart messaging for the explicit force-update action.
 
 ## Module Map
 
@@ -41,6 +46,7 @@ The plugin is split into a few strong boundaries:
 Most important responsibilities:
 
 - plugin load/unload
+- mobile background/resume and network-online transport recovery
 - persisted state bootstrap via `mergePluginData(...)`
 - room install / connect / disconnect
 - room snapshot refresh and room SSE startup
@@ -53,6 +59,7 @@ Search here for:
 
 - `connectRoom`
 - `disconnectRoom`
+- `recoverLiveTransports`
 - `refreshRoomSnapshot`
 - `bootstrapRoomMarkdownCache`
 - `syncBinaryEntriesFromSnapshot`
@@ -77,7 +84,28 @@ Search here for:
 - `uploadBlobContent`
 - `createBlobDownloadTicket`
 - `downloadBlobFromUrl`
-- `openSettingsEventStream`
+- `getLatestPluginUpdate`
+- `downloadPluginUpdateFile`
+
+### `src/update/plugin-updater.ts`
+
+What it does:
+
+- checks the public Rolay update manifest without authentication
+- validates exact file allowlist, semver, sizes, hashes, plugin ID, and Obsidian compatibility
+- stages all files before touching the installed plugin
+- keeps local backups and rolls back partial replacement
+- replaces `manifest.json` last so an interrupted install cannot label old code as current
+- attempts an internal Obsidian reload only when manifest refresh APIs are available
+
+Search here for:
+
+- `PluginUpdater`
+- `checkForUpdates`
+- `installAvailableUpdate`
+- `downloadAndVerifyFiles`
+- `replaceInstalledFiles`
+- `scheduleSoftReload`
 
 ### `src/sync/note-presence-stream.ts`
 
@@ -85,6 +113,7 @@ What it does:
 
 - subscribes to room-level markdown note presence SSE
 - keeps reconnect logic separate from tree SSE
+- exposes immediate generation-safe reconnect for app resume/network recovery
 - delivers `presence.snapshot` and `note.presence.updated` events into `main.ts`
 
 Search here for:
@@ -92,6 +121,30 @@ Search here for:
 - `NotePresenceEventStream`
 - `start`
 - `connect`
+
+### `src/sync/*`
+
+Important files:
+
+- `event-stream.ts`
+  Room tree SSE connection, cursor resume, generation-safe reconnect/abort, transport diagnostics,
+  and event parsing.
+- `settings-stream.ts`
+  Settings/admin SSE connection and generation-safe reconnect lifecycle.
+- `operations.ts`
+  Typed construction of server-authoritative tree mutation batches.
+- `tree-store.ts`
+  In-memory authoritative entry index for one room.
+- `path-mapper.ts`
+  Mapping between vault paths, room folder bindings, and server paths.
+
+Search here for:
+
+- `WorkspaceEventStream`
+- `SettingsEventStream`
+- `TreeStore`
+- `OperationsQueue`
+- `toServerPathForRoom`
 
 ### `src/obsidian/file-bridge.ts`
 
@@ -184,6 +237,21 @@ Search here for:
 - `mergePluginData`
 - `normalizeRoomBindings`
 - `normalizePresenceColor`
+
+### `src/utils/*` And `src/ui/*`
+
+- `utils/text-diff.ts`
+  Minimal text patches that preserve editor viewport during remote Markdown updates.
+- `utils/sha256.ts`
+  Canonical `sha256:<base64>` normalization and hashing helpers.
+- `utils/file-kind.ts`
+  Markdown-versus-binary classification.
+- `utils/base64.ts`
+  Binary/base64 conversion shared by CRDT and blob payload handling.
+- `ui/text-input-modal.ts`
+  Shared local-folder/name prompt.
+- `ui/plugin-update-modal.ts`
+  Update confirmation, progress, and restart messaging.
 
 ## Typical Bug Entry Points
 

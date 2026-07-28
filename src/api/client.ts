@@ -24,6 +24,7 @@ import type {
   MarkdownBootstrapRequest,
   MarkdownBootstrapResponse,
   ManagedUserResponse,
+  PluginUpdateManifest,
   RefreshRequest,
   RefreshResponse,
   RoomListResponse,
@@ -40,6 +41,7 @@ import type {
 
 interface RolayApiClientConfig {
   getServerUrl: () => string;
+  getUpdateServerUrl?: () => string;
   getSession: () => RolaySessionState | null;
   saveSession: (session: RolaySessionState | null) => Promise<void>;
   getClientVersion?: () => string;
@@ -84,6 +86,12 @@ export interface BlobUploadContentResult extends BlobUploadContentResponse {
   transport: string;
 }
 
+export interface PluginUpdateDownloadResult {
+  data: ArrayBuffer;
+  status: number;
+  headers: Record<string, string>;
+}
+
 const MAX_BINARY_REDIRECTS = 5;
 
 export class RolayApiError extends Error {
@@ -118,6 +126,44 @@ export class RolayApiClient {
     }
 
     return headers;
+  }
+
+  async getLatestPluginUpdate(): Promise<PluginUpdateManifest> {
+    const response = await requestUrl({
+      url: this.buildUpdateUrl("/v1/plugin-updates/latest"),
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        ...this.getClientHeaders()
+      },
+      throw: false
+    });
+    if (response.status >= 400) {
+      throw createRequestUrlError(response);
+    }
+    return response.json as PluginUpdateManifest;
+  }
+
+  async downloadPluginUpdateFile(path: string): Promise<PluginUpdateDownloadResult> {
+    const response = await requestUrl({
+      url: this.buildUpdateUrl(path),
+      method: "GET",
+      headers: {
+        Accept: "application/octet-stream",
+        ...this.getClientHeaders()
+      },
+      throw: false
+    });
+
+    if (response.status >= 400) {
+      throw createRequestUrlError(response);
+    }
+
+    return {
+      data: response.arrayBuffer,
+      status: response.status,
+      headers: response.headers
+    };
   }
 
   async login(request: LoginRequest): Promise<LoginResponse> {
@@ -352,10 +398,11 @@ export class RolayApiClient {
   }
 
   async createCrdtToken(entryId: string): Promise<CrdtTokenResponse> {
-    return this.requestJson<CrdtTokenResponse>(
+    const response = await this.requestJson<CrdtTokenResponse>(
       "POST",
       `/v1/files/${encodeURIComponent(entryId)}/crdt-token`
     );
+    return validateCrdtTokenResponse(response, this.config.getServerUrl());
   }
 
   async getWorkspaceMarkdownBootstrap(
@@ -473,6 +520,7 @@ export class RolayApiClient {
     if (!uploadTarget) {
       throw new Error("Blob upload target is missing.");
     }
+    assertSecureTransferUrl(uploadTarget.url, this.config.getServerUrl(), "upload");
 
     const transportErrors: string[] = [];
 
@@ -555,6 +603,7 @@ export class RolayApiClient {
     onProgress?: (progress: BlobTransferProgress) => void,
     signal?: AbortSignal
   ): Promise<BlobDownloadResult> {
+    assertSecureTransferUrl(url, this.config.getServerUrl(), "download");
     // Signed blob download URLs have been flaky in desktop Obsidian depending
     // on the transport layer, so try Electron/Node first and keep browser
     // transports only as a fallback.
@@ -769,6 +818,20 @@ export class RolayApiClient {
       throw new Error("Server URL is empty.");
     }
 
+    return `${baseUrl}${path}`;
+  }
+
+  private buildUpdateUrl(path: string): string {
+    const baseUrl = (
+      this.config.getUpdateServerUrl?.() ??
+      this.config.getServerUrl()
+    ).trim().replace(/\/+$/, "");
+    if (!/^https:\/\//i.test(baseUrl)) {
+      throw new Error("Rolay plugin updates require an HTTPS server URL.");
+    }
+    if (!path.startsWith("/v1/plugin-updates/")) {
+      throw new Error("Unexpected Rolay plugin update path.");
+    }
     return `${baseUrl}${path}`;
   }
 
@@ -2346,6 +2409,55 @@ function parseContentLengthHeader(value: string | null): number | null {
 
 function requestHeader(request: XMLHttpRequest, name: string): string | null {
   return request.getResponseHeader(name);
+}
+
+function validateCrdtTokenResponse(
+  response: CrdtTokenResponse,
+  serverUrl: string
+): CrdtTokenResponse {
+  if (!response.docId?.trim() || !response.token?.trim() || !response.wsUrl?.trim()) {
+    throw new Error("CRDT token response is incomplete.");
+  }
+
+  let websocketUrl: URL;
+  let authorityUrl: URL;
+  try {
+    websocketUrl = new URL(response.wsUrl);
+    authorityUrl = new URL(serverUrl);
+  } catch {
+    throw new Error("CRDT token response contains an invalid websocket URL.");
+  }
+
+  if (websocketUrl.protocol !== "ws:" && websocketUrl.protocol !== "wss:") {
+    throw new Error(`CRDT websocket uses unsupported protocol ${websocketUrl.protocol}.`);
+  }
+
+  if (authorityUrl.protocol === "https:" && websocketUrl.protocol !== "wss:") {
+    throw new Error("Refusing an insecure CRDT websocket from the HTTPS Rolay server.");
+  }
+
+  return response;
+}
+
+function assertSecureTransferUrl(
+  targetUrl: string,
+  serverUrl: string,
+  transferKind: "upload" | "download"
+): void {
+  let authorityUrl: URL;
+  let resolvedTargetUrl: URL;
+  try {
+    authorityUrl = new URL(serverUrl);
+    resolvedTargetUrl = new URL(targetUrl, `${authorityUrl.toString().replace(/\/+$/, "")}/`);
+  } catch {
+    throw new Error(`Blob ${transferKind} target URL is invalid.`);
+  }
+
+  if (authorityUrl.protocol === "https:" && resolvedTargetUrl.protocol !== "https:") {
+    throw new Error(
+      `Refusing an insecure blob ${transferKind} target from the HTTPS Rolay server.`
+    );
+  }
 }
 
 function getHeaderValue(

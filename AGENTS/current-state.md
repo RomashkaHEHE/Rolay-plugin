@@ -1,20 +1,31 @@
 # Current State
 
-Last updated: 2026-05-29
+Last updated: 2026-07-28
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.16`
-- Latest notable commit in recent history before this AGENTS layer: `1a8c272` `Document presence and cursor sync behavior`
+- Plugin version: `1.2.17`
+- Release baseline: `1.2.17` mobile transport and self-update rollout
 
 ## Current Priorities
 
 Priority order for most work unless the user explicitly overrides it:
 
 1. Sync correctness and data safety
-2. Collaboration UX correctness
-3. Keep the AGENTS handoff layer current, especially backlog intent and product decisions
-4. Performance/scaling improvements only after correctness
+2. Autonomous recovery and cross-platform reliability
+3. Startup/resume speed and useful-work-first scheduling
+4. Calm, contextual sync/collaboration UX
+5. Keep the AGENTS handoff layer current, especially backlog intent and product decisions
+
+Current product framing:
+
+- Rolay is a general Obsidian synchronization tool with collaboration, not only a lecture-writing
+  tool.
+- Healthy solo sync should be almost invisible beyond a subtle room health mark.
+- Detail should appear automatically when collaboration, active work, degradation, or required action
+  makes it useful.
+- Android/mobile behavior is a first-class requirement, not an incidental consequence of
+  `"isDesktopOnly": false`.
 
 ## Stable Product Invariants
 
@@ -34,6 +45,11 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Local delete operations keep a short pending-delete guard so stale snapshots cannot resurrect files while multi-file delete operations are still settling.
 - Bulk duplicate cleanup must stay possible even while markdown preload/locked-state is stale. Remote/suppressed delete echoes and already-pending deletes must be ignored before protected-markdown delete restoration, and safe `entryVersion=0` suffix-copy markdown duplicates may bypass the locked-delete restore so their `delete_entry` can reach the server.
 - Authenticated REST/blob/SSE requests include `X-Rolay-Client: obsidian-plugin` and `X-Rolay-Client-Version`; keep this so the server can diagnose or reject stale clients if an old plugin build starts creating duplicate entries.
+- Normal sync and public plugin update discovery use `https://rolay.ru`; update discovery remains a
+  separate unauthenticated read-only surface.
+- An HTTPS authority must not return insecure `ws:` CRDT or `http:` blob fallback targets; the client
+  rejects them instead of downgrading.
+- Self-update may replace only `main.js`, `manifest.json`, and `styles.css` after complete size/hash/manifest verification. It must preserve `data.json`, logs, caches, room bindings, and vault content.
 - Persistent `rolay-sync.log` is intentionally short-lived: entries older than 48 hours are removed, and noisy files are capped to a compact recent tail.
 - Startup sync is deferred until after Obsidian workspace layout is ready; downloaded rooms then resume with a small stagger so auth/snapshot/preload work does not block the plugin loading screen.
 - Room Disconnect is a hard per-room pause: it stops room SSE/presence, cancels scheduled snapshot/background markdown work, aborts active binary transfers for that workspace, invalidates in-flight upload tokens, and ignores late snapshot/bootstrap/download results without affecting other connected rooms.
@@ -41,10 +57,87 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Remote markdown patches should preserve the local viewport.
 - Remote cursor rendering has extra stabilization against stale backward awareness offsets.
 - Room publication is private by default and public access is only through the separate server-root read-only site.
+- Quiet healthy-state presentation must not remove underlying presence, transfer state, or durable
+  diagnostics. It is a rendering/attention policy, not a protocol simplification.
+
+## Current Reliability And Experience Initiative
+
+Status: `IMPLEMENTING / DEVICE VERIFICATION`
+
+Product intent:
+
+- make healthy synchronization ambient and low-noise
+- recover from routine failures without manual buttons
+- reduce startup and requested-content latency
+- preserve clear contextual state when collaboration or real problems exist
+- establish verified Android/mobile parity
+
+Implemented in the current worktrees:
+
+- main plugin sync authority migrated to `https://rolay.ru`
+- strict server CORS allowlist for Obsidian app origins and sync/transfer headers
+- actual platform/SSE/blob transport diagnostics
+- immediate generation-safe SSE reconnect after online/mobile resume
+- mobile background CRDT presence cleanup and active-note rebind
+- lower mobile batch/chunk/download concurrency
+- updated WebSocket dependencies with zero remaining plugin `npm audit` findings
+
+Remaining risks before claiming mobile parity:
+
+- mobile lacks the preferred Electron/Node SSE and blob transports
+- SSE therefore uses browser streaming fetch, and blob transfer uses XHR/fetch fallbacks
+- actual Android origin, browser streaming behavior, CRDT WSS, app suspend/resume, network switching,
+  interrupted transfers, and updater reload still need real-device verification
+
+Production rollout `978f311` on 2026-07-28 confirmed that `https://rolay.ru/v1/auth/me` reaches the
+authenticated API (`401` without credentials), `app://obsidian.md` receives the required CORS and
+preflight headers, unknown origins receive no CORS permission, and
+`https://rolay.ru/v1/plugin-updates/latest` serves the verified current release. SSE/blob/WSS
+behavior on a real mobile client remains unverified.
+
+This is captured in:
+
+- [Ambient sync experience](context/ambient-sync-experience.md)
+- [Cross-platform reliability](ideas/candidate/cross-platform-reliability.md)
+- [Ambient sync indicators](ideas/candidate/ambient-sync-indicators.md)
+- [Mobile transport foundation task](tasks/mobile-transport-foundation.md)
 
 ## Currently Active / Unfinished Work
 
-### 1. Blob Transfer Trace Cleanup
+### 1. Mobile Transport Foundation
+
+Status: `IN_PROGRESS`
+
+Summary:
+
+- The first reliability/experience slice is a verified HTTPS/WSS and mobile lifecycle foundation.
+- HTTPS authority migration, server CORS, reconnect lifecycle, and diagnostics are implemented and
+  pass automated checks.
+- Plugin `1.2.17` release and real Android SSE/blob/CRDT/updater verification remain.
+- Do not make the healthy-state UI quieter until its underlying mobile health signals are trustworthy.
+
+Task file:
+
+- [AGENTS/tasks/mobile-transport-foundation.md](tasks/mobile-transport-foundation.md)
+
+### 2. Self Update
+
+Status: `IN_PROGRESS`
+
+Summary:
+
+- Rolay is moving from BRAT-managed updates to a server-authoritative self-updater.
+- The plugin must check without blocking startup or requiring authentication.
+- Stale clients get a persistent indicator and an explicit verified force-update action.
+- One final BRAT/manual release is still required to deliver the updater to existing installations.
+- Client/server code and automated validation are complete; the updater-enabled `1.2.17` release and
+  a live two-version Obsidian test remain.
+
+Task file:
+
+- [AGENTS/tasks/self-update.md](tasks/self-update.md)
+
+### 3. Blob Transfer Trace Cleanup
 
 Status: `TODO`, lower priority than sync correctness
 
@@ -58,19 +151,6 @@ Task file:
 
 - [AGENTS/tasks/blob-transfer-trace-cleanup.md](tasks/blob-transfer-trace-cleanup.md)
 
-### 2. Room Publication
-
-Status: `IN_PROGRESS`
-
-Summary:
-
-- Server now supports room-level publication and a public read-only site.
-- Plugin work includes payload model updates, publication endpoints, settings SSE support, and room-settings/admin UI.
-
-Task file:
-
-- [AGENTS/tasks/room-publication.md](tasks/room-publication.md)
-
 ## Idea Pipeline
 
 Potential future work now lives in:
@@ -80,7 +160,9 @@ Potential future work now lives in:
 Important current product decisions:
 
 - Multi-pane note presence is intentionally deferred for now. The value looks low for the current academic-group workflow and the bug surface looks non-trivial.
-- The next likely UX-facing work should come from the approved idea backlog rather than from broad new system rewrites.
+- The reliability/experience initiative now comes before unrelated collaboration features.
+- The first runtime slice should verify the HTTPS/WSS mobile transport foundation before visual
+  simplification makes health state quieter.
 
 ## Recently Completed Work
 

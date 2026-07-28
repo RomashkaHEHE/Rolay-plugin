@@ -1,8 +1,8 @@
 # Explicit Degraded Mode
 
 Status: CANDIDATE
-Priority: Medium
-Last reviewed: 2026-04-22
+Priority: High
+Last reviewed: 2026-07-28
 
 ## Idea
 
@@ -15,11 +15,15 @@ Expose a clearer "degraded mode" when sync is partially healthy but not fully no
 ## User Feedback
 
 - Extra indicators are welcome if they stay smart and unobtrusive.
+- Healthy operation should be almost invisible; degraded state should reuse the nearest existing
+  indicator and reveal detail contextually.
 
 ## Risks / Constraints
 
 - Must avoid panic-inducing false alarms.
 - Probably best built on top of existing indicators, not as a separate dashboard.
+- Distinguish transient automatic recovery from persistent degradation and action-required state.
+- Mobile needs tap/focus disclosure because hover-only detail is insufficient.
 
 ## Good Entry Points
 

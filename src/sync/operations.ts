@@ -67,6 +67,10 @@ export class OperationsQueue {
     this.chain = task.then(() => undefined, () => undefined);
     return task;
   }
+
+  async waitForIdle(): Promise<void> {
+    await this.chain;
+  }
 }
 
 export class RolayOperationError extends Error {

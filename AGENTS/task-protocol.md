@@ -37,6 +37,10 @@ Use one of:
 - `DONE`
 - `WATCH` for recently fixed areas that may still need regression observation
 
+Use `BLOCKED` only when implementation is waiting on an external dependency or decision. If an idea
+is rejected or deliberately deferred before implementation starts, keep that history in
+`AGENTS/ideas/rejected/` and remove any duplicate task file.
+
 ## Update Rules
 
 Agents should update task files:
@@ -99,6 +103,19 @@ When an active task is intentionally paused for product reasons, say so in both 
 
 - the task file
 - the relevant idea file or rejected/deferred backlog note
+
+If no implementation was started and the product decision is to reject/defer the idea, the idea
+file is sufficient; do not leave a `BLOCKED` task that looks actionable.
+
+## Task Completion
+
+When implementation is complete:
+
+1. Update canonical docs with stable behavior.
+2. Summarize the completion in [AGENTS/current-state.md](current-state.md).
+3. Mark the task `DONE` while it still carries useful handoff or verification context.
+4. Remove the task file once it no longer contains active operational memory; git history remains
+   the archive.
 
 ## Required End-Of-Turn Hygiene
 
