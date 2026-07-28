@@ -151,8 +151,8 @@ Summary:
 - Its original import nevertheless committed every binary revision twice because snapshot replay
   marked active uploads for rerun.
 - Server identical-revision protection is deployed in commit `c70836b` through successful workflow
-  run `30386327315`. Client active-worker suppression, committed-revision no-op, and failed-token
-  cleanup are prepared in plugin `1.2.21` and await release/runtime verification.
+  run `30386327315`. Matching client active-worker suppression, committed-revision no-op, and
+  failed-token cleanup are released in plugin `1.2.21`; controlled import verification remains.
 
 Task file:
 
@@ -221,6 +221,8 @@ These are important because future regressions will often land in these areas:
   check-now diagnostic; GitHub release assets and production update-proxy bytes were verified
 - Verified the complete automatic desktop `1.2.19 -> 1.2.20` installation and soft reload in the
   real vault `Main`, with room bindings, caches, and sync resume preserved
+- Released `1.2.21` with binary upload replay suppression; GitHub workflow `30386634559`, all five
+  assets, archive contents, and production updater bytes were verified
 
 ## First Places To Look By Task Type
 

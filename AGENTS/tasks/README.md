@@ -10,8 +10,8 @@ belongs in `README.md` and `docs/*`; product ideas that are not being implemente
   Verify HTTPS/WSS, browser SSE/blob fallbacks, lifecycle recovery, and updater behavior on real
   Android/mobile before simplifying healthy-state UI.
 - [Primary vault integrity audit](primary-vault-integrity-audit.md)
-  Local/server content integrity is proven; the server duplicate-commit guard is deployed and the
-  matching plugin `1.2.21` guard awaits release/runtime verification.
+  Local/server content integrity is proven; server and plugin `1.2.21` duplicate-commit guards are
+  live, with controlled runtime import verification still required.
 
 ## Queued
 

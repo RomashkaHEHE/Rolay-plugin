@@ -74,9 +74,18 @@ any manual refresh/check/install action.
 - 2026-07-28: Published plain-semver release `1.2.20` from commit `48418f7`. GitHub Actions run
   `30381604566` passed. The five release assets and four-file archive match the tag; the production
   endpoint reports `1.2.20` and serves exact bytes for all three updater files.
-- 2026-07-28: Canonical release SHA-256 values are
+- 2026-07-28: Published plain-semver release `1.2.21` from commit `535c1ee`. GitHub Actions run
+  `30386634559` passed. The five release assets and four-file archive match the tag; the production
+  endpoint reports `1.2.21` and serves exact bytes for all three updater files.
+- 2026-07-28: Canonical `1.2.20` release SHA-256 values are
   `0cdf9aa7b8f5fd91e50d86d70508145331a1a398d0284ca7a3351b76acc42483` (`main.js`),
   `0dbaea63b5567a68a979f8ddb3a93522b17631cebd8f9a98a1d895b334ca9301`
+  (`manifest.json`), and
+  `2e2bc5dc2ca433f2e7951d267f5fefbbf3ddb068cf563858d4ec32912215db22`
+  (`styles.css`).
+- 2026-07-28: Canonical `1.2.21` release SHA-256 values are
+  `21a33ea2359064e3d944a45bddbc605aafdd15fd5477d35af61544e78de127a4` (`main.js`),
+  `bb091480b7950c8c5a231f7cac81863d6ad1d27bee0c380dce72179e369b91b7`
   (`manifest.json`), and
   `2e2bc5dc2ca433f2e7951d267f5fefbbf3ddb068cf563858d4ec32912215db22`
   (`styles.css`).

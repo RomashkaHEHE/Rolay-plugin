@@ -57,6 +57,9 @@ client defect exposed by the workload.
   server integration tests pass.
 - 2026-07-28: Deployed the server guard from commit `c70836b`; GitHub Actions deploy run
   `30386327315` completed successfully and production `/ready` returned `200`.
+- 2026-07-28: Released plugin `1.2.21` from commit `535c1ee`; GitHub Actions run `30386634559`
+  passed, all standalone/archive assets match the tag, and the production updater reports
+  `1.2.21` with byte-verified runtime files.
 
 ## Open Questions / Risks
 
@@ -67,10 +70,9 @@ client defect exposed by the workload.
 
 ## Next Steps
 
-1. Release plugin `1.2.21`.
-2. Run a small controlled binary import and confirm one placeholder plus one blob commit per file,
+1. Run a small controlled binary import and confirm one placeholder plus one blob commit per file,
    with no rerun after `local-op` snapshots.
-3. Move this task to `WATCH` after rollout/runtime verification.
+2. Move this task to `WATCH` after runtime verification.
 
 ## Exit Criteria
 
