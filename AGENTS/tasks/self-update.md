@@ -11,8 +11,9 @@ refresh/check/install action.
 
 ## Current Understanding
 
-- `1.2.17` is the final BRAT/manual bootstrap release containing the updater. Clients older than
-  that cannot discover a feature they do not have.
+- `1.2.17` first delivered update discovery. Clients older than that cannot discover a feature they
+  do not have, while transitional `1.2.17`/`1.2.18` clients still need one explicit update to
+  automatic client `1.2.19`.
 - Update discovery must work before authentication.
 - The Rolay server is the update authority and proxies a strict allowlist of GitHub Release assets.
 - Only `main.js`, `manifest.json`, and `styles.css` may be replaced.
@@ -63,6 +64,10 @@ refresh/check/install action.
   endpoint successfully verifies and serves release `1.2.16`.
 - 2026-07-28: Published stable plain-semver release `1.2.17` from commit `2017faa`; workflow,
   manifest, standalone BRAT assets, and archive contents were verified.
+- 2026-07-28: Published plain-semver release `1.2.19` from commit `f3fc86a`. GitHub Actions run
+  `30353663231` passed; all five release assets, the zip contents, tag blobs, production proxy bytes,
+  sizes, and canonical SHA-256 values were verified. `https://rolay.ru/v1/plugin-updates/latest`
+  now reports `1.2.19`.
 
 ## Open Questions / Risks
 
@@ -73,9 +78,9 @@ refresh/check/install action.
 
 ## Next Steps
 
-1. Publish `1.2.19` and allow an existing `1.2.18` client to perform the final manual bootstrap
-   update; `1.2.18` still contains the old explicit installer.
-2. Publish a later test release and verify automatic discovery, safe-idle waiting, download,
+1. Move existing `1.2.17`/`1.2.18` clients to `1.2.19` once through their existing explicit updater
+   or BRAT.
+2. Publish `1.2.20` (or a later test release) and verify automatic discovery, safe-idle waiting, download,
    installation, retry, soft reload, and restart fallback in Obsidian.
 3. Mark this task `DONE` after the live two-version test.
 

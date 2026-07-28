@@ -119,7 +119,7 @@ Summary:
 - The first reliability/experience slice is a verified HTTPS/WSS and mobile lifecycle foundation.
 - HTTPS authority migration, server CORS, reconnect lifecycle, and diagnostics are implemented and
   pass automated checks.
-- Plugin `1.2.17` is released; real Android SSE/blob/CRDT/updater verification remains.
+- Plugin `1.2.19` is released; real Android SSE/blob/CRDT/updater verification remains.
 - Do not make the healthy-state UI quieter until its underlying mobile health signals are trustworthy.
 
 Task file:
@@ -136,10 +136,10 @@ Summary:
 - The plugin must check without blocking startup or requiring authentication.
 - Updater-enabled clients discover, verify, wait for a safe idle window, and install without user
   action. Normal update work stays invisible.
-- `1.2.17` is the final BRAT/manual bootstrap release that delivers the updater to existing
-  installations.
-- The automatic client flow is implemented; `1.2.19` release validation and a later live
-  two-version Obsidian update test remain.
+- `1.2.17` first delivered update discovery. Transitional `1.2.17`/`1.2.18` clients still need one
+  explicit update to `1.2.19`; old running code cannot retroactively install automatically.
+- Automatic client release `1.2.19`, GitHub assets/archive, and the production server proxy are
+  byte-verified. A later live `1.2.19 -> 1.2.20` Obsidian update test remains.
 
 Task file:
 
