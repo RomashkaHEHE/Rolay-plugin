@@ -23576,7 +23576,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       }
     }
   }
-  async queueBinaryWrite(workspaceId, serverPath, localContent, existingEntry) {
+  async queueBinaryWrite(workspaceId, serverPath, localContent, existingEntry, requestRerunIfActive = true) {
     const localPath = (0, import_obsidian10.normalizePath)(this.fileBridge.toLocalPath(workspaceId, serverPath) ?? serverPath);
     if (!this.isRoomSyncActive(workspaceId)) {
       this.recordLog(
@@ -23586,22 +23586,16 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       return;
     }
     if (this.binarySyncTokens.has(localPath)) {
-      this.pendingBinarySyncReruns.add(localPath);
-      this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
-      const existingTransfer = this.binaryTransferState.get(localPath);
-      if (existingTransfer?.kind === "upload") {
-        this.updateBinaryTransferState(localPath, {
-          rerunRequested: true
-        });
+      if (requestRerunIfActive) {
+        this.pendingBinarySyncReruns.add(localPath);
+        this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
+        const existingTransfer = this.binaryTransferState.get(localPath);
+        if (existingTransfer?.kind === "upload") {
+          this.updateBinaryTransferState(localPath, {
+            rerunRequested: true
+          });
+        }
       }
-      return;
-    }
-    const activeTransfer = this.binaryTransferState.get(localPath);
-    if (activeTransfer && activeTransfer.kind === "upload" && activeTransfer.status !== "done" && activeTransfer.status !== "failed" && this.binarySyncTokens.has(localPath)) {
-      this.updateBinaryTransferState(localPath, {
-        rerunRequested: true
-      });
-      this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? activeTransfer.entryId);
       return;
     }
     this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
@@ -23730,6 +23724,23 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       finalEntryId = entry.id;
       this.updatePendingBinaryWriteEntryId(desiredLocalPath, entry.id, desiredServerPath);
       if (!this.isBinarySyncTokenCurrent(desiredLocalPath, token)) {
+        return;
+      }
+      const committedHash = normalizeSha256Hash(entry.blob?.hash);
+      if (entry.blob && committedHash === hash && entry.blob.sizeBytes === sizeBytes && entry.blob.mimeType === mimeType && entry.mimeType === mimeType) {
+        this.persistBinaryCacheEntry(
+          entry.id,
+          desiredLocalPath,
+          hash,
+          sizeBytes,
+          entry.blob.mimeType || entry.mimeType || mimeType
+        );
+        await this.clearPendingBinaryWriteForLocalPath(desiredLocalPath, false);
+        this.clearBinaryTransferState(desiredLocalPath);
+        this.invalidateBinarySyncToken(desiredLocalPath);
+        this.traceBlob(
+          `[${workspaceId}] upload skipped entryId=${entry.id} localPath=${desiredLocalPath} hash=${hash} sizeBytes=${sizeBytes} mimeType=${mimeType} reason=committed-revision-match`
+        );
         return;
       }
       const existingTransfer = this.binaryTransferState.get(desiredLocalPath);
@@ -23992,19 +24003,31 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       if (this.isUnloading) {
         return;
       }
-      const transfer = this.binaryTransferState.get((0, import_obsidian10.normalizePath)(finalLocalPath));
       const normalizedFinalLocalPath = (0, import_obsidian10.normalizePath)(finalLocalPath);
-      const shouldRerun = Boolean(transfer?.rerunRequested) || this.pendingBinarySyncReruns.has(normalizedFinalLocalPath);
+      const tokenLocalPath = this.getBinarySyncPathForToken(token);
+      const rerunLocalPath = (0, import_obsidian10.normalizePath)(tokenLocalPath ?? normalizedFinalLocalPath);
+      const transfer = this.binaryTransferState.get(rerunLocalPath) ?? this.binaryTransferState.get(normalizedFinalLocalPath);
+      const shouldRerun = Boolean(transfer?.rerunRequested) || this.pendingBinarySyncReruns.has(rerunLocalPath) || this.pendingBinarySyncReruns.has(normalizedFinalLocalPath);
+      this.pendingBinarySyncReruns.delete(rerunLocalPath);
       this.pendingBinarySyncReruns.delete(normalizedFinalLocalPath);
+      if (tokenLocalPath && this.isBinarySyncTokenCurrent(tokenLocalPath, token)) {
+        this.invalidateBinarySyncToken(tokenLocalPath);
+      } else if (this.isBinarySyncTokenCurrent(normalizedFinalLocalPath, token)) {
+        this.invalidateBinarySyncToken(normalizedFinalLocalPath);
+      }
       if (!shouldRerun && transfer?.status !== "failed") {
-        this.clearBinaryTransferState(finalLocalPath);
+        this.clearBinaryTransferState(transfer?.localPath ?? rerunLocalPath);
       }
       if (shouldRerun) {
-        this.clearBinaryTransferState(finalLocalPath);
-        const currentFile = this.app.vault.getAbstractFileByPath(finalLocalPath);
-        const currentServerPath = this.resolvePendingMarkdownServerPath(workspaceId, finalLocalPath, fallbackServerPath);
-        const entry = this.data.pendingBinaryWrites[(0, import_obsidian10.normalizePath)(finalLocalPath)]?.entryId ? this.getRoomStore(workspaceId)?.getEntryById(
-          this.data.pendingBinaryWrites[(0, import_obsidian10.normalizePath)(finalLocalPath)]?.entryId ?? ""
+        this.clearBinaryTransferState(transfer?.localPath ?? rerunLocalPath);
+        const currentFile = this.app.vault.getAbstractFileByPath(rerunLocalPath);
+        const currentServerPath = this.resolvePendingMarkdownServerPath(
+          workspaceId,
+          rerunLocalPath,
+          fallbackServerPath
+        );
+        const entry = this.data.pendingBinaryWrites[rerunLocalPath]?.entryId ? this.getRoomStore(workspaceId)?.getEntryById(
+          this.data.pendingBinaryWrites[rerunLocalPath]?.entryId ?? ""
         ) ?? null : currentServerPath ? this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null : null;
         if (currentFile instanceof import_obsidian10.TFile && isBinaryPath(currentFile.path) && currentServerPath) {
           await this.queueBinaryWrite(
@@ -24111,7 +24134,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
           workspaceId,
           currentServerPath,
           await this.app.vault.readBinary(currentFile),
-          entry
+          entry,
+          false
         );
       } catch {
       }

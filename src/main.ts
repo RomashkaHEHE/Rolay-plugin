@@ -7248,7 +7248,8 @@ export default class RolayPlugin extends Plugin {
     workspaceId: string,
     serverPath: string,
     localContent: ArrayBuffer | null,
-    existingEntry: FileEntry | null
+    existingEntry: FileEntry | null,
+    requestRerunIfActive = true
   ): Promise<void> {
     const localPath = normalizePath(this.fileBridge.toLocalPath(workspaceId, serverPath) ?? serverPath);
     if (!this.isRoomSyncActive(workspaceId)) {
@@ -7261,29 +7262,16 @@ export default class RolayPlugin extends Plugin {
     }
 
     if (this.binarySyncTokens.has(localPath)) {
-      this.pendingBinarySyncReruns.add(localPath);
-      this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
-      const existingTransfer = this.binaryTransferState.get(localPath);
-      if (existingTransfer?.kind === "upload") {
-        this.updateBinaryTransferState(localPath, {
-          rerunRequested: true
-        });
+      if (requestRerunIfActive) {
+        this.pendingBinarySyncReruns.add(localPath);
+        this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
+        const existingTransfer = this.binaryTransferState.get(localPath);
+        if (existingTransfer?.kind === "upload") {
+          this.updateBinaryTransferState(localPath, {
+            rerunRequested: true
+          });
+        }
       }
-      return;
-    }
-
-    const activeTransfer = this.binaryTransferState.get(localPath);
-    if (
-      activeTransfer &&
-      activeTransfer.kind === "upload" &&
-      activeTransfer.status !== "done" &&
-      activeTransfer.status !== "failed" &&
-      this.binarySyncTokens.has(localPath)
-    ) {
-      this.updateBinaryTransferState(localPath, {
-        rerunRequested: true
-      });
-      this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? activeTransfer.entryId);
       return;
     }
 
@@ -7455,6 +7443,31 @@ export default class RolayPlugin extends Plugin {
       finalEntryId = entry.id;
       this.updatePendingBinaryWriteEntryId(desiredLocalPath, entry.id, desiredServerPath);
       if (!this.isBinarySyncTokenCurrent(desiredLocalPath, token)) {
+        return;
+      }
+
+      const committedHash = normalizeSha256Hash(entry.blob?.hash);
+      if (
+        entry.blob &&
+        committedHash === hash &&
+        entry.blob.sizeBytes === sizeBytes &&
+        entry.blob.mimeType === mimeType &&
+        entry.mimeType === mimeType
+      ) {
+        this.persistBinaryCacheEntry(
+          entry.id,
+          desiredLocalPath,
+          hash,
+          sizeBytes,
+          entry.blob.mimeType || entry.mimeType || mimeType
+        );
+        await this.clearPendingBinaryWriteForLocalPath(desiredLocalPath, false);
+        this.clearBinaryTransferState(desiredLocalPath);
+        this.invalidateBinarySyncToken(desiredLocalPath);
+        this.traceBlob(
+          `[${workspaceId}] upload skipped entryId=${entry.id} localPath=${desiredLocalPath} ` +
+          `hash=${hash} sizeBytes=${sizeBytes} mimeType=${mimeType} reason=committed-revision-match`
+        );
         return;
       }
 
@@ -7757,22 +7770,39 @@ export default class RolayPlugin extends Plugin {
         return;
       }
 
-      const transfer = this.binaryTransferState.get(normalizePath(finalLocalPath));
       const normalizedFinalLocalPath = normalizePath(finalLocalPath);
-      const shouldRerun = Boolean(transfer?.rerunRequested) || this.pendingBinarySyncReruns.has(normalizedFinalLocalPath);
+      const tokenLocalPath = this.getBinarySyncPathForToken(token);
+      const rerunLocalPath = normalizePath(tokenLocalPath ?? normalizedFinalLocalPath);
+      const transfer =
+        this.binaryTransferState.get(rerunLocalPath) ??
+        this.binaryTransferState.get(normalizedFinalLocalPath);
+      const shouldRerun =
+        Boolean(transfer?.rerunRequested) ||
+        this.pendingBinarySyncReruns.has(rerunLocalPath) ||
+        this.pendingBinarySyncReruns.has(normalizedFinalLocalPath);
+      this.pendingBinarySyncReruns.delete(rerunLocalPath);
       this.pendingBinarySyncReruns.delete(normalizedFinalLocalPath);
+      if (tokenLocalPath && this.isBinarySyncTokenCurrent(tokenLocalPath, token)) {
+        this.invalidateBinarySyncToken(tokenLocalPath);
+      } else if (this.isBinarySyncTokenCurrent(normalizedFinalLocalPath, token)) {
+        this.invalidateBinarySyncToken(normalizedFinalLocalPath);
+      }
       if (!shouldRerun && transfer?.status !== "failed") {
-        this.clearBinaryTransferState(finalLocalPath);
+        this.clearBinaryTransferState(transfer?.localPath ?? rerunLocalPath);
       }
 
       if (shouldRerun) {
-        this.clearBinaryTransferState(finalLocalPath);
-        const currentFile = this.app.vault.getAbstractFileByPath(finalLocalPath);
-        const currentServerPath = this.resolvePendingMarkdownServerPath(workspaceId, finalLocalPath, fallbackServerPath);
+        this.clearBinaryTransferState(transfer?.localPath ?? rerunLocalPath);
+        const currentFile = this.app.vault.getAbstractFileByPath(rerunLocalPath);
+        const currentServerPath = this.resolvePendingMarkdownServerPath(
+          workspaceId,
+          rerunLocalPath,
+          fallbackServerPath
+        );
         const entry =
-          this.data.pendingBinaryWrites[normalizePath(finalLocalPath)]?.entryId
+          this.data.pendingBinaryWrites[rerunLocalPath]?.entryId
             ? this.getRoomStore(workspaceId)?.getEntryById(
-                this.data.pendingBinaryWrites[normalizePath(finalLocalPath)]?.entryId ?? ""
+                this.data.pendingBinaryWrites[rerunLocalPath]?.entryId ?? ""
               ) ?? null
             : currentServerPath
               ? this.getRoomStore(workspaceId)?.getEntryByPath(currentServerPath) ?? null
@@ -7908,7 +7938,8 @@ export default class RolayPlugin extends Plugin {
           workspaceId,
           currentServerPath,
           await this.app.vault.readBinary(currentFile),
-          entry
+          entry,
+          false
         );
       } catch {
         // Keep the pending binary write registered for the next room refresh/connect.

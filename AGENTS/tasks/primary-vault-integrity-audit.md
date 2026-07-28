@@ -22,6 +22,11 @@ client defect exposed by the workload.
   matches the previous cached state.
 - The audit exposed a separate performance defect: the full state of every closed Markdown note was
   downloaded about every seven seconds even when no state changed.
+- A later local-log audit exposed a binary idempotency defect in the same import: all 34 binary
+  entries received two identical `commit_blob_revision` operations. Paths and bytes stayed correct,
+  but the room cursor advanced by 68 blob commits and every binary entry reached version `2`.
+- Root cause: snapshot reconciliation replayed durable pending writes while their original upload
+  workers were still active, and the shared queue interpreted that replay as a new local edit.
 
 ## Relevant Files
 
@@ -40,6 +45,18 @@ client defect exposed by the workload.
 - 2026-07-28: Changed post-snapshot fallback settling from 1.2 seconds to 15 seconds, steady
   closed-note reconciliation from 5 seconds to 60 seconds, and stopped counting unchanged files as
   locally hydrated writes.
+- 2026-07-28: Re-audited the installed `1.2.20` state. The production tree has exactly 179 active
+  entries with no duplicate/missing/extra paths; all 113 Markdown texts and normalized Yjs states
+  match server, cache, and disk; all 34 binary files match server and cache by size and SHA-256; all
+  pending queues and transfer records are empty.
+- 2026-07-28: Prepared plugin `1.2.21`: made pending-write reconciliation passive for a path with an
+  active upload, added a committed `hash + size + MIME` client no-op, and guaranteed worker tokens
+  are released after failure so later reconciliation can retry.
+- 2026-07-28: Added the server companion guard: an identical blob revision with valid preconditions
+  returns `applied` without another version increment or SSE event. Plugin check/build and all 34
+  server integration tests pass.
+- 2026-07-28: Deployed the server guard from commit `c70836b`; GitHub Actions deploy run
+  `30386327315` completed successfully and production `/ready` returned `200`.
 
 ## Open Questions / Risks
 
@@ -50,9 +67,10 @@ client defect exposed by the workload.
 
 ## Next Steps
 
-1. Run typecheck/build and inspect the generated bundle.
-2. Observe a runtime build long enough to confirm the tight no-op refresh loop is gone.
-3. Move this task to `WATCH` after release/runtime verification.
+1. Release plugin `1.2.21`.
+2. Run a small controlled binary import and confirm one placeholder plus one blob commit per file,
+   with no rerun after `local-op` snapshots.
+3. Move this task to `WATCH` after rollout/runtime verification.
 
 ## Exit Criteria
 

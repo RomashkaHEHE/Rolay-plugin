@@ -1,6 +1,6 @@
 # Self Update
 
-Status: IN_PROGRESS
+Status: DONE
 Priority: High
 Last updated: 2026-07-28
 
@@ -80,21 +80,23 @@ any manual refresh/check/install action.
   (`manifest.json`), and
   `2e2bc5dc2ca433f2e7951d267f5fefbbf3ddb068cf563858d4ec32912215db22`
   (`styles.css`).
+- 2026-07-28: The desktop vault `Main` provided the live two-version proof. Rolay `1.2.19`
+  discovered `1.2.20`, downloaded and verified it, installed it automatically, performed a
+  successful soft reload, preserved the room binding and caches, then resumed the 179-entry room
+  and its 113-document Markdown preload without user action.
 
 ## Open Questions / Risks
 
-- Obsidian's programmatic plugin reload API is internal and may differ by version. Installation must remain successful even when reload is unavailable.
-- Reload must not discard local state. Persist state before replacement and let the normal plugin unload lifecycle stop streams/transfers.
-- A live two-version Obsidian update still needs to confirm the automatic safe-idle install and
-  internal soft-reload path. Restart fallback is already implemented.
+- Obsidian's programmatic plugin reload API is internal and may differ by version. The desktop path
+  is verified; unsupported environments must continue to use the explicit restart fallback.
+- Mobile update installation/reload remains part of the mobile transport task, not a blocker for
+  the completed desktop self-update foundation.
 
-## Next Steps
+## Follow-up
 
-1. Move existing `1.2.17`/`1.2.18` clients to `1.2.19` once through their existing explicit updater
-   or BRAT.
-2. Verify automatic `1.2.19 -> 1.2.20` discovery, safe-idle waiting, download, installation, retry,
-   soft reload, and restart fallback in Obsidian.
-3. Mark this task `DONE` after the live two-version test.
+1. Move any remaining `1.2.17`/`1.2.18` clients to `1.2.19` once through their existing explicit
+   updater or BRAT.
+2. Record mobile reload/restart-fallback evidence in the mobile transport task.
 
 ## Exit Criteria
 

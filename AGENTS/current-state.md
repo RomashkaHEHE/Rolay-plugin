@@ -4,8 +4,8 @@ Last updated: 2026-07-28
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.20`
-- Release baseline: `1.2.20` mobile request compatibility and optional immediate update check
+- Plugin version: `1.2.21`
+- Release baseline: `1.2.21` binary upload replay suppression and identical-revision no-op
 
 ## Current Priorities
 
@@ -59,6 +59,9 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Startup sync is deferred until after Obsidian workspace layout is ready; downloaded rooms then resume with a small stagger so auth/snapshot/preload work does not block the plugin loading screen.
 - Room Disconnect is a hard per-room pause: it stops room SSE/presence, cancels scheduled snapshot/background markdown work, aborts active binary transfers for that workspace, invalidates in-flight upload tokens, and ignores late snapshot/bootstrap/download results without affecting other connected rooms.
 - Disconnected/stopped rooms must not persist new markdown/binary create replay records from Obsidian vault `create` events. Existing remote files can otherwise be misclassified as local creates on startup/reconnect, causing runaway `(1)`, `(2)`, ... duplicates.
+- Binary pending-write reconciliation must not request a rerun for an upload worker that is already
+  active. Publishing the same committed hash, size, and MIME type is a client no-op, and the server
+  must also treat an identical revision as idempotent after validating preconditions.
 - Remote markdown patches should preserve the local viewport.
 - Remote cursor rendering has extra stabilization against stale backward awareness offsets.
 - Full-room closed-Markdown reconciliation is a safety fallback, not a hot poll. Snapshots hydrate
@@ -137,24 +140,23 @@ Task file:
 
 - [AGENTS/tasks/mobile-transport-foundation.md](tasks/mobile-transport-foundation.md)
 
-### 2. Self Update
+### 2. Primary Vault Integrity And Binary Idempotency
 
 Status: `IN_PROGRESS`
 
 Summary:
 
-- Rolay is moving from BRAT-managed updates to a server-authoritative self-updater.
-- The plugin must check without blocking startup or requiring authentication.
-- Updater-enabled clients discover, verify, wait for a safe idle window, and install without user
-  action. Normal update work stays invisible.
-- `1.2.17` first delivered update discovery. Transitional `1.2.17`/`1.2.18` clients still need one
-  explicit update to `1.2.19`; old running code cannot retroactively install automatically.
-- Automatic client release `1.2.20`, GitHub assets/archive, and the production server proxy are
-  byte-verified. The live `1.2.19 -> 1.2.20` Obsidian update and reload test remains.
+- The real room `main` is content-clean: 179 server/local paths, 113 Markdown Yjs texts, and 34
+  binary SHA-256 values match exactly, with no pending operation or transfer state.
+- Its original import nevertheless committed every binary revision twice because snapshot replay
+  marked active uploads for rerun.
+- Server identical-revision protection is deployed in commit `c70836b` through successful workflow
+  run `30386327315`. Client active-worker suppression, committed-revision no-op, and failed-token
+  cleanup are prepared in plugin `1.2.21` and await release/runtime verification.
 
 Task file:
 
-- [AGENTS/tasks/self-update.md](tasks/self-update.md)
+- [AGENTS/tasks/primary-vault-integrity-audit.md](tasks/primary-vault-integrity-audit.md)
 
 ### 3. Blob Transfer Trace Cleanup
 
@@ -217,6 +219,8 @@ These are important because future regressions will often land in these areas:
   connectivity-aware retry/backoff, and exception-only restart/error UI
 - Released `1.2.20` with Android bodyless-request compatibility and the optional same-pipeline
   check-now diagnostic; GitHub release assets and production update-proxy bytes were verified
+- Verified the complete automatic desktop `1.2.19 -> 1.2.20` installation and soft reload in the
+  real vault `Main`, with room bindings, caches, and sync resume preserved
 
 ## First Places To Look By Task Type
 
