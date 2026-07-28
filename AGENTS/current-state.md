@@ -4,8 +4,8 @@ Last updated: 2026-07-28
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.17`
-- Release baseline: `1.2.17` mobile transport and self-update rollout
+- Plugin version: `1.2.18`
+- Release baseline: `1.2.18` primary-vault integrity and closed-note refresh fix
 
 ## Current Priorities
 
@@ -56,6 +56,9 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Disconnected/stopped rooms must not persist new markdown/binary create replay records from Obsidian vault `create` events. Existing remote files can otherwise be misclassified as local creates on startup/reconnect, causing runaway `(1)`, `(2)`, ... duplicates.
 - Remote markdown patches should preserve the local viewport.
 - Remote cursor rendering has extra stabilization against stale backward awareness offsets.
+- Full-room closed-Markdown reconciliation is a safety fallback, not a hot poll. Snapshots hydrate
+  immediately, open notes use realtime WSS, snapshot bursts coalesce for 15 seconds, and the quiet
+  fallback runs once per minute.
 - Room publication is private by default and public access is only through the separate server-root read-only site.
 - Quiet healthy-state presentation must not remove underlying presence, transfer state, or durable
   diagnostics. It is a rendering/attention policy, not a protocol simplification.
@@ -192,6 +195,9 @@ These are important because future regressions will often land in these areas:
 - Hardened bulk duplicate deletion against protected-markdown restore races and longer stale-snapshot windows
 - Added client/version headers on authenticated API, blob, and SSE traffic for stale-client diagnostics/enforcement
 - Switched explorer transfer progress to minimal-visible-parent roll-up so expanded folders do not keep noisy/stale red percentage badges when their visible children are already normal; completed markdown siblings contribute to a collapsed folder percentage only when the same folder still contains active incomplete work
+- Verified a primary-vault import path-by-path and byte-by-byte against production, then reduced
+  no-op full-room Markdown polling from a tight five-second loop to a burst-coalesced one-minute
+  fallback
 
 ## First Places To Look By Task Type
 

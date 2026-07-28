@@ -233,8 +233,10 @@ export default class RolayPlugin extends Plugin {
   private static readonly PENDING_CREATE_CONFIRMATION_TTL_MS = 60_000;
   private static readonly RECENT_REMOTE_PATH_TTL_MS = 30_000;
   private static readonly REMOTE_MARKDOWN_SETTLE_TTL_MS = 15_000;
-  private static readonly ROOM_MARKDOWN_REFRESH_INTERVAL_MS = 5_000;
-  private static readonly ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS = 1_200;
+  // Snapshots already hydrate the room and open notes use realtime WSS. Keep the
+  // full-room closed-note fallback calm so large vaults are not downloaded in a tight loop.
+  private static readonly ROOM_MARKDOWN_REFRESH_INTERVAL_MS = 60_000;
+  private static readonly ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS = 15_000;
   private static readonly MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS =
     Platform.isMobileApp ? 4 : 8;
   private static readonly MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES =
@@ -6104,7 +6106,7 @@ export default class RolayPlugin extends Plugin {
     const nextText = decodeMarkdownTextState(nextState);
     const currentText = await this.app.vault.cachedRead(localFile);
     if (currentText === nextText) {
-      return true;
+      return false;
     }
 
     const previousText = previousState ? decodeMarkdownTextState(previousState) : null;

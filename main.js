@@ -22585,7 +22585,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian11.Plugin {
     const nextText = decodeMarkdownTextState(nextState);
     const currentText = await this.app.vault.cachedRead(localFile);
     if (currentText === nextText) {
-      return true;
+      return false;
     }
     const previousText = previousState ? decodeMarkdownTextState(previousState) : null;
     const safeToOverwrite = currentText.length === 0 || previousText !== null && currentText === previousText;
@@ -24502,8 +24502,10 @@ _RolayPlugin.LOG_FILE_NAME = "rolay-sync.log";
 _RolayPlugin.PENDING_CREATE_CONFIRMATION_TTL_MS = 6e4;
 _RolayPlugin.RECENT_REMOTE_PATH_TTL_MS = 3e4;
 _RolayPlugin.REMOTE_MARKDOWN_SETTLE_TTL_MS = 15e3;
-_RolayPlugin.ROOM_MARKDOWN_REFRESH_INTERVAL_MS = 5e3;
-_RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS = 1200;
+// Snapshots already hydrate the room and open notes use realtime WSS. Keep the
+// full-room closed-note fallback calm so large vaults are not downloaded in a tight loop.
+_RolayPlugin.ROOM_MARKDOWN_REFRESH_INTERVAL_MS = 6e4;
+_RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS = 15e3;
 _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_MAX_DOCS = import_obsidian11.Platform.isMobileApp ? 4 : 8;
 _RolayPlugin.MARKDOWN_BOOTSTRAP_BATCH_TARGET_ENCODED_BYTES = (import_obsidian11.Platform.isMobileApp ? 256 : 512) * 1024;
 _RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY = import_obsidian11.Platform.isMobileApp ? 1 : 2;

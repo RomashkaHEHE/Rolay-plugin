@@ -7,11 +7,14 @@ belongs in `README.md` and `docs/*`; product ideas that are not being implemente
 ## Active
 
 - [Self update](self-update.md)
-  Server-authoritative update discovery and verified force-update are implemented; deployment and a
-  live two-version Obsidian test remain.
+  Server-authoritative update discovery and verified force-update are deployed; a live two-version
+  Obsidian test remains.
 - [Mobile transport foundation](mobile-transport-foundation.md)
   Verify HTTPS/WSS, browser SSE/blob fallbacks, lifecycle recovery, and updater behavior on real
   Android/mobile before simplifying healthy-state UI.
+- [Primary vault integrity audit](primary-vault-integrity-audit.md)
+  Verify a real full-vault import against production and remove any reliability/performance defect
+  exposed by the audit.
 
 ## Queued
 

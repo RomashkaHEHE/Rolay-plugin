@@ -231,6 +231,9 @@ Current expectation:
 - if the cache cap is too small, downloaded notes are pruned and later treated as still loading
 - red markdown explorer state should only mean the note is genuinely missing/unhydrated/protected, not that its cached bootstrap state was evicted
 - folder percentages during markdown preload should aggregate the whole active bootstrap target set; if folders stay at `0%` until they disappear, check `addMarkdownBootstrapVisibleProgress` and exact-vs-ancestor transfer badge aggregation
+- a quiet connected room must not log a full `Refreshed N/N closed markdown document(s)` pass every
+  few seconds. Snapshot bursts settle after 15 seconds and the steady fallback runs once per minute;
+  open notes remain realtime through WSS.
 
 ### Settings UI looks stale
 

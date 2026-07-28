@@ -186,6 +186,9 @@ Tag note:
 - The default `syncRoot` is the vault root (`/` in the settings UI), so newly installed rooms appear directly in the vault unless the user chooses a subfolder.
 - After each authoritative room snapshot, the plugin first fetches byte metadata for room markdown bootstrap and then downloads Yjs state in HTTP batches. This keeps offline-safe cache bootstrap separate from live websocket sync and gives the UI a more honest byte-based preload progress.
 - After each room connect/snapshot, the plugin preloads markdown content for the whole downloaded room in the background instead of waiting for each note to be opened one by one.
+- Open Markdown notes stay realtime through WSS. Closed notes use a burst-coalesced post-snapshot
+  settle plus a one-minute fallback reconciliation, so large rooms remain current without
+  continuously downloading every Yjs document.
 - On Obsidian startup, auth recovery, room resume, snapshots, and preload are deferred until after the workspace layout is ready, then downloaded rooms resume with a small stagger. Manual Connect/Install still runs immediately.
 - On Android/mobile, REST uses Obsidian `requestUrl`, SSE uses browser streaming `fetch`, binary
   transfer uses XHR/fetch, and Markdown realtime uses WSS. The server exposes a narrow CORS
