@@ -60,6 +60,9 @@ correctness.
 - 2026-07-29: `npm run check`, all 8 tests, production build, `npm audit --omit=dev`, generated
   bundle inspection, and `git diff --check` pass.
 - 2026-07-29: Prepared plugin version `1.2.22` for release.
+- 2026-07-29: Published plain-semver release `1.2.22` from commit `d76c84a`. GitHub Actions run
+  `30453648991` passed, all five release assets and the four-file archive match the tag, and the
+  production updater reports `1.2.22` with byte-verified runtime files.
 
 ## Open Questions / Risks
 
@@ -73,7 +76,8 @@ correctness.
 
 ## Next Steps
 
-1. Install the next build in a test vault and perform one binary create plus rapid renames.
+1. Let the automatic updater install `1.2.22` in a test vault, then perform one binary create plus
+   rapid renames.
 2. Confirm each server cursor is fetched at most once and binary-only snapshots log skipped
    room-wide Markdown bootstrap rather than `Preloading 113 markdown document(s)`.
 3. During a deliberately slowed bootstrap, create, rename, and delete a Markdown note and verify the

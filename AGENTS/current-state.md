@@ -251,6 +251,9 @@ These are important because future regressions will often land in these areas:
   assets, archive contents, and production updater bytes were verified
 - Verified a real post-release binary upload creates exactly one blob revision even when an
   event-stream snapshot observes its active pending write
+- Released `1.2.22` with cursor-aware snapshot coalescing and conditional Markdown preload; GitHub
+  workflow `30453648991`, all five assets, archive contents, and production updater bytes were
+  verified
 
 ## First Places To Look By Task Type
 
