@@ -9,9 +9,15 @@ belongs in `README.md` and `docs/*`; product ideas that are not being implemente
 - [Mobile transport foundation](mobile-transport-foundation.md)
   Verify HTTPS/WSS, browser SSE/blob fallbacks, lifecycle recovery, and updater behavior on real
   Android/mobile before simplifying healthy-state UI.
+
+## Watch
+
+- [Snapshot refresh coalescing](snapshot-refresh-coalescing.md)
+  Cursor-aware local-op/SSE deduplication and safe binary-only Markdown-bootstrap skipping are
+  implemented and automated; verify the traffic reduction in a real installed build.
 - [Primary vault integrity audit](primary-vault-integrity-audit.md)
-  Local/server content integrity is proven; server and plugin `1.2.21` duplicate-commit guards are
-  live, with controlled runtime import verification still required.
+  Local/server content integrity and the real `1.2.21` single-commit binary path are verified;
+  continue regression observation without treating it as unfinished implementation.
 
 ## Queued
 

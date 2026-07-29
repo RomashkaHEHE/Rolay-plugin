@@ -1,8 +1,8 @@
 # Primary Vault Integrity Audit
 
-Status: IN_PROGRESS
+Status: WATCH
 Priority: High
-Last updated: 2026-07-28
+Last updated: 2026-07-29
 
 ## Goal
 
@@ -27,6 +27,8 @@ client defect exposed by the workload.
   but the room cursor advanced by 68 blob commits and every binary entry reached version `2`.
 - Root cause: snapshot reconciliation replayed durable pending writes while their original upload
   workers were still active, and the shared queue interpreted that replay as a new local edit.
+- Post-release runtime evidence confirms the fix: an active pending-write replay was observed during
+  a real PNG upload but did not produce a second upload ticket, blob commit, or revision.
 
 ## Relevant Files
 
@@ -60,6 +62,12 @@ client defect exposed by the workload.
 - 2026-07-28: Released plugin `1.2.21` from commit `535c1ee`; GitHub Actions run `30386634559`
   passed, all standalone/archive assets match the tag, and the production updater reports
   `1.2.21` with byte-verified runtime files.
+- 2026-07-29: Verified a real 1,138,269-byte PNG upload on installed `1.2.21`. Event `248` created
+  the placeholder, event `249` committed the blob once, and events `250-251` were the user's two
+  renames. The server entry reached version `3` from exactly those three mutations; pending
+  Markdown/binary queues and active transfers all converged to zero.
+- 2026-07-29: Rechecked a Markdown note protected as locally diverged during the same event burst.
+  Local disk, persisted Yjs cache, and production Yjs state all match at 1,455 characters.
 
 ## Open Questions / Risks
 
@@ -67,12 +75,14 @@ client defect exposed by the workload.
   Rolay now provides a verified second copy, but it should not be treated as the only backup.
 - The one-minute closed-note fallback preserves eventual disk convergence. Open notes remain
   realtime, and opening a stale closed note still joins the authoritative CRDT session.
+- Cursor-aware snapshot coalescing and conditional binary-only bootstrap skipping are now
+  implemented under [snapshot-refresh-coalescing.md](snapshot-refresh-coalescing.md). Keep runtime
+  observation open until a real installed build proves the nine-pass burst is gone.
 
 ## Next Steps
 
-1. Run a small controlled binary import and confirm one placeholder plus one blob commit per file,
-   with no rerun after `local-op` snapshots.
-2. Move this task to `WATCH` after runtime verification.
+1. Keep watching future binary uploads for duplicate upload-ticket or commit sequences.
+2. Verify the snapshot/bootstrap coalescing work in a real installed build.
 
 ## Exit Criteria
 

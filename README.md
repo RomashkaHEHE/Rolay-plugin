@@ -100,6 +100,12 @@ Type-check:
 npm run check
 ```
 
+Run focused regression tests:
+
+```bash
+npm test
+```
+
 Build once:
 
 ```bash
@@ -164,6 +170,7 @@ The workflow then:
 
 - installs dependencies
 - runs `npm run check`
+- runs `npm test`
 - runs `npm run build`
 - uploads `manifest.json`, `main.js`, `styles.css`, `versions.json`
 - uploads a release zip for convenience
@@ -190,8 +197,14 @@ Tag note:
 - Downloaded rooms sync in parallel: each downloaded room maintains its own snapshot cursor and SSE stream.
 - Local room folders are projected under `syncRoot/<room-folder-name>/...`.
 - The default `syncRoot` is the vault root (`/` in the settings UI), so newly installed rooms appear directly in the vault unless the user chooses a subfolder.
-- After each authoritative room snapshot, the plugin first fetches byte metadata for room markdown bootstrap and then downloads Yjs state in HTTP batches. This keeps offline-safe cache bootstrap separate from live websocket sync and gives the UI a more honest byte-based preload progress.
-- After each room connect/snapshot, the plugin preloads markdown content for the whole downloaded room in the background instead of waiting for each note to be opened one by one.
+- Cold-start, recovery, and Markdown-tree-changing snapshots fetch byte metadata and then download
+  Yjs state in HTTP batches. Tree/blob snapshots with an unchanged Markdown `entryId -> path` set
+  skip the room-wide bootstrap only when the hydrated local cache is healthy.
+- Applied local tree operations and their SSE echoes are coalesced by server event cursor. A
+  snapshot that already covers that cursor is not fetched a second time; failed operations,
+  startup, lifecycle, recovery, and priority-open refreshes remain unconditional.
+- Room connect and required snapshots preload markdown content for the whole downloaded room in the
+  background instead of waiting for each note to be opened one by one.
 - Open Markdown notes stay realtime through WSS. Closed notes use a burst-coalesced post-snapshot
   settle plus a one-minute fallback reconciliation, so large rooms remain current without
   continuously downloading every Yjs document.

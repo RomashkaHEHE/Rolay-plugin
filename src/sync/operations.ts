@@ -1,4 +1,4 @@
-import { RolayApiClient, type ApiResponseMeta } from "../api/client";
+import type { ApiResponseMeta, RolayApiClient } from "../api/client";
 import type {
   BatchOperationsResponse,
   OperationResult,
@@ -10,7 +10,7 @@ interface OperationsQueueConfig {
   getDeviceId: () => string;
   log: (message: string) => void;
   onTrace?: (workspaceId: string, operation: TreeOperation, reason: string, meta: ApiResponseMeta) => void;
-  onAfterApply?: (workspaceId: string, reason: string) => Promise<void> | void;
+  onAfterApply?: (workspaceId: string, reason: string, eventCursor: number | null) => Promise<void> | void;
 }
 
 export class OperationsQueue {
@@ -18,7 +18,11 @@ export class OperationsQueue {
   private readonly getDeviceId: () => string;
   private readonly log: (message: string) => void;
   private readonly onTrace?: (workspaceId: string, operation: TreeOperation, reason: string, meta: ApiResponseMeta) => void;
-  private readonly onAfterApply?: (workspaceId: string, reason: string) => Promise<void> | void;
+  private readonly onAfterApply?: (
+    workspaceId: string,
+    reason: string,
+    eventCursor: number | null
+  ) => Promise<void> | void;
   private chain: Promise<void> = Promise.resolve();
   private pendingCount = 0;
 
@@ -56,7 +60,15 @@ export class OperationsQueue {
         this.log(describeResult(result));
       }
 
-      await this.onAfterApply?.(workspaceId, reason);
+      const eventCursor = response.results.reduce<number | null>((highestCursor, result) => {
+        if (typeof result.eventSeq !== "number") {
+          return highestCursor;
+        }
+        return highestCursor === null ? result.eventSeq : Math.max(highestCursor, result.eventSeq);
+      }, null);
+      if (failed || eventCursor !== null) {
+        await this.onAfterApply?.(workspaceId, reason, failed ? null : eventCursor);
+      }
 
       if (failed) {
         throw new RolayOperationError(workspaceId, opWithId, failed);

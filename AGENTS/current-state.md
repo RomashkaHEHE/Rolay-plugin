@@ -1,11 +1,11 @@
 # Current State
 
-Last updated: 2026-07-28
+Last updated: 2026-07-29
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.21`
-- Release baseline: `1.2.21` binary upload replay suppression and identical-revision no-op
+- Plugin version: `1.2.22`
+- Release baseline: `1.2.22` cursor-aware snapshot coalescing and safe conditional Markdown preload
 
 ## Current Priorities
 
@@ -67,6 +67,11 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Full-room closed-Markdown reconciliation is a safety fallback, not a hot poll. Snapshots hydrate
   immediately, open notes use realtime WSS, snapshot bursts coalesce for 15 seconds, and the quiet
   fallback runs once per minute.
+- Local tree operations and their SSE echoes carry the server cursor into snapshot scheduling.
+  Covered cursors are discarded, and cursor-backed event/successful-local-op snapshots skip
+  room-wide Markdown bootstrap only when the active Markdown `entryId -> path` set and hydrated
+  cache are healthy. Failed operations and forced startup/lifecycle/recovery paths remain
+  unconditional.
 - Room publication is private by default and public access is only through the separate server-root read-only site.
 - Quiet healthy-state presentation must not remove underlying presence, transfer state, or durable
   diagnostics. It is a rendering/attention policy, not a protocol simplification.
@@ -142,7 +147,7 @@ Task file:
 
 ### 2. Primary Vault Integrity And Binary Idempotency
 
-Status: `IN_PROGRESS`
+Status: `WATCH`
 
 Summary:
 
@@ -152,13 +157,34 @@ Summary:
   marked active uploads for rerun.
 - Server identical-revision protection is deployed in commit `c70836b` through successful workflow
   run `30386327315`. Matching client active-worker suppression, committed-revision no-op, and
-  failed-token cleanup are released in plugin `1.2.21`; controlled import verification remains.
+  failed-token cleanup are released in plugin `1.2.21`.
+- A real `1.2.21` PNG upload produced one placeholder event (`248`), one blob commit (`249`), and
+  only the two intentional rename events (`250-251`). Active-upload pending reconciliation did not
+  start a second transfer; all durable queues converged to zero.
 
 Task file:
 
 - [AGENTS/tasks/primary-vault-integrity-audit.md](tasks/primary-vault-integrity-audit.md)
 
-### 3. Blob Transfer Trace Cleanup
+### 3. Snapshot Refresh Coalescing
+
+Status: `WATCH`
+
+Summary:
+
+- A real PNG create plus two renames exposed nine complete 113-document bootstrap passes in roughly
+  25 seconds.
+- Cursor-aware scheduled/in-flight request merging now removes local-op/SSE duplicate snapshots.
+- Binary-only snapshots preserve tree/blob reconciliation but skip unchanged healthy Markdown
+  bootstrap.
+- Exact active-bootstrap target tracking keeps optimistic Markdown create/delete/rename races safe.
+- Eight focused tests pass; real installed-vault timing and convergence still need verification.
+
+Task file:
+
+- [AGENTS/tasks/snapshot-refresh-coalescing.md](tasks/snapshot-refresh-coalescing.md)
+
+### 4. Blob Transfer Trace Cleanup
 
 Status: `TODO`, lower priority than sync correctness
 
@@ -223,6 +249,8 @@ These are important because future regressions will often land in these areas:
   real vault `Main`, with room bindings, caches, and sync resume preserved
 - Released `1.2.21` with binary upload replay suppression; GitHub workflow `30386634559`, all five
   assets, archive contents, and production updater bytes were verified
+- Verified a real post-release binary upload creates exactly one blob revision even when an
+  event-stream snapshot observes its active pending write
 
 ## First Places To Look By Task Type
 

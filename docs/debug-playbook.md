@@ -238,6 +238,32 @@ Current expectation:
   few seconds. Snapshot bursts settle after 15 seconds and the steady fallback runs once per minute;
   open notes remain realtime through WSS.
 
+### One tree/blob action repeatedly preloads every Markdown note
+
+Check:
+
+1. matching `ops/info`, `sse/info`, `tree/info`, and `crdt/info` lines by event cursor
+2. whether one local operation and its SSE echo produced more than one fetched snapshot
+3. whether a binary-only snapshot logged a skipped room-wide Markdown bootstrap
+4. [src/sync/snapshot-refresh.ts](../src/sync/snapshot-refresh.ts):
+   - `mergeSnapshotRefreshRequests`
+   - `isSnapshotRefreshCovered`
+   - `doesActiveMarkdownTreeMatch`
+5. [src/main.ts](../src/main.ts):
+   - `runRoomSnapshotRefresh`
+   - `shouldBootstrapMarkdownAfterSnapshot`
+   - `bootstrapRoomMarkdownCache`
+
+Current expectation:
+
+- local operation and SSE requests carrying the same server cursor coalesce into one snapshot
+- an in-flight snapshot drops queued cursors that its returned snapshot already covers
+- binary-only tree changes do not restart a healthy room-wide Markdown bootstrap
+- startup, lifecycle, priority-open, recovery, Markdown create/delete/rename, cache gaps, and
+  protected/failed preload state still force or request the required bootstrap
+- an active bootstrap records its exact Markdown `entryId -> path` target, so an optimistic
+  Markdown mutation during loading cannot be mistaken for already covered work
+
 ### Settings UI looks stale
 
 Check:

@@ -398,4 +398,9 @@ Supported server operation types:
 - Device label and startup auto-connect behavior are fixed by the plugin instead of being user-configurable.
 - Markdown bootstrap is kept separate from `/tree`; the plugin fetches tree metadata first, then byte metadata from `/markdown/bootstrap`, and finally pulls Yjs state in batches through the same endpoint.
 - SSE payload shape is treated defensively. The plugin advances cursor state and refreshes the authoritative tree snapshot when tree/blob events arrive instead of assuming a fully materialized `FileEntry` in every SSE payload.
+- Applied local operation results and tree/blob SSE events use their server `eventSeq`/event ID as a
+  snapshot coalescing cursor. Once an authoritative `/tree` response covers that cursor, duplicate
+  requests are discarded. Room-wide Markdown bootstrap may be skipped only when the active
+  Markdown `entryId -> path` set and hydrated local cache are unchanged; forced recovery paths
+  remain unconditional.
 - For binary files, local vault changes are uploaded through the blob ticket flow, while incoming server revisions are downloaded through blob download tickets and applied only after integrity checks succeed.

@@ -29,6 +29,9 @@ The plugin is split into a few strong boundaries:
   Shared remote cursor/selection rendering for CodeMirror. If the issue is cursor placement, label behavior, selection color, or cursor jitter, start here.
 - `src/sync/note-presence-stream.ts`
   Room-level markdown note presence SSE. This powers viewer chips above notes and per-note explorer badges without opening every markdown document locally.
+- `src/sync/snapshot-refresh.ts`
+  Pure cursor coalescing and active-Markdown-tree comparison helpers used by room snapshot
+  scheduling. Start here when a local operation and its SSE echo trigger redundant work.
 - `src/settings/tab.ts`
   All settings UI and navigation. Rooms view, room detail page, account page, admin page, pagination, room install button, color picker, and tooltips all live here.
 - `src/settings/data.ts`
@@ -60,6 +63,8 @@ Search here for:
 - `disconnectRoom`
 - `recoverLiveTransports`
 - `refreshRoomSnapshot`
+- `runRoomSnapshotRefresh`
+- `shouldBootstrapMarkdownAfterSnapshot`
 - `bootstrapRoomMarkdownCache`
 - `syncBinaryEntriesFromSnapshot`
 - `queueBinaryWrite`
@@ -134,6 +139,8 @@ Important files:
   Settings/admin SSE connection and generation-safe reconnect lifecycle.
 - `operations.ts`
   Typed construction of server-authoritative tree mutation batches.
+- `snapshot-refresh.ts`
+  Cursor-aware snapshot request merging/coverage and active Markdown tree signatures.
 - `tree-store.ts`
   In-memory authoritative entry index for one room.
 - `path-mapper.ts`
@@ -145,6 +152,10 @@ Search here for:
 - `SettingsEventStream`
 - `TreeStore`
 - `OperationsQueue`
+- `createSnapshotRefreshRequest`
+- `mergeSnapshotRefreshRequests`
+- `isSnapshotRefreshCovered`
+- `doesActiveMarkdownTreeMatch`
 - `toServerPathForRoom`
 
 ### `src/obsidian/file-bridge.ts`

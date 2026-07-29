@@ -17226,7 +17226,15 @@ var OperationsQueue = class {
       for (const result of response.results) {
         this.log(describeResult(result));
       }
-      await this.onAfterApply?.(workspaceId, reason);
+      const eventCursor = response.results.reduce((highestCursor, result) => {
+        if (typeof result.eventSeq !== "number") {
+          return highestCursor;
+        }
+        return highestCursor === null ? result.eventSeq : Math.max(highestCursor, result.eventSeq);
+      }, null);
+      if (failed || eventCursor !== null) {
+        await this.onAfterApply?.(workspaceId, reason, failed ? null : eventCursor);
+      }
       if (failed) {
         throw new RolayOperationError(workspaceId, opWithId, failed);
       }
@@ -17891,6 +17899,72 @@ async function openNodeRequest3(urlString, accessToken, signal, nodeRequire, cli
   });
 }
 
+// src/sync/snapshot-refresh.ts
+function createSnapshotRefreshRequest(reason, options = {}) {
+  const targetCursor = typeof options.targetCursor === "number" && Number.isFinite(options.targetCursor) ? Math.max(0, Math.trunc(options.targetCursor)) : null;
+  return {
+    reason,
+    targetCursor,
+    force: targetCursor === null,
+    markdownBootstrapPolicy: targetCursor === null ? "always" : options.markdownBootstrapPolicy ?? "always"
+  };
+}
+function mergeSnapshotRefreshRequests(current, incoming) {
+  if (!current) {
+    return incoming;
+  }
+  return {
+    reason: mergeReasons(current.reason, incoming.reason),
+    targetCursor: maxCursor(current.targetCursor, incoming.targetCursor),
+    force: current.force || incoming.force,
+    markdownBootstrapPolicy: current.markdownBootstrapPolicy === "always" || incoming.markdownBootstrapPolicy === "always" ? "always" : "if-markdown-tree-changed"
+  };
+}
+function isSnapshotRefreshCovered(request, lastAppliedSnapshotCursor) {
+  return !request.force && request.targetCursor !== null && lastAppliedSnapshotCursor !== null && lastAppliedSnapshotCursor >= request.targetCursor;
+}
+function hasActiveMarkdownTreeChanged(previousEntries, nextEntries) {
+  return !doesActiveMarkdownTreeMatch(
+    nextEntries,
+    createActiveMarkdownTreeSignature(previousEntries)
+  );
+}
+function doesActiveMarkdownTreeMatch(entries, targetPathsByEntryId) {
+  const activeMarkdownPaths = createActiveMarkdownTreeSignature(entries);
+  if (activeMarkdownPaths.size !== targetPathsByEntryId.size) {
+    return false;
+  }
+  for (const [entryId, targetPath] of targetPathsByEntryId) {
+    if (activeMarkdownPaths.get(entryId) !== targetPath) {
+      return false;
+    }
+  }
+  return true;
+}
+function createActiveMarkdownTreeSignature(entries) {
+  return new Map(
+    entries.filter((entry) => entry.kind === "markdown" && !entry.deleted).map((entry) => [entry.id, normalizeServerPath(entry.path)])
+  );
+}
+function normalizeServerPath(path) {
+  return path.replace(/\\/g, "/");
+}
+function maxCursor(left, right) {
+  if (left === null) {
+    return right;
+  }
+  if (right === null) {
+    return left;
+  }
+  return Math.max(left, right);
+}
+function mergeReasons(left, right) {
+  if (left === right) {
+    return left;
+  }
+  return [.../* @__PURE__ */ new Set([...left.split("+"), ...right.split("+")])].slice(0, 4).join("+");
+}
+
 // src/sync/tree-store.ts
 var TreeStore = class {
   constructor() {
@@ -18122,8 +18196,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
           `[${workspaceId}] commit_blob_revision entryId=${operation.entryId} hash=${operation.hash} sizeBytes=${operation.sizeBytes} entryVersion=${operation.preconditions?.entryVersion ?? "?"} path=${operation.preconditions?.path ?? "?"} reason=${reason} status=${meta.status} requestId=${meta.requestId ?? "-"}`
         );
       },
-      onAfterApply: (workspaceId) => {
-        this.scheduleSnapshotRefresh(workspaceId, "local-op");
+      onAfterApply: (workspaceId, _reason, eventCursor) => {
+        this.scheduleSnapshotRefresh(workspaceId, "local-op", {
+          targetCursor: eventCursor,
+          markdownBootstrapPolicy: "if-markdown-tree-changed"
+        });
       }
     });
     this.fileBridge = new FileBridge({
@@ -19136,23 +19213,50 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       throw error;
     }
   }
-  async refreshRoomSnapshot(workspaceId, reason = "manual") {
+  async refreshRoomSnapshot(workspaceId, reason = "manual", options = {}) {
+    await this.runRoomSnapshotRefresh(
+      workspaceId,
+      createSnapshotRefreshRequest(reason, options)
+    );
+  }
+  async runRoomSnapshotRefresh(workspaceId, request) {
     const runtime = this.ensureRoomRuntime(workspaceId);
     if (!this.isRoomSyncActive(workspaceId)) {
       return;
     }
+    let effectiveRequest = request;
+    if (runtime.snapshotRefreshHandle !== null) {
+      window.clearTimeout(runtime.snapshotRefreshHandle);
+      runtime.snapshotRefreshHandle = null;
+      if (runtime.snapshotRefreshScheduledRequest) {
+        effectiveRequest = mergeSnapshotRefreshRequests(
+          effectiveRequest,
+          runtime.snapshotRefreshScheduledRequest
+        );
+        runtime.snapshotRefreshScheduledRequest = null;
+      }
+    }
+    if (this.isRoomSnapshotRequestCovered(runtime, effectiveRequest)) {
+      return;
+    }
     if (runtime.snapshotRefreshInFlight) {
-      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
+      runtime.snapshotRefreshQueuedRequest = mergeSnapshotRefreshRequests(
+        runtime.snapshotRefreshQueuedRequest,
+        effectiveRequest
+      );
       return;
     }
     runtime.snapshotRefreshInFlight = true;
     try {
-      await this.performRoomSnapshotRefresh(workspaceId, reason);
+      await this.performRoomSnapshotRefresh(workspaceId, effectiveRequest);
     } catch (error) {
       if (this.shouldRetrySnapshotAfterAuthRecovery(error)) {
         try {
           await this.ensureAuthenticated(true);
-          await this.performRoomSnapshotRefresh(workspaceId, `${reason}-auth-retry`);
+          await this.performRoomSnapshotRefresh(workspaceId, {
+            ...effectiveRequest,
+            reason: `${effectiveRequest.reason}-auth-retry`
+          });
           return;
         } catch (retryError) {
           this.handleError("Tree snapshot failed", retryError);
@@ -19163,14 +19267,14 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       throw error;
     } finally {
       runtime.snapshotRefreshInFlight = false;
-      const queuedReason = runtime.snapshotRefreshQueuedReason;
-      runtime.snapshotRefreshQueuedReason = null;
-      if (queuedReason && this.isRoomSyncActive(workspaceId)) {
-        this.scheduleSnapshotRefresh(workspaceId, queuedReason);
+      const queuedRequest = runtime.snapshotRefreshQueuedRequest;
+      runtime.snapshotRefreshQueuedRequest = null;
+      if (queuedRequest && this.isRoomSyncActive(workspaceId) && !this.isRoomSnapshotRequestCovered(runtime, queuedRequest)) {
+        this.scheduleSnapshotRefreshRequest(workspaceId, queuedRequest);
       }
     }
   }
-  async performRoomSnapshotRefresh(workspaceId, reason) {
+  async performRoomSnapshotRefresh(workspaceId, request) {
     if (!this.isRoomSyncActive(workspaceId)) {
       return;
     }
@@ -19194,6 +19298,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     if (!this.isRoomSyncActive(workspaceId)) {
       return;
     }
+    runtime.lastAppliedSnapshotCursor = snapshot.cursor;
     this.scheduleExplorerLoadingDecorations();
     this.setRoomSyncState(room.workspace.id, {
       lastCursor: snapshot.cursor,
@@ -19201,28 +19306,79 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     });
     this.recordLog(
       "tree",
-      `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
+      `Fetched snapshot for ${snapshot.workspace.name} at cursor ${snapshot.cursor} with ${snapshot.entries.length} entries (${request.reason}).`
     );
-    await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
-    if (!this.isRoomSyncActive(workspaceId)) {
-      return;
-    }
-    await this.syncBinaryEntriesFromSnapshot(room.workspace.id, snapshot.entries, reason);
-    if (!this.isRoomSyncActive(workspaceId)) {
-      return;
-    }
-    this.scheduleBackgroundMarkdownRefresh(
+    const shouldBootstrapMarkdown = this.shouldBootstrapMarkdownAfterSnapshot(
       room.workspace.id,
-      "post-snapshot-background-refresh",
-      _RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS,
-      true
+      previousEntries,
+      snapshot.entries,
+      request.markdownBootstrapPolicy
     );
-    await this.reconcilePendingMarkdownCreates(room.workspace.id, reason);
-    await this.reconcilePendingMarkdownMerges(room.workspace.id, reason);
-    await this.reconcilePendingBinaryWrites(room.workspace.id, reason);
+    if (shouldBootstrapMarkdown) {
+      await this.bootstrapRoomMarkdownCache(
+        room.workspace.id,
+        snapshot.entries,
+        request.reason
+      );
+    } else {
+      this.recordLog(
+        "crdt",
+        `[${room.workspace.id}] Skipped room-wide Markdown bootstrap after ${request.reason}; the active Markdown tree and hydrated cache are unchanged.`
+      );
+    }
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+    await this.syncBinaryEntriesFromSnapshot(
+      room.workspace.id,
+      snapshot.entries,
+      request.reason
+    );
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+    if (shouldBootstrapMarkdown) {
+      this.scheduleBackgroundMarkdownRefresh(
+        room.workspace.id,
+        "post-snapshot-background-refresh",
+        _RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS,
+        true
+      );
+    } else {
+      this.scheduleBackgroundMarkdownRefresh(
+        room.workspace.id,
+        "background-markdown"
+      );
+    }
+    await this.reconcilePendingMarkdownCreates(room.workspace.id, request.reason);
+    await this.reconcilePendingMarkdownMerges(room.workspace.id, request.reason);
+    await this.reconcilePendingBinaryWrites(room.workspace.id, request.reason);
     await this.persistNow();
     this.updateStatusBar();
     await this.bindActiveMarkdownToCrdt();
+  }
+  isRoomSnapshotRequestCovered(runtime, request) {
+    return runtime.markdownBootstrap.status !== "error" && isSnapshotRefreshCovered(request, runtime.lastAppliedSnapshotCursor);
+  }
+  shouldBootstrapMarkdownAfterSnapshot(workspaceId, previousEntries, nextEntries, policy) {
+    if (policy === "always" || hasActiveMarkdownTreeChanged(previousEntries, nextEntries)) {
+      return true;
+    }
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    if (runtime.markdownBootstrap.status === "loading") {
+      return !doesActiveMarkdownTreeMatch(
+        nextEntries,
+        runtime.markdownBootstrap.targetPathsByEntryId
+      );
+    }
+    if (runtime.markdownBootstrap.status !== "ready" || runtime.markdownBootstrap.lastError || runtime.markdownBootstrap.lockedLocalPaths.size > 0) {
+      return true;
+    }
+    return nextEntries.filter((entry) => entry.kind === "markdown" && !entry.deleted).some((entry) => {
+      const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path);
+      const cachedEntry = this.findPersistedCrdtCacheEntry(entry.id);
+      return !localPath || !cachedEntry || (0, import_obsidian10.normalizePath)(cachedEntry.filePath) !== (0, import_obsidian10.normalizePath)(localPath) || !(this.app.vault.getAbstractFileByPath(localPath) instanceof import_obsidian10.TFile);
+    });
   }
   shouldRetrySnapshotAfterAuthRecovery(error) {
     if (!(error instanceof Error)) {
@@ -19276,7 +19432,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         this.schedulePersist();
         this.recordLog("sse", `[${room.workspace.id}] Event ${event.id}: ${event.event}`);
         if (event.event.startsWith("tree.") || event.event.startsWith("blob.")) {
-          this.scheduleSnapshotRefresh(room.workspace.id, "event-stream");
+          this.scheduleSnapshotRefresh(room.workspace.id, "event-stream", {
+            targetCursor: event.id,
+            markdownBootstrapPolicy: "if-markdown-tree-changed"
+          });
         }
       },
       onStatusChange: (status) => {
@@ -19306,7 +19465,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       window.clearTimeout(runtime.snapshotRefreshHandle);
       runtime.snapshotRefreshHandle = null;
     }
-    runtime.snapshotRefreshQueuedReason = null;
+    runtime.snapshotRefreshScheduledRequest = null;
+    runtime.snapshotRefreshQueuedRequest = null;
     this.clearBackgroundMarkdownRefresh(workspaceId);
     this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
     this.cancelRoomMarkdownBootstrap(workspaceId);
@@ -19847,22 +20007,41 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       }
     }
   }
-  scheduleSnapshotRefresh(workspaceId, reason = "event-stream") {
+  scheduleSnapshotRefresh(workspaceId, reason = "event-stream", options = {}) {
+    this.scheduleSnapshotRefreshRequest(
+      workspaceId,
+      createSnapshotRefreshRequest(reason, options)
+    );
+  }
+  scheduleSnapshotRefreshRequest(workspaceId, request) {
     const runtime = this.ensureRoomRuntime(workspaceId);
     if (!this.isRoomSyncActive(workspaceId)) {
       return;
     }
-    if (runtime.snapshotRefreshInFlight) {
-      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
+    if (this.isRoomSnapshotRequestCovered(runtime, request)) {
       return;
     }
+    if (runtime.snapshotRefreshInFlight) {
+      runtime.snapshotRefreshQueuedRequest = mergeSnapshotRefreshRequests(
+        runtime.snapshotRefreshQueuedRequest,
+        request
+      );
+      return;
+    }
+    runtime.snapshotRefreshScheduledRequest = mergeSnapshotRefreshRequests(
+      runtime.snapshotRefreshScheduledRequest,
+      request
+    );
     if (runtime.snapshotRefreshHandle !== null) {
-      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
       return;
     }
     runtime.snapshotRefreshHandle = window.setTimeout(() => {
       runtime.snapshotRefreshHandle = null;
-      void this.refreshRoomSnapshot(workspaceId, reason);
+      const scheduledRequest = runtime.snapshotRefreshScheduledRequest;
+      runtime.snapshotRefreshScheduledRequest = null;
+      if (scheduledRequest) {
+        void this.runRoomSnapshotRefresh(workspaceId, scheduledRequest);
+      }
     }, 400);
   }
   clearBackgroundMarkdownRefresh(workspaceId) {
@@ -20191,7 +20370,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       lastHandledEventId: null,
       snapshotRefreshHandle: null,
       snapshotRefreshInFlight: false,
-      snapshotRefreshQueuedReason: null,
+      snapshotRefreshScheduledRequest: null,
+      snapshotRefreshQueuedRequest: null,
+      lastAppliedSnapshotCursor: null,
       backgroundMarkdownRefreshHandle: null,
       backgroundMarkdownRefreshInFlight: false,
       lockedBootstrapRetryHandle: null,
@@ -20202,6 +20383,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         completedTargets: 0,
         totalBytes: 0,
         completedBytes: 0,
+        targetPathsByEntryId: /* @__PURE__ */ new Map(),
         documentBytesByEntryId: /* @__PURE__ */ new Map(),
         completedEntryIds: /* @__PURE__ */ new Set(),
         hydratedTargets: 0,
@@ -22981,6 +23163,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     runtime.markdownBootstrap.completedTargets = 0;
     runtime.markdownBootstrap.totalBytes = 0;
     runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.targetPathsByEntryId.clear();
     runtime.markdownBootstrap.documentBytesByEntryId.clear();
     runtime.markdownBootstrap.completedEntryIds.clear();
     runtime.markdownBootstrap.hydratedTargets = 0;
@@ -23015,6 +23198,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     runtime.markdownBootstrap.completedTargets = 0;
     runtime.markdownBootstrap.totalBytes = 0;
     runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.targetPathsByEntryId = createActiveMarkdownTreeSignature(markdownEntries);
     runtime.markdownBootstrap.documentBytesByEntryId.clear();
     runtime.markdownBootstrap.completedEntryIds.clear();
     runtime.markdownBootstrap.hydratedTargets = 0;
@@ -23064,6 +23248,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         runtime.markdownBootstrap.status = metadataMissingCount > 0 ? "error" : "ready";
         await this.refreshRoomMarkdownLocks(workspaceId, lockEntries);
         this.updateStatusBar();
+        await this.rerunRoomMarkdownBootstrapIfRequested(workspaceId, runtime);
         return;
       }
       const batches = this.buildMarkdownBootstrapBatches(knownEntries, metadataByEntryId);
@@ -23164,15 +23349,20 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       );
       this.updateStatusBar();
     }
-    if (runtime.markdownBootstrap.rerunRequested) {
-      runtime.markdownBootstrap.rerunRequested = false;
-      await this.bootstrapRoomMarkdownCache(
-        workspaceId,
-        runtime.treeStore.getEntries(),
-        "rerun",
-        runtime.treeStore.getEntries()
-      );
+    await this.rerunRoomMarkdownBootstrapIfRequested(workspaceId, runtime);
+  }
+  async rerunRoomMarkdownBootstrapIfRequested(workspaceId, runtime) {
+    if (!runtime.markdownBootstrap.rerunRequested) {
+      return;
     }
+    runtime.markdownBootstrap.rerunRequested = false;
+    const currentEntries = runtime.treeStore.getEntries();
+    await this.bootstrapRoomMarkdownCache(
+      workspaceId,
+      currentEntries,
+      "rerun",
+      currentEntries
+    );
   }
   buildMarkdownBootstrapBatches(entries, metadataByEntryId) {
     const batches = [];

@@ -36,6 +36,17 @@ import { OperationsQueue, RolayOperationError } from "./sync/operations";
 import { SettingsEventStream } from "./sync/settings-stream";
 import { NotePresenceEventStream } from "./sync/note-presence-stream";
 import {
+  createActiveMarkdownTreeSignature,
+  createSnapshotRefreshRequest,
+  doesActiveMarkdownTreeMatch,
+  hasActiveMarkdownTreeChanged,
+  isSnapshotRefreshCovered,
+  mergeSnapshotRefreshRequests,
+  type MarkdownBootstrapPolicy,
+  type SnapshotRefreshOptions,
+  type SnapshotRefreshRequest
+} from "./sync/snapshot-refresh";
+import {
   getRoomRoot,
   isValidRoomFolderName,
   normalizeRoomFolderName,
@@ -89,7 +100,9 @@ interface RoomRuntimeState {
   lastHandledEventId: number | null;
   snapshotRefreshHandle: number | null;
   snapshotRefreshInFlight: boolean;
-  snapshotRefreshQueuedReason: string | null;
+  snapshotRefreshScheduledRequest: SnapshotRefreshRequest | null;
+  snapshotRefreshQueuedRequest: SnapshotRefreshRequest | null;
+  lastAppliedSnapshotCursor: number | null;
   backgroundMarkdownRefreshHandle: number | null;
   backgroundMarkdownRefreshInFlight: boolean;
   lockedBootstrapRetryHandle: number | null;
@@ -103,6 +116,7 @@ interface RoomMarkdownBootstrapState {
   completedTargets: number;
   totalBytes: number;
   completedBytes: number;
+  targetPathsByEntryId: Map<string, string>;
   documentBytesByEntryId: Map<string, number>;
   completedEntryIds: Set<string>;
   hydratedTargets: number;
@@ -392,8 +406,11 @@ export default class RolayPlugin extends Plugin {
           `reason=${reason} status=${meta.status} requestId=${meta.requestId ?? "-"}`
         );
       },
-      onAfterApply: (workspaceId) => {
-        this.scheduleSnapshotRefresh(workspaceId, "local-op");
+      onAfterApply: (workspaceId, _reason, eventCursor) => {
+        this.scheduleSnapshotRefresh(workspaceId, "local-op", {
+          targetCursor: eventCursor,
+          markdownBootstrapPolicy: "if-markdown-tree-changed"
+        });
       }
     });
     this.fileBridge = new FileBridge({
@@ -1591,25 +1608,62 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
-  async refreshRoomSnapshot(workspaceId: string, reason = "manual"): Promise<void> {
+  async refreshRoomSnapshot(
+    workspaceId: string,
+    reason = "manual",
+    options: SnapshotRefreshOptions = {}
+  ): Promise<void> {
+    await this.runRoomSnapshotRefresh(
+      workspaceId,
+      createSnapshotRefreshRequest(reason, options)
+    );
+  }
+
+  private async runRoomSnapshotRefresh(
+    workspaceId: string,
+    request: SnapshotRefreshRequest
+  ): Promise<void> {
     const runtime = this.ensureRoomRuntime(workspaceId);
     if (!this.isRoomSyncActive(workspaceId)) {
       return;
     }
 
+    let effectiveRequest = request;
+    if (runtime.snapshotRefreshHandle !== null) {
+      window.clearTimeout(runtime.snapshotRefreshHandle);
+      runtime.snapshotRefreshHandle = null;
+      if (runtime.snapshotRefreshScheduledRequest) {
+        effectiveRequest = mergeSnapshotRefreshRequests(
+          effectiveRequest,
+          runtime.snapshotRefreshScheduledRequest
+        );
+        runtime.snapshotRefreshScheduledRequest = null;
+      }
+    }
+
+    if (this.isRoomSnapshotRequestCovered(runtime, effectiveRequest)) {
+      return;
+    }
+
     if (runtime.snapshotRefreshInFlight) {
-      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
+      runtime.snapshotRefreshQueuedRequest = mergeSnapshotRefreshRequests(
+        runtime.snapshotRefreshQueuedRequest,
+        effectiveRequest
+      );
       return;
     }
 
     runtime.snapshotRefreshInFlight = true;
     try {
-      await this.performRoomSnapshotRefresh(workspaceId, reason);
+      await this.performRoomSnapshotRefresh(workspaceId, effectiveRequest);
     } catch (error) {
       if (this.shouldRetrySnapshotAfterAuthRecovery(error)) {
         try {
           await this.ensureAuthenticated(true);
-          await this.performRoomSnapshotRefresh(workspaceId, `${reason}-auth-retry`);
+          await this.performRoomSnapshotRefresh(workspaceId, {
+            ...effectiveRequest,
+            reason: `${effectiveRequest.reason}-auth-retry`
+          });
           return;
         } catch (retryError) {
           this.handleError("Tree snapshot failed", retryError);
@@ -1621,15 +1675,22 @@ export default class RolayPlugin extends Plugin {
       throw error;
     } finally {
       runtime.snapshotRefreshInFlight = false;
-      const queuedReason = runtime.snapshotRefreshQueuedReason;
-      runtime.snapshotRefreshQueuedReason = null;
-      if (queuedReason && this.isRoomSyncActive(workspaceId)) {
-        this.scheduleSnapshotRefresh(workspaceId, queuedReason);
+      const queuedRequest = runtime.snapshotRefreshQueuedRequest;
+      runtime.snapshotRefreshQueuedRequest = null;
+      if (
+        queuedRequest &&
+        this.isRoomSyncActive(workspaceId) &&
+        !this.isRoomSnapshotRequestCovered(runtime, queuedRequest)
+      ) {
+        this.scheduleSnapshotRefreshRequest(workspaceId, queuedRequest);
       }
     }
   }
 
-  private async performRoomSnapshotRefresh(workspaceId: string, reason: string): Promise<void> {
+  private async performRoomSnapshotRefresh(
+    workspaceId: string,
+    request: SnapshotRefreshRequest
+  ): Promise<void> {
     if (!this.isRoomSyncActive(workspaceId)) {
       return;
     }
@@ -1656,6 +1717,7 @@ export default class RolayPlugin extends Plugin {
     if (!this.isRoomSyncActive(workspaceId)) {
       return;
     }
+    runtime.lastAppliedSnapshotCursor = snapshot.cursor;
 
     this.scheduleExplorerLoadingDecorations();
     this.setRoomSyncState(room.workspace.id, {
@@ -1664,30 +1726,113 @@ export default class RolayPlugin extends Plugin {
     });
     this.recordLog(
       "tree",
-      `Fetched snapshot for ${snapshot.workspace.name} with ${snapshot.entries.length} entries (${reason}).`
+      `Fetched snapshot for ${snapshot.workspace.name} at cursor ${snapshot.cursor} ` +
+      `with ${snapshot.entries.length} entries (${request.reason}).`
     );
-    await this.bootstrapRoomMarkdownCache(room.workspace.id, snapshot.entries, reason);
-    if (!this.isRoomSyncActive(workspaceId)) {
-      return;
-    }
 
-    await this.syncBinaryEntriesFromSnapshot(room.workspace.id, snapshot.entries, reason);
-    if (!this.isRoomSyncActive(workspaceId)) {
-      return;
-    }
-
-    this.scheduleBackgroundMarkdownRefresh(
+    const shouldBootstrapMarkdown = this.shouldBootstrapMarkdownAfterSnapshot(
       room.workspace.id,
-      "post-snapshot-background-refresh",
-      RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS,
-      true
+      previousEntries,
+      snapshot.entries,
+      request.markdownBootstrapPolicy
     );
-    await this.reconcilePendingMarkdownCreates(room.workspace.id, reason);
-    await this.reconcilePendingMarkdownMerges(room.workspace.id, reason);
-    await this.reconcilePendingBinaryWrites(room.workspace.id, reason);
+    if (shouldBootstrapMarkdown) {
+      await this.bootstrapRoomMarkdownCache(
+        room.workspace.id,
+        snapshot.entries,
+        request.reason
+      );
+    } else {
+      this.recordLog(
+        "crdt",
+        `[${room.workspace.id}] Skipped room-wide Markdown bootstrap after ${request.reason}; ` +
+        "the active Markdown tree and hydrated cache are unchanged."
+      );
+    }
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
+    await this.syncBinaryEntriesFromSnapshot(
+      room.workspace.id,
+      snapshot.entries,
+      request.reason
+    );
+    if (!this.isRoomSyncActive(workspaceId)) {
+      return;
+    }
+
+    if (shouldBootstrapMarkdown) {
+      this.scheduleBackgroundMarkdownRefresh(
+        room.workspace.id,
+        "post-snapshot-background-refresh",
+        RolayPlugin.ROOM_MARKDOWN_REFRESH_AFTER_SNAPSHOT_MS,
+        true
+      );
+    } else {
+      this.scheduleBackgroundMarkdownRefresh(
+        room.workspace.id,
+        "background-markdown"
+      );
+    }
+    await this.reconcilePendingMarkdownCreates(room.workspace.id, request.reason);
+    await this.reconcilePendingMarkdownMerges(room.workspace.id, request.reason);
+    await this.reconcilePendingBinaryWrites(room.workspace.id, request.reason);
     await this.persistNow();
     this.updateStatusBar();
     await this.bindActiveMarkdownToCrdt();
+  }
+
+  private isRoomSnapshotRequestCovered(
+    runtime: RoomRuntimeState,
+    request: SnapshotRefreshRequest
+  ): boolean {
+    return (
+      runtime.markdownBootstrap.status !== "error" &&
+      isSnapshotRefreshCovered(request, runtime.lastAppliedSnapshotCursor)
+    );
+  }
+
+  private shouldBootstrapMarkdownAfterSnapshot(
+    workspaceId: string,
+    previousEntries: FileEntry[],
+    nextEntries: FileEntry[],
+    policy: MarkdownBootstrapPolicy
+  ): boolean {
+    if (
+      policy === "always" ||
+      hasActiveMarkdownTreeChanged(previousEntries, nextEntries)
+    ) {
+      return true;
+    }
+
+    const runtime = this.ensureRoomRuntime(workspaceId);
+    if (runtime.markdownBootstrap.status === "loading") {
+      return !doesActiveMarkdownTreeMatch(
+        nextEntries,
+        runtime.markdownBootstrap.targetPathsByEntryId
+      );
+    }
+    if (
+      runtime.markdownBootstrap.status !== "ready" ||
+      runtime.markdownBootstrap.lastError ||
+      runtime.markdownBootstrap.lockedLocalPaths.size > 0
+    ) {
+      return true;
+    }
+
+    return nextEntries
+      .filter((entry) => entry.kind === "markdown" && !entry.deleted)
+      .some((entry) => {
+        const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path);
+        const cachedEntry = this.findPersistedCrdtCacheEntry(entry.id);
+        return (
+          !localPath ||
+          !cachedEntry ||
+          normalizePath(cachedEntry.filePath) !== normalizePath(localPath) ||
+          !(this.app.vault.getAbstractFileByPath(localPath) instanceof TFile)
+        );
+      });
   }
 
   private shouldRetrySnapshotAfterAuthRecovery(error: unknown): boolean {
@@ -1755,7 +1900,10 @@ export default class RolayPlugin extends Plugin {
         this.schedulePersist();
         this.recordLog("sse", `[${room.workspace.id}] Event ${event.id}: ${event.event}`);
         if (event.event.startsWith("tree.") || event.event.startsWith("blob.")) {
-          this.scheduleSnapshotRefresh(room.workspace.id, "event-stream");
+          this.scheduleSnapshotRefresh(room.workspace.id, "event-stream", {
+            targetCursor: event.id,
+            markdownBootstrapPolicy: "if-markdown-tree-changed"
+          });
         }
       },
       onStatusChange: (status) => {
@@ -1788,7 +1936,8 @@ export default class RolayPlugin extends Plugin {
       window.clearTimeout(runtime.snapshotRefreshHandle);
       runtime.snapshotRefreshHandle = null;
     }
-    runtime.snapshotRefreshQueuedReason = null;
+    runtime.snapshotRefreshScheduledRequest = null;
+    runtime.snapshotRefreshQueuedRequest = null;
     this.clearBackgroundMarkdownRefresh(workspaceId);
     this.clearLockedMarkdownBootstrapRetry(workspaceId, false);
     this.cancelRoomMarkdownBootstrap(workspaceId);
@@ -2420,25 +2569,53 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
-  private scheduleSnapshotRefresh(workspaceId: string, reason = "event-stream"): void {
+  private scheduleSnapshotRefresh(
+    workspaceId: string,
+    reason = "event-stream",
+    options: SnapshotRefreshOptions = {}
+  ): void {
+    this.scheduleSnapshotRefreshRequest(
+      workspaceId,
+      createSnapshotRefreshRequest(reason, options)
+    );
+  }
+
+  private scheduleSnapshotRefreshRequest(
+    workspaceId: string,
+    request: SnapshotRefreshRequest
+  ): void {
     const runtime = this.ensureRoomRuntime(workspaceId);
     if (!this.isRoomSyncActive(workspaceId)) {
       return;
     }
 
-    if (runtime.snapshotRefreshInFlight) {
-      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
+    if (this.isRoomSnapshotRequestCovered(runtime, request)) {
       return;
     }
 
+    if (runtime.snapshotRefreshInFlight) {
+      runtime.snapshotRefreshQueuedRequest = mergeSnapshotRefreshRequests(
+        runtime.snapshotRefreshQueuedRequest,
+        request
+      );
+      return;
+    }
+
+    runtime.snapshotRefreshScheduledRequest = mergeSnapshotRefreshRequests(
+      runtime.snapshotRefreshScheduledRequest,
+      request
+    );
     if (runtime.snapshotRefreshHandle !== null) {
-      runtime.snapshotRefreshQueuedReason = runtime.snapshotRefreshQueuedReason ?? reason;
       return;
     }
 
     runtime.snapshotRefreshHandle = window.setTimeout(() => {
       runtime.snapshotRefreshHandle = null;
-      void this.refreshRoomSnapshot(workspaceId, reason);
+      const scheduledRequest = runtime.snapshotRefreshScheduledRequest;
+      runtime.snapshotRefreshScheduledRequest = null;
+      if (scheduledRequest) {
+        void this.runRoomSnapshotRefresh(workspaceId, scheduledRequest);
+      }
     }, 400);
   }
 
@@ -2851,7 +3028,9 @@ export default class RolayPlugin extends Plugin {
       lastHandledEventId: null,
       snapshotRefreshHandle: null,
       snapshotRefreshInFlight: false,
-      snapshotRefreshQueuedReason: null,
+      snapshotRefreshScheduledRequest: null,
+      snapshotRefreshQueuedRequest: null,
+      lastAppliedSnapshotCursor: null,
       backgroundMarkdownRefreshHandle: null,
       backgroundMarkdownRefreshInFlight: false,
       lockedBootstrapRetryHandle: null,
@@ -2862,6 +3041,7 @@ export default class RolayPlugin extends Plugin {
         completedTargets: 0,
         totalBytes: 0,
         completedBytes: 0,
+        targetPathsByEntryId: new Map(),
         documentBytesByEntryId: new Map(),
         completedEntryIds: new Set(),
         hydratedTargets: 0,
@@ -6502,6 +6682,7 @@ export default class RolayPlugin extends Plugin {
     runtime.markdownBootstrap.completedTargets = 0;
     runtime.markdownBootstrap.totalBytes = 0;
     runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.targetPathsByEntryId.clear();
     runtime.markdownBootstrap.documentBytesByEntryId.clear();
     runtime.markdownBootstrap.completedEntryIds.clear();
     runtime.markdownBootstrap.hydratedTargets = 0;
@@ -6549,6 +6730,8 @@ export default class RolayPlugin extends Plugin {
     runtime.markdownBootstrap.completedTargets = 0;
     runtime.markdownBootstrap.totalBytes = 0;
     runtime.markdownBootstrap.completedBytes = 0;
+    runtime.markdownBootstrap.targetPathsByEntryId =
+      createActiveMarkdownTreeSignature(markdownEntries);
     runtime.markdownBootstrap.documentBytesByEntryId.clear();
     runtime.markdownBootstrap.completedEntryIds.clear();
     runtime.markdownBootstrap.hydratedTargets = 0;
@@ -6610,6 +6793,7 @@ export default class RolayPlugin extends Plugin {
         runtime.markdownBootstrap.status = metadataMissingCount > 0 ? "error" : "ready";
         await this.refreshRoomMarkdownLocks(workspaceId, lockEntries);
         this.updateStatusBar();
+        await this.rerunRoomMarkdownBootstrapIfRequested(workspaceId, runtime);
         return;
       }
 
@@ -6729,15 +6913,25 @@ export default class RolayPlugin extends Plugin {
       this.updateStatusBar();
     }
 
-    if (runtime.markdownBootstrap.rerunRequested) {
-      runtime.markdownBootstrap.rerunRequested = false;
-      await this.bootstrapRoomMarkdownCache(
-        workspaceId,
-        runtime.treeStore.getEntries(),
-        "rerun",
-        runtime.treeStore.getEntries()
-      );
+    await this.rerunRoomMarkdownBootstrapIfRequested(workspaceId, runtime);
+  }
+
+  private async rerunRoomMarkdownBootstrapIfRequested(
+    workspaceId: string,
+    runtime: RoomRuntimeState
+  ): Promise<void> {
+    if (!runtime.markdownBootstrap.rerunRequested) {
+      return;
     }
+
+    runtime.markdownBootstrap.rerunRequested = false;
+    const currentEntries = runtime.treeStore.getEntries();
+    await this.bootstrapRoomMarkdownCache(
+      workspaceId,
+      currentEntries,
+      "rerun",
+      currentEntries
+    );
   }
 
   private buildMarkdownBootstrapBatches(
