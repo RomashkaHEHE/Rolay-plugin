@@ -14,6 +14,8 @@ import type {
   BlobUploadTicketResponse,
   ChangePasswordRequest,
   ChangePasswordResponse,
+  ClientErrorBatchRequest,
+  ClientErrorBatchResponse,
   CreateManagedUserRequest,
   CreateRoomRequest,
   CrdtTokenResponse,
@@ -98,13 +100,21 @@ export class RolayApiError extends Error {
   readonly status: number;
   readonly code: string;
   readonly details?: Record<string, unknown>;
+  readonly requestId: string | null;
 
-  constructor(status: number, message: string, code = "http_error", details?: Record<string, unknown>) {
+  constructor(
+    status: number,
+    message: string,
+    code = "http_error",
+    details?: Record<string, unknown>,
+    requestId: string | null = null
+  ) {
     super(message);
     this.name = "RolayApiError";
     this.status = status;
     this.code = code;
     this.details = details;
+    this.requestId = requestId;
   }
 }
 
@@ -142,6 +152,16 @@ export class RolayApiClient {
       throw createRequestUrlError(response);
     }
     return response.json as PluginUpdateManifest;
+  }
+
+  async submitClientErrors(
+    body: ClientErrorBatchRequest
+  ): Promise<ClientErrorBatchResponse> {
+    return this.requestJson<ClientErrorBatchResponse>(
+      "POST",
+      "/v1/client-errors",
+      body
+    );
   }
 
   async downloadPluginUpdateFile(path: string): Promise<PluginUpdateDownloadResult> {
@@ -857,7 +877,12 @@ export class RolayApiClient {
   private async createFetchError(response: Response): Promise<RolayApiError> {
     const fallbackMessage = `HTTP ${response.status}`;
     const responseText = await response.text();
-    return createTextError(response.status, responseText, fallbackMessage);
+    return createTextError(
+      response.status,
+      responseText,
+      fallbackMessage,
+      response.headers.get("X-Rolay-Request-Id")
+    );
   }
 
   private async downloadBlobContentWithRefresh(
@@ -1093,7 +1118,12 @@ export class RolayApiClient {
         );
       }
 
-      throw createTextError(response.status, response.text, response.statusText || `HTTP ${response.status}`);
+      throw createTextError(
+        response.status,
+        response.text,
+        response.statusText || `HTTP ${response.status}`,
+        getHeaderValue(response.headers, "x-rolay-request-id")
+      );
     }
 
     try {
@@ -1246,7 +1276,8 @@ function xhrBinaryRequest<TResult = void>(
           createTextError(
             request.status,
             extractXhrResponseText(request),
-            request.statusText || `HTTP ${request.status}`
+            request.statusText || `HTTP ${request.status}`,
+            request.getResponseHeader("X-Rolay-Request-Id")
           )
         );
         return;
@@ -1355,7 +1386,14 @@ function tryNodeBinaryUpload(
           const status = response.statusCode ?? 0;
           if (status < 200 || status >= 300) {
             const responseText = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
-            finishReject(createTextError(status, responseText, response.statusMessage || `HTTP ${status}`));
+            finishReject(
+              createTextError(
+                status,
+                responseText,
+                response.statusMessage || `HTTP ${status}`,
+                getHeaderValue(response.headers, "x-rolay-request-id")
+              )
+            );
             return;
           }
 
@@ -1480,7 +1518,14 @@ function tryElectronBinaryUpload(
         const status = response.statusCode ?? 0;
         if (status < 200 || status >= 300) {
           const responseText = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
-          finishReject(createTextError(status, responseText, response.statusMessage || `HTTP ${status}`));
+          finishReject(
+            createTextError(
+              status,
+              responseText,
+              response.statusMessage || `HTTP ${status}`,
+              getHeaderValue(response.headers, "x-rolay-request-id")
+            )
+          );
           return;
         }
 
@@ -1627,7 +1672,14 @@ function startNodeBinaryDownload(
           }
 
           if (status < 200 || status >= 300) {
-            finishReject(createTextError(status, buffer.toString("utf8"), response.statusMessage || `HTTP ${status}`));
+            finishReject(
+              createTextError(
+                status,
+                buffer.toString("utf8"),
+                response.statusMessage || `HTTP ${status}`,
+                getHeaderValue(response.headers, "x-rolay-request-id")
+              )
+            );
             return;
           }
 
@@ -1787,7 +1839,14 @@ function startElectronBinaryDownload(
         }
 
         if (status < 200 || status >= 300) {
-          finishReject(createTextError(status, buffer.toString("utf8"), response.statusMessage || `HTTP ${status}`));
+          finishReject(
+            createTextError(
+              status,
+              buffer.toString("utf8"),
+              response.statusMessage || `HTTP ${status}`,
+              getHeaderValue(response.headers, "x-rolay-request-id")
+            )
+          );
           return;
         }
 
@@ -1936,7 +1995,8 @@ function tryNodeBinaryDownloadStream(
                 createTextError(
                   status,
                   Buffer.concat(errorChunks.map((chunk) => Buffer.from(chunk))).toString("utf8"),
-                  response.statusMessage ?? `HTTP ${status}`
+                  response.statusMessage ?? `HTTP ${status}`,
+                  getHeaderValue(response.headers, "x-rolay-request-id")
                 )
               );
               return;
@@ -2109,7 +2169,8 @@ function tryElectronBinaryDownloadStream(
               createTextError(
                 status,
                 Buffer.concat(errorChunks.map((chunk) => Buffer.from(chunk))).toString("utf8"),
-                response.statusMessage ?? `HTTP ${status}`
+                response.statusMessage ?? `HTTP ${status}`,
+                getHeaderValue(response.headers, "x-rolay-request-id")
               )
             );
             return;
@@ -2311,7 +2372,12 @@ function tryNodeBinaryRequest(
 }
 
 function createRequestUrlError(response: RequestUrlResponse): RolayApiError {
-  return createTextError(response.status, response.text, `HTTP ${response.status}`);
+  return createTextError(
+    response.status,
+    response.text,
+    `HTTP ${response.status}`,
+    getHeaderValue(response.headers, "x-rolay-request-id")
+  );
 }
 
 function extractResponseMeta(response: RequestUrlResponse): ApiResponseMeta {
@@ -2396,7 +2462,8 @@ function parseBlobUploadContentResponse(
 function createTextError(
   status: number,
   responseText: string,
-  fallbackMessage: string
+  fallbackMessage: string,
+  requestId: string | null = null
 ): RolayApiError {
   try {
     const parsed = JSON.parse(responseText) as ApiErrorResponse;
@@ -2405,14 +2472,21 @@ function createTextError(
         status,
         parsed.error.message,
         parsed.error.code,
-        parsed.error.details
+        parsed.error.details,
+        requestId
       );
     }
   } catch {
     // Ignore parse failures and fall back to the generic message.
   }
 
-  return new RolayApiError(status, responseText || fallbackMessage);
+  return new RolayApiError(
+    status,
+    responseText || fallbackMessage,
+    "http_error",
+    undefined,
+    requestId
+  );
 }
 
 function parseContentLengthHeader(value: string | null): number | null {
@@ -2582,7 +2656,12 @@ async function fetchBinaryDownloadStream(
 
   if (!response.ok) {
     const responseText = await response.text();
-    throw createTextError(response.status, responseText, `HTTP ${response.status}`);
+    throw createTextError(
+      response.status,
+      responseText,
+      `HTTP ${response.status}`,
+      response.headers.get("X-Rolay-Request-Id")
+    );
   }
 
   if (!response.body) {
@@ -2637,7 +2716,12 @@ async function fetchBinaryDownload(
 
   if (!response.ok) {
     const responseText = await response.text();
-    throw createTextError(response.status, responseText, `HTTP ${response.status}`);
+    throw createTextError(
+      response.status,
+      responseText,
+      `HTTP ${response.status}`,
+      response.headers.get("X-Rolay-Request-Id")
+    );
   }
 
   if (!response.body) {

@@ -8426,12 +8426,13 @@ glo[importIdentifier] = true;
 var import_obsidian = require("obsidian");
 var MAX_BINARY_REDIRECTS = 5;
 var RolayApiError = class extends Error {
-  constructor(status, message, code = "http_error", details) {
+  constructor(status, message, code = "http_error", details, requestId = null) {
     super(message);
     this.name = "RolayApiError";
     this.status = status;
     this.code = code;
     this.details = details;
+    this.requestId = requestId;
   }
 };
 var RolayApiClient = class {
@@ -8462,6 +8463,13 @@ var RolayApiClient = class {
       throw createRequestUrlError(response);
     }
     return response.json;
+  }
+  async submitClientErrors(body) {
+    return this.requestJson(
+      "POST",
+      "/v1/client-errors",
+      body
+    );
   }
   async downloadPluginUpdateFile(path) {
     const response = await (0, import_obsidian.requestUrl)({
@@ -9004,7 +9012,12 @@ var RolayApiClient = class {
   async createFetchError(response) {
     const fallbackMessage = `HTTP ${response.status}`;
     const responseText = await response.text();
-    return createTextError(response.status, responseText, fallbackMessage);
+    return createTextError(
+      response.status,
+      responseText,
+      fallbackMessage,
+      response.headers.get("X-Rolay-Request-Id")
+    );
   }
   async downloadBlobContentWithRefresh(url, offset, onChunk, onProgress, signal) {
     const initialToken = await this.getAccessToken();
@@ -9188,7 +9201,12 @@ var RolayApiClient = class {
           "node"
         );
       }
-      throw createTextError(response2.status, response2.text, response2.statusText || `HTTP ${response2.status}`);
+      throw createTextError(
+        response2.status,
+        response2.text,
+        response2.statusText || `HTTP ${response2.status}`,
+        getHeaderValue(response2.headers, "x-rolay-request-id")
+      );
     }
     try {
       return await xhrBinaryRequest({
@@ -9307,7 +9325,8 @@ function xhrBinaryRequest(options) {
           createTextError(
             request.status,
             extractXhrResponseText(request),
-            request.statusText || `HTTP ${request.status}`
+            request.statusText || `HTTP ${request.status}`,
+            request.getResponseHeader("X-Rolay-Request-Id")
           )
         );
         return;
@@ -9384,7 +9403,14 @@ function tryNodeBinaryUpload(target, data, onProgress, signal) {
           const status = response.statusCode ?? 0;
           if (status < 200 || status >= 300) {
             const responseText = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
-            finishReject(createTextError(status, responseText, response.statusMessage || `HTTP ${status}`));
+            finishReject(
+              createTextError(
+                status,
+                responseText,
+                response.statusMessage || `HTTP ${status}`,
+                getHeaderValue(response.headers, "x-rolay-request-id")
+              )
+            );
             return;
           }
           onProgress?.({
@@ -9470,7 +9496,14 @@ function tryElectronBinaryUpload(target, data, onProgress, signal) {
         const status = response.statusCode ?? 0;
         if (status < 200 || status >= 300) {
           const responseText = Buffer.concat(chunks.map((chunk) => Buffer.from(chunk))).toString("utf8");
-          finishReject(createTextError(status, responseText, response.statusMessage || `HTTP ${status}`));
+          finishReject(
+            createTextError(
+              status,
+              responseText,
+              response.statusMessage || `HTTP ${status}`,
+              getHeaderValue(response.headers, "x-rolay-request-id")
+            )
+          );
           return;
         }
         onProgress?.({
@@ -9573,7 +9606,14 @@ function startNodeBinaryDownload(urlString, onProgress, signal, nodeRequire, red
             return;
           }
           if (status < 200 || status >= 300) {
-            finishReject(createTextError(status, buffer.toString("utf8"), response.statusMessage || `HTTP ${status}`));
+            finishReject(
+              createTextError(
+                status,
+                buffer.toString("utf8"),
+                response.statusMessage || `HTTP ${status}`,
+                getHeaderValue(response.headers, "x-rolay-request-id")
+              )
+            );
             return;
           }
           finishResolve({
@@ -9679,7 +9719,14 @@ function startElectronBinaryDownload(url, onProgress, signal, electronNet, redir
           return;
         }
         if (status < 200 || status >= 300) {
-          finishReject(createTextError(status, buffer.toString("utf8"), response.statusMessage || `HTTP ${status}`));
+          finishReject(
+            createTextError(
+              status,
+              buffer.toString("utf8"),
+              response.statusMessage || `HTTP ${status}`,
+              getHeaderValue(response.headers, "x-rolay-request-id")
+            )
+          );
           return;
         }
         finishResolve({
@@ -9788,7 +9835,8 @@ function tryNodeBinaryDownloadStream(url, headers, offset, onChunk, onProgress, 
                 createTextError(
                   status,
                   Buffer.concat(errorChunks.map((chunk) => Buffer.from(chunk))).toString("utf8"),
-                  response.statusMessage ?? `HTTP ${status}`
+                  response.statusMessage ?? `HTTP ${status}`,
+                  getHeaderValue(response.headers, "x-rolay-request-id")
                 )
               );
               return;
@@ -9915,7 +9963,8 @@ function tryElectronBinaryDownloadStream(url, headers, offset, onChunk, onProgre
               createTextError(
                 status,
                 Buffer.concat(errorChunks.map((chunk) => Buffer.from(chunk))).toString("utf8"),
-                response.statusMessage ?? `HTTP ${status}`
+                response.statusMessage ?? `HTTP ${status}`,
+                getHeaderValue(response.headers, "x-rolay-request-id")
               )
             );
             return;
@@ -10030,7 +10079,12 @@ function tryNodeBinaryRequest(requestTarget, data, onProgress, signal) {
   });
 }
 function createRequestUrlError(response) {
-  return createTextError(response.status, response.text, `HTTP ${response.status}`);
+  return createTextError(
+    response.status,
+    response.text,
+    `HTTP ${response.status}`,
+    getHeaderValue(response.headers, "x-rolay-request-id")
+  );
 }
 function extractResponseMeta(response) {
   return {
@@ -10088,7 +10142,7 @@ function parseBlobUploadContentResponse(responseText, expectedHash, fallbackSize
     transport
   };
 }
-function createTextError(status, responseText, fallbackMessage) {
+function createTextError(status, responseText, fallbackMessage, requestId = null) {
   try {
     const parsed = JSON.parse(responseText);
     if (parsed?.error?.message) {
@@ -10096,12 +10150,19 @@ function createTextError(status, responseText, fallbackMessage) {
         status,
         parsed.error.message,
         parsed.error.code,
-        parsed.error.details
+        parsed.error.details,
+        requestId
       );
     }
   } catch {
   }
-  return new RolayApiError(status, responseText || fallbackMessage);
+  return new RolayApiError(
+    status,
+    responseText || fallbackMessage,
+    "http_error",
+    void 0,
+    requestId
+  );
 }
 function parseContentLengthHeader(value) {
   if (!value) {
@@ -10214,7 +10275,12 @@ async function fetchBinaryDownloadStream(url, headers, offset, onChunk, onProgre
   });
   if (!response.ok) {
     const responseText = await response.text();
-    throw createTextError(response.status, responseText, `HTTP ${response.status}`);
+    throw createTextError(
+      response.status,
+      responseText,
+      `HTTP ${response.status}`,
+      response.headers.get("X-Rolay-Request-Id")
+    );
   }
   if (!response.body) {
     throw new Error("Binary download response body is empty.");
@@ -10256,7 +10322,12 @@ async function fetchBinaryDownload(url, onProgress, signal) {
   });
   if (!response.ok) {
     const responseText = await response.text();
-    throw createTextError(response.status, responseText, `HTTP ${response.status}`);
+    throw createTextError(
+      response.status,
+      responseText,
+      `HTTP ${response.status}`,
+      response.headers.get("X-Rolay-Request-Id")
+    );
   }
   if (!response.body) {
     throw new Error("Binary download response body is empty.");
@@ -10335,6 +10406,441 @@ function getNodeRequire() {
   } catch {
     return null;
   }
+}
+
+// src/diagnostics/client-error.ts
+var MAX_PENDING_CLIENT_ERROR_REPORTS = 25;
+var MAX_CLIENT_ERROR_BREADCRUMBS = 8;
+var CLIENT_ERROR_DEDUPE_WINDOW_MS = 5 * 6e4;
+var MAX_REPORT_ID_LENGTH = 128;
+var MAX_SCOPE_LENGTH = 64;
+var MAX_MESSAGE_LENGTH = 2e3;
+var MAX_STACK_LENGTH = 6e3;
+var MAX_ERROR_FIELD_LENGTH = 128;
+var MAX_ACTIVE_FILE_PATH_LENGTH = 1024;
+var MAX_WORKSPACE_IDS = 20;
+var MAX_WORKSPACE_ID_LENGTH = 128;
+function createClientErrorReport(input) {
+  return {
+    reportId: createClientErrorReportId(),
+    firstOccurredAt: input.occurredAt,
+    lastOccurredAt: input.occurredAt,
+    occurrenceCount: 1,
+    scope: sanitizeDiagnosticText(input.scope, MAX_SCOPE_LENGTH),
+    message: sanitizeDiagnosticText(input.message, MAX_MESSAGE_LENGTH),
+    error: createClientErrorException(input.error),
+    context: normalizeClientErrorContext(input.context),
+    breadcrumbs: normalizeClientErrorBreadcrumbs(input.breadcrumbs)
+  };
+}
+function enqueueClientErrorReport(reports, incoming) {
+  const incomingAt = Date.parse(incoming.lastOccurredAt);
+  const duplicateIndex = reports.findIndex((report) => {
+    const reportAt = Date.parse(report.lastOccurredAt);
+    return Number.isFinite(incomingAt) && Number.isFinite(reportAt) && incomingAt - reportAt >= 0 && incomingAt - reportAt <= CLIENT_ERROR_DEDUPE_WINDOW_MS && getClientErrorFingerprint(report) === getClientErrorFingerprint(incoming);
+  });
+  const nextReports = [...reports];
+  if (duplicateIndex >= 0) {
+    const duplicate = nextReports[duplicateIndex];
+    nextReports[duplicateIndex] = {
+      ...duplicate,
+      lastOccurredAt: incoming.lastOccurredAt,
+      occurrenceCount: Math.min(1e6, duplicate.occurrenceCount + 1),
+      error: incoming.error,
+      context: incoming.context,
+      breadcrumbs: incoming.breadcrumbs
+    };
+  } else {
+    nextReports.push(incoming);
+  }
+  return nextReports.sort((left, right) => left.firstOccurredAt.localeCompare(right.firstOccurredAt)).slice(-MAX_PENDING_CLIENT_ERROR_REPORTS);
+}
+function normalizePendingClientErrorReports(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  const normalized = value.map((report) => normalizePendingClientErrorReport(report)).filter((report) => report !== null).sort((left, right) => left.firstOccurredAt.localeCompare(right.firstOccurredAt));
+  return normalized.slice(-MAX_PENDING_CLIENT_ERROR_REPORTS);
+}
+function sanitizeDiagnosticText(value, maxLength) {
+  const redacted = value.replace(/\u0000/g, "").replace(
+    /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]+/gi,
+    "$1 [REDACTED]"
+  ).replace(
+    /("(?:access[_-]?token|refresh[_-]?token|authorization|password|current[_-]?password|new[_-]?password|api[_-]?key|secret)"\s*:\s*")[^"]*(")/gi,
+    "$1[REDACTED]$2"
+  ).replace(
+    /\b(access[_-]?token|refresh[_-]?token|authorization|password|current[_-]?password|new[_-]?password|api[_-]?key|secret)\s*[:=]\s*([^\s&,;]+)/gi,
+    "$1=[REDACTED]"
+  ).replace(
+    /(https?:\/\/[^/\s:@]+:)[^@\s/]+@/gi,
+    "$1[REDACTED]@"
+  ).replace(
+    /\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?:\.[A-Za-z0-9_-]{8,})?\b/g,
+    "[REDACTED_TOKEN]"
+  );
+  return redacted.slice(0, Math.max(0, maxLength));
+}
+function createClientErrorException(error) {
+  if (error === void 0 || error === null) {
+    return null;
+  }
+  const candidate = isRecord(error) ? error : {};
+  const name = error instanceof Error ? error.name || "Error" : typeof candidate.name === "string" && candidate.name.trim() ? candidate.name : "Error";
+  const stack = error instanceof Error ? error.stack ?? null : typeof candidate.stack === "string" ? candidate.stack : null;
+  return {
+    name: sanitizeDiagnosticText(name, MAX_ERROR_FIELD_LENGTH) || "Error",
+    stack: stack ? sanitizeDiagnosticText(stack, MAX_STACK_LENGTH) : null,
+    code: normalizeOptionalDiagnosticField(candidate.code),
+    status: normalizeHttpStatus(candidate.status),
+    requestId: normalizeOptionalDiagnosticField(candidate.requestId)
+  };
+}
+function normalizePendingClientErrorReport(value) {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const reportId = normalizeRequiredString(value.reportId, MAX_REPORT_ID_LENGTH);
+  const firstOccurredAt = normalizeDateTime(value.firstOccurredAt);
+  const lastOccurredAt = normalizeDateTime(value.lastOccurredAt);
+  const scope = normalizeRequiredString(value.scope, MAX_SCOPE_LENGTH);
+  const message = normalizeRequiredString(value.message, MAX_MESSAGE_LENGTH);
+  const occurrenceCount = normalizeInteger(value.occurrenceCount, 1, 1e6);
+  const context = normalizePersistedClientErrorContext(value.context);
+  if (!reportId || !firstOccurredAt || !lastOccurredAt || Date.parse(lastOccurredAt) < Date.parse(firstOccurredAt) || !scope || !message || occurrenceCount === null || !context) {
+    return null;
+  }
+  return {
+    reportId,
+    firstOccurredAt,
+    lastOccurredAt,
+    occurrenceCount,
+    scope: sanitizeDiagnosticText(scope, MAX_SCOPE_LENGTH),
+    message: sanitizeDiagnosticText(message, MAX_MESSAGE_LENGTH),
+    error: normalizePersistedClientErrorException(value.error),
+    context,
+    breadcrumbs: normalizeClientErrorBreadcrumbs(
+      Array.isArray(value.breadcrumbs) ? value.breadcrumbs.map((breadcrumb) => normalizePersistedClientErrorBreadcrumb(breadcrumb)).filter((breadcrumb) => breadcrumb !== null) : []
+    )
+  };
+}
+function normalizeClientErrorContext(context) {
+  return {
+    pluginId: "rolay",
+    pluginVersion: sanitizeDiagnosticText(context.pluginVersion, 32),
+    obsidianVersion: sanitizeDiagnosticText(context.obsidianVersion, 32),
+    platform: normalizePlatform(context.platform),
+    runtimeOrigin: sanitizeDiagnosticText(context.runtimeOrigin, 256),
+    locale: sanitizeDiagnosticText(context.locale, 64),
+    userAgent: sanitizeDiagnosticText(context.userAgent, 512),
+    online: Boolean(context.online),
+    nodeRuntime: Boolean(context.nodeRuntime),
+    installationId: sanitizeDiagnosticText(context.installationId, 128),
+    activeFilePath: context.activeFilePath ? sanitizeDiagnosticText(context.activeFilePath, MAX_ACTIVE_FILE_PATH_LENGTH) : null,
+    downloadedWorkspaceIds: normalizeWorkspaceIds(context.downloadedWorkspaceIds),
+    connectedWorkspaceIds: normalizeWorkspaceIds(context.connectedWorkspaceIds),
+    pendingMarkdownCreates: normalizeCounter(context.pendingMarkdownCreates),
+    pendingMarkdownMerges: normalizeCounter(context.pendingMarkdownMerges),
+    pendingBinaryWrites: normalizeCounter(context.pendingBinaryWrites),
+    activeBinaryTransfers: normalizeCounter(context.activeBinaryTransfers)
+  };
+}
+function normalizePersistedClientErrorContext(value) {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const pluginVersion = normalizeRequiredString(value.pluginVersion, 32);
+  const obsidianVersion = normalizeRequiredString(value.obsidianVersion, 32);
+  const runtimeOrigin = normalizeRequiredString(value.runtimeOrigin, 256);
+  const locale = normalizeRequiredString(value.locale, 64);
+  const userAgent = normalizeRequiredString(value.userAgent, 512);
+  const installationId = normalizeRequiredString(value.installationId, 128);
+  if (value.pluginId !== "rolay" || !pluginVersion || !obsidianVersion || !runtimeOrigin || !locale || !userAgent || !installationId) {
+    return null;
+  }
+  return normalizeClientErrorContext({
+    pluginId: "rolay",
+    pluginVersion,
+    obsidianVersion,
+    platform: normalizePlatform(value.platform),
+    runtimeOrigin,
+    locale,
+    userAgent,
+    online: value.online !== false,
+    nodeRuntime: value.nodeRuntime === true,
+    installationId,
+    activeFilePath: typeof value.activeFilePath === "string" ? value.activeFilePath : null,
+    downloadedWorkspaceIds: Array.isArray(value.downloadedWorkspaceIds) ? value.downloadedWorkspaceIds.filter((entry) => typeof entry === "string") : [],
+    connectedWorkspaceIds: Array.isArray(value.connectedWorkspaceIds) ? value.connectedWorkspaceIds.filter((entry) => typeof entry === "string") : [],
+    pendingMarkdownCreates: normalizeCounter(value.pendingMarkdownCreates),
+    pendingMarkdownMerges: normalizeCounter(value.pendingMarkdownMerges),
+    pendingBinaryWrites: normalizeCounter(value.pendingBinaryWrites),
+    activeBinaryTransfers: normalizeCounter(value.activeBinaryTransfers)
+  });
+}
+function normalizePersistedClientErrorException(value) {
+  if (value === null || value === void 0) {
+    return null;
+  }
+  if (!isRecord(value)) {
+    return null;
+  }
+  const name = normalizeRequiredString(value.name, MAX_ERROR_FIELD_LENGTH);
+  if (!name) {
+    return null;
+  }
+  return {
+    name: sanitizeDiagnosticText(name, MAX_ERROR_FIELD_LENGTH),
+    stack: typeof value.stack === "string" ? sanitizeDiagnosticText(value.stack, MAX_STACK_LENGTH) : null,
+    code: normalizeOptionalDiagnosticField(value.code),
+    status: normalizeHttpStatus(value.status),
+    requestId: normalizeOptionalDiagnosticField(value.requestId)
+  };
+}
+function normalizeClientErrorBreadcrumbs(breadcrumbs) {
+  return breadcrumbs.slice(-MAX_CLIENT_ERROR_BREADCRUMBS).map((breadcrumb) => ({
+    at: normalizeDateTime(breadcrumb.at) ?? (/* @__PURE__ */ new Date(0)).toISOString(),
+    level: breadcrumb.level === "error" ? "error" : "info",
+    scope: sanitizeDiagnosticText(breadcrumb.scope, MAX_SCOPE_LENGTH),
+    message: sanitizeDiagnosticText(breadcrumb.message, 500)
+  }));
+}
+function normalizePersistedClientErrorBreadcrumb(value) {
+  if (!isRecord(value)) {
+    return null;
+  }
+  const at = normalizeDateTime(value.at);
+  const scope = normalizeRequiredString(value.scope, MAX_SCOPE_LENGTH);
+  const message = normalizeRequiredString(value.message, 500);
+  if (!at || !scope || !message) {
+    return null;
+  }
+  return {
+    at,
+    level: value.level === "error" ? "error" : "info",
+    scope,
+    message
+  };
+}
+function getClientErrorFingerprint(report) {
+  return [
+    report.context.pluginVersion,
+    report.context.installationId,
+    report.scope,
+    report.message,
+    report.error?.name ?? "",
+    report.error?.code ?? "",
+    report.error?.status ?? ""
+  ].join("");
+}
+function createClientErrorReportId() {
+  const randomId = globalThis.crypto?.randomUUID?.();
+  const suffix = randomId ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return sanitizeDiagnosticText(`err_${suffix}`, MAX_REPORT_ID_LENGTH);
+}
+function normalizeWorkspaceIds(values) {
+  return [...new Set(
+    values.map((value) => sanitizeDiagnosticText(value.trim(), MAX_WORKSPACE_ID_LENGTH)).filter(Boolean)
+  )].slice(0, MAX_WORKSPACE_IDS);
+}
+function normalizePlatform(value) {
+  switch (value) {
+    case "desktop":
+    case "android":
+    case "ios":
+    case "mobile-ui":
+      return value;
+    default:
+      return "unknown";
+  }
+}
+function normalizeOptionalDiagnosticField(value) {
+  if (typeof value !== "string" && typeof value !== "number" || String(value).trim() === "") {
+    return null;
+  }
+  return sanitizeDiagnosticText(String(value), MAX_ERROR_FIELD_LENGTH);
+}
+function normalizeHttpStatus(value) {
+  return Number.isInteger(value) && Number(value) >= 100 && Number(value) <= 599 ? Number(value) : null;
+}
+function normalizeCounter(value) {
+  return Number.isInteger(value) && Number(value) >= 0 ? Math.min(1e6, Number(value)) : 0;
+}
+function normalizeInteger(value, minimum, maximum) {
+  return Number.isInteger(value) && Number(value) >= minimum && Number(value) <= maximum ? Number(value) : null;
+}
+function normalizeRequiredString(value, maxLength) {
+  if (typeof value !== "string" || !value.trim()) {
+    return null;
+  }
+  return value.slice(0, maxLength);
+}
+function normalizeDateTime(value) {
+  return typeof value === "string" && !Number.isNaN(Date.parse(value)) ? value : null;
+}
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// src/diagnostics/client-error-reporter.ts
+var CAPTURE_FLUSH_DELAY_MS = 2e3;
+var DELIVERY_UNAVAILABLE_RETRY_MS = 6e4;
+var MAX_REPORTS_PER_BATCH = 5;
+var RETRY_DELAYS_MS = [
+  3e4,
+  2 * 6e4,
+  5 * 6e4,
+  15 * 6e4
+];
+var ClientErrorReporter = class {
+  constructor(config) {
+    this.flushHandle = null;
+    this.flushScheduledAt = null;
+    this.flushPromise = null;
+    this.consecutiveFailures = 0;
+    this.started = false;
+    this.stopped = false;
+    this.config = config;
+  }
+  start() {
+    if (this.started) {
+      return;
+    }
+    this.started = true;
+    this.stopped = false;
+    if (this.config.getPendingReports().length > 0) {
+      this.scheduleFlush(0);
+    }
+  }
+  stop() {
+    this.started = false;
+    this.stopped = true;
+    if (this.flushHandle !== null) {
+      window.clearTimeout(this.flushHandle);
+      this.flushHandle = null;
+      this.flushScheduledAt = null;
+    }
+  }
+  capture(scope, message, error) {
+    try {
+      const occurredAt = (/* @__PURE__ */ new Date()).toISOString();
+      const report = createClientErrorReport({
+        occurredAt,
+        scope,
+        message,
+        error,
+        context: this.config.getContext(),
+        breadcrumbs: this.config.getBreadcrumbs()
+      });
+      const reports = enqueueClientErrorReport(
+        this.config.getPendingReports(),
+        report
+      );
+      this.config.replacePendingReports(reports);
+      this.scheduleFlush(CAPTURE_FLUSH_DELAY_MS);
+    } catch (captureError) {
+      console.warn(
+        `[Rolay] diagnostics: Failed to queue client error report: ${getErrorMessage(captureError)}`
+      );
+    }
+  }
+  notifyDeliveryAvailable() {
+    if (!this.started || this.stopped) {
+      return;
+    }
+    this.consecutiveFailures = 0;
+    this.scheduleFlush(0);
+  }
+  scheduleFlush(delayMs) {
+    if (!this.started || this.stopped || this.config.getPendingReports().length === 0) {
+      return;
+    }
+    const scheduledAt = Date.now() + Math.max(0, delayMs);
+    if (this.flushHandle !== null && this.flushScheduledAt !== null && this.flushScheduledAt <= scheduledAt) {
+      return;
+    }
+    if (this.flushHandle !== null) {
+      window.clearTimeout(this.flushHandle);
+    }
+    this.flushScheduledAt = scheduledAt;
+    this.flushHandle = window.setTimeout(() => {
+      this.flushHandle = null;
+      this.flushScheduledAt = null;
+      void this.flush();
+    }, Math.max(0, delayMs));
+  }
+  async flush() {
+    if (this.stopped || this.flushPromise) {
+      return;
+    }
+    if (this.config.getPendingReports().length === 0) {
+      return;
+    }
+    if (!this.config.canSend() || globalThis.navigator?.onLine === false) {
+      this.scheduleFlush(DELIVERY_UNAVAILABLE_RETRY_MS);
+      return;
+    }
+    const batch = this.config.getPendingReports().slice(0, MAX_REPORTS_PER_BATCH);
+    const delivery = this.deliverBatch(batch);
+    this.flushPromise = delivery;
+    try {
+      await delivery;
+    } finally {
+      if (this.flushPromise === delivery) {
+        this.flushPromise = null;
+      }
+    }
+  }
+  async deliverBatch(batch) {
+    try {
+      const response = await this.config.apiClient.submitClientErrors({
+        reports: batch
+      });
+      if (this.stopped) {
+        return;
+      }
+      if (response.accepted !== batch.length) {
+        throw new Error(
+          `Server accepted ${response.accepted} of ${batch.length} client error reports.`
+        );
+      }
+      const sentById = new Map(batch.map((report) => [report.reportId, report]));
+      const remaining = this.config.getPendingReports().filter((current) => {
+        const sent = sentById.get(current.reportId);
+        return !sent || current.lastOccurredAt !== sent.lastOccurredAt || current.occurrenceCount !== sent.occurrenceCount;
+      });
+      this.config.replacePendingReports(remaining);
+      this.consecutiveFailures = 0;
+      this.config.log(
+        `Delivered ${batch.length} client error report(s) as server request ${response.requestId}.`
+      );
+      if (remaining.length > 0) {
+        this.scheduleFlush(0);
+      }
+    } catch (error) {
+      if (this.stopped) {
+        return;
+      }
+      this.consecutiveFailures += 1;
+      const retryDelay = getRetryDelay(this.consecutiveFailures);
+      this.config.log(
+        `Client error delivery failed; retrying automatically in ${Math.round(
+          retryDelay / 1e3
+        )}s: ${sanitizeDiagnosticText(getErrorMessage(error), 500)}`
+      );
+      this.scheduleFlush(retryDelay);
+    }
+  }
+};
+function getRetryDelay(consecutiveFailures) {
+  const index = Math.min(
+    Math.max(0, consecutiveFailures - 1),
+    RETRY_DELAYS_MS.length - 1
+  );
+  return RETRY_DELAYS_MS[index];
+}
+function getErrorMessage(error) {
+  return error instanceof Error ? error.message : String(error);
 }
 
 // src/obsidian/file-bridge.ts
@@ -10837,7 +11343,10 @@ var _FileBridge = class _FileBridge {
     try {
       return await this.app.vault.cachedRead(file);
     } catch (error) {
-      this.log(`Failed to read markdown content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
+      this.log(
+        `Failed to read markdown content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
       return "";
     }
   }
@@ -10845,7 +11354,10 @@ var _FileBridge = class _FileBridge {
     try {
       return await this.app.vault.readBinary(file);
     } catch (error) {
-      this.log(`Failed to read binary content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
+      this.log(
+        `Failed to read binary content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
       return new ArrayBuffer(0);
     }
   }
@@ -10925,7 +11437,10 @@ var _FileBridge = class _FileBridge {
     try {
       await work();
     } catch (error) {
-      this.log(`${label} failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.log(
+        `${label} failed: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
     }
   }
   markRecentRemoteCreate(path) {
@@ -13741,7 +14256,8 @@ var BoundCrdtSession = class {
         this.clearRemotePresence();
       },
       onAuthenticationFailed: ({ reason }) => {
-        this.log(`CRDT auth failed for ${this.file.path}: ${reason}`);
+        const error = new Error(`CRDT auth failed for ${this.file.path}: ${reason}`);
+        this.log(error.message, error);
         this.clearLocalPresence();
         this.clearRemotePresence();
         this.provider?.disconnect();
@@ -14094,8 +14610,8 @@ function getPrimaryEditorSelection(editor) {
   };
 }
 function parseRemotePresenceState(clientId, state) {
-  const user = isRecord(state.user) ? state.user : null;
-  const selection = isRecord(state.selection) ? state.selection : null;
+  const user = isRecord2(state.user) ? state.user : null;
+  const selection = isRecord2(state.selection) ? state.selection : null;
   if (!user || !selection) {
     return null;
   }
@@ -14118,7 +14634,7 @@ function parseRemotePresenceState(clientId, state) {
     }
   };
 }
-function isRecord(value) {
+function isRecord2(value) {
   return Boolean(value) && typeof value === "object";
 }
 function createCrdtTokenSupplier(apiClient, entryId, initialToken) {
@@ -14359,6 +14875,7 @@ function createDefaultPluginData() {
     pendingMarkdownMerges: {},
     pendingBinaryWrites: {},
     binaryTransfers: {},
+    pendingClientErrors: [],
     deviceId: createDeviceId(),
     logs: []
   };
@@ -14400,6 +14917,7 @@ function mergePluginData(rawData) {
     pendingMarkdownMerges: normalizePendingMarkdownMerges(rawData?.pendingMarkdownMerges),
     pendingBinaryWrites: normalizePendingBinaryWrites(rawData?.pendingBinaryWrites),
     binaryTransfers: normalizeBinaryTransfers(rawData?.binaryTransfers),
+    pendingClientErrors: normalizePendingClientErrorReports(rawData?.pendingClientErrors),
     deviceId: rawData?.deviceId ?? defaults.deviceId,
     logs: Array.isArray(rawData?.logs) ? rawData.logs.slice(-100) : defaults.logs
   };
@@ -14842,10 +15360,16 @@ var INSTALL_ORDER = [
   "manifest.json"
 ];
 var PLAIN_SEMVER_PATTERN = /^\d+\.\d+\.\d+$/;
-var INITIAL_CHECK_DELAY_MS = 8e3;
+var INITIAL_CHECK_DELAY_MS = 0;
 var CHECK_INTERVAL_MS = 15 * 60 * 1e3;
+var STARTUP_DEFERRED_CHECK_DELAYS_MS = [
+  5e3,
+  15e3,
+  3e4,
+  6e4
+];
 var INSTALL_RETRY_DELAY_MS = 5e3;
-var RETRY_DELAYS_MS = [
+var RETRY_DELAYS_MS2 = [
   3e4,
   2 * 6e4,
   5 * 6e4,
@@ -14868,6 +15392,8 @@ var PluginUpdater = class {
     this.failurePhase = null;
     this.lastBlockerSignature = "";
     this.lastBlockerLoggedAt = 0;
+    this.startupCheckCompleted = false;
+    this.startupDeferredCheckAttempt = 0;
     this.started = false;
     this.stopped = false;
     this.config = config;
@@ -14890,6 +15416,8 @@ var PluginUpdater = class {
     }
     this.started = true;
     this.stopped = false;
+    this.startupCheckCompleted = false;
+    this.startupDeferredCheckAttempt = 0;
     this.scheduleCheck(INITIAL_CHECK_DELAY_MS);
   }
   stop() {
@@ -14923,7 +15451,8 @@ var PluginUpdater = class {
     if (isPluginUpdateAvailable(this.state)) {
       this.scheduleInstall(0);
     }
-    this.scheduleCheck(2e3);
+    this.startupDeferredCheckAttempt = 0;
+    this.scheduleCheck(0);
   }
   scheduleCheck(delayMs) {
     if (!this.started || this.stopped || this.state.status === "restart-required") {
@@ -14966,17 +15495,24 @@ var PluginUpdater = class {
       return;
     }
     if (navigator.onLine === false) {
-      this.scheduleCheck(CHECK_INTERVAL_MS);
+      this.scheduleCheck(this.getDeferredCheckDelay());
       return;
     }
-    if (this.checkPromise || this.installPromise) {
-      this.scheduleCheck(CHECK_INTERVAL_MS);
+    if (this.checkPromise) {
+      return;
+    }
+    if (this.installPromise) {
+      this.scheduleCheck(
+        this.startupCheckCompleted ? CHECK_INTERVAL_MS : this.getDeferredCheckDelay()
+      );
       return;
     }
     const check = this.runCheck();
     this.checkPromise = check;
     try {
       const state = await check;
+      this.startupCheckCompleted = true;
+      this.startupDeferredCheckAttempt = 0;
       if (isPluginUpdateAvailable(state)) {
         this.scheduleInstall(0);
       }
@@ -14991,6 +15527,17 @@ var PluginUpdater = class {
         this.checkPromise = null;
       }
     }
+  }
+  getDeferredCheckDelay() {
+    if (this.startupCheckCompleted) {
+      return CHECK_INTERVAL_MS;
+    }
+    const index = Math.min(
+      this.startupDeferredCheckAttempt,
+      STARTUP_DEFERRED_CHECK_DELAYS_MS.length - 1
+    );
+    this.startupDeferredCheckAttempt += 1;
+    return STARTUP_DEFERRED_CHECK_DELAYS_MS[index];
   }
   async runAutomaticInstall() {
     if (this.stopped || this.state.status === "restart-required" || this.installPromise) {
@@ -15046,7 +15593,7 @@ var PluginUpdater = class {
   recordFailure(phase, error) {
     const message = describeError(error);
     const consecutiveFailures = this.state.consecutiveFailures + 1;
-    const retryDelay = getRetryDelay(consecutiveFailures);
+    const retryDelay = getRetryDelay2(consecutiveFailures);
     this.failurePhase = phase;
     this.updateState({
       status: "error",
@@ -15059,7 +15606,7 @@ var PluginUpdater = class {
     });
     this.log(
       `Plugin update ${phase} failed (attempt ${consecutiveFailures}); retrying automatically: ${message}`,
-      true
+      error
     );
     return retryDelay;
   }
@@ -15304,7 +15851,7 @@ var PluginUpdater = class {
       throw new Error("Rolay unloaded before the update operation completed.");
     }
   }
-  log(message, error = false) {
+  log(message, error) {
     if (!this.stopped) {
       this.config.log(message, error);
     }
@@ -15391,7 +15938,7 @@ function validateDownloadedPluginManifest(data, version, pluginId) {
   } catch {
     throw new Error("Downloaded plugin manifest is not valid UTF-8 JSON.");
   }
-  if (!isRecord2(parsed) || parsed.id !== pluginId || parsed.version !== version) {
+  if (!isRecord3(parsed) || parsed.id !== pluginId || parsed.version !== version) {
     throw new Error(
       `Downloaded manifest must declare id "${pluginId}" and version "${version}".`
     );
@@ -15479,18 +16026,18 @@ function createOperationId() {
   const randomId = globalThis.crypto?.randomUUID?.();
   return randomId ? randomId.replace(/-/g, "") : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
-function isRecord2(value) {
+function isRecord3(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 function describeError(error) {
   return error instanceof Error ? error.message : String(error);
 }
-function getRetryDelay(consecutiveFailures) {
+function getRetryDelay2(consecutiveFailures) {
   const index = Math.min(
     Math.max(0, consecutiveFailures - 1),
-    RETRY_DELAYS_MS.length - 1
+    RETRY_DELAYS_MS2.length - 1
   );
-  return RETRY_DELAYS_MS[index];
+  return RETRY_DELAYS_MS2[index];
 }
 
 // src/settings/tab.ts
@@ -18105,6 +18652,7 @@ function decodeBase64(encoded) {
 var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
   constructor() {
     super(...arguments);
+    this.clientErrorReporter = null;
     this.roomRuntime = /* @__PURE__ */ new Map();
     this.roomInvites = /* @__PURE__ */ new Map();
     this.pendingLocalCreates = /* @__PURE__ */ new Map();
@@ -18184,7 +18732,26 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
           this.stopSettingsEventStream();
         }
         await this.persistNow();
+        if (session) {
+          this.clientErrorReporter?.notifyDeliveryAvailable();
+        }
         this.updateStatusBar();
+      }
+    });
+    this.clientErrorReporter = new ClientErrorReporter({
+      apiClient: this.apiClient,
+      getPendingReports: () => this.data.pendingClientErrors,
+      replacePendingReports: (reports) => {
+        this.data.pendingClientErrors = reports;
+        this.schedulePersist();
+      },
+      canSend: () => Boolean(
+        this.data.session?.accessToken || this.data.session?.refreshToken
+      ),
+      getContext: () => this.createClientErrorContext(),
+      getBreadcrumbs: () => this.data.logs.slice(-8),
+      log: (message) => {
+        this.recordLog("diagnostics", message);
       }
     });
     this.pluginUpdater = new PluginUpdater({
@@ -18200,8 +18767,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         this.updatePluginUpdateUi();
         this.requestSettingsRender();
       },
-      log: (message, error = false) => {
-        this.recordLog("update", message, error ? "error" : "info");
+      log: (message, error) => {
+        this.recordLog(
+          "update",
+          message,
+          error === void 0 ? "info" : "error",
+          error
+        );
       }
     });
     this.updateRibbonEl = this.addRibbonIcon(
@@ -18221,7 +18793,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       getPersistedCrdtState: (entryId) => this.getPersistedCrdtState(entryId),
       persistCrdtState: (entryId, filePath, state) => this.persistCrdtState(entryId, filePath, state),
       resolveEntryByLocalPath: (localPath) => this.resolveEntryByLocalPath(localPath),
-      log: (message) => this.recordLog("crdt", message)
+      log: (message, error) => this.recordLog(
+        "crdt",
+        message,
+        error === void 0 ? "info" : "error",
+        error
+      )
     });
     this.registerEditorExtension(
       createSharedPresenceExtension(({ filePath, editor, focused }) => {
@@ -18257,7 +18834,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       hasPendingCreate: (workspaceId, path) => this.hasPendingLocalCreate(workspaceId, path),
       hasPendingDelete: (workspaceId, path) => this.hasPendingLocalDelete(workspaceId, path),
       hasPendingBinaryWrite: (localPath) => (0, import_obsidian10.normalizePath)(localPath) in this.data.pendingBinaryWrites,
-      log: (message) => this.recordLog("bridge", message),
+      log: (message, error) => this.recordLog(
+        "bridge",
+        message,
+        error === void 0 ? "info" : "error",
+        error
+      ),
       onCreateFolder: (workspaceId, path) => this.queueCreateFolder(workspaceId, path),
       onCreateMarkdown: (workspaceId, path, localContent) => this.queueCreateMarkdown(workspaceId, path, localContent),
       onCreateBinary: (workspaceId, path, localContent) => this.queueBinaryWrite(workspaceId, path, localContent, null),
@@ -18297,6 +18879,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     );
     this.registerDomEvent(window, "online", () => {
       this.pluginUpdater.notifyConnectivityRestored();
+      this.clientErrorReporter?.notifyDeliveryAvailable();
       this.scheduleLiveTransportRecovery("network-online");
     });
     if (import_obsidian10.Platform.isMobileApp) {
@@ -18348,6 +18931,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     this.register(() => {
       this.isUnloading = true;
       this.pluginUpdater.stop();
+      this.clientErrorReporter?.stop();
       this.stopSettingsEventStream();
       this.clearLifecycleRecovery();
       if (this.persistHandle !== null) {
@@ -18399,6 +18983,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       `Runtime platform=${getRuntimePlatformLabel()} server=${normalizeServerUrl(this.data.settings.serverUrl)} origin=${getRuntimeOriginLabel()} rest=requestUrl sse=${hasNodeRuntime() ? "node-http(s)" : "fetch"} blob=${hasNodeRuntime() ? "electron/node/xhr/fetch" : "xhr/fetch"} crdt=websocket downloadConcurrency=${_RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY} uploadChunkBytes=${_RolayPlugin.BINARY_UPLOAD_CHUNK_SIZE}.`
     );
     this.scheduleStartupBootstrap("startup");
+    this.clientErrorReporter.start();
     this.pluginUpdater.start();
   }
   async onunload() {
@@ -18803,7 +19388,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     } catch (error) {
       const friendlyMessage = this.getPasswordChangeErrorMessage(error);
       if (friendlyMessage) {
-        this.recordLog("error", `Password change failed: ${friendlyMessage}`, "error");
+        this.recordLog(
+          "error",
+          `Password change failed: ${friendlyMessage}`,
+          "error",
+          error
+        );
         new import_obsidian10.Notice(friendlyMessage);
         throw new Error(friendlyMessage);
       }
@@ -19199,7 +19789,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       this.recordLog(
         "rooms",
         `Failed to load members for room ${workspaceId}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       return this.getRoomMembers(workspaceId);
     }
@@ -20134,7 +20725,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     try {
       await this.refreshClosedRoomMarkdownContent(workspaceId, reason);
     } catch (error) {
-      const message = getErrorMessage(error);
+      const message = getErrorMessage2(error);
       if (isStaleMarkdownBootstrapError(error)) {
         this.recordLog(
           "crdt",
@@ -20150,7 +20741,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         this.recordLog(
           "crdt",
           `[${workspaceId}] Background markdown refresh failed: ${message}`,
-          "error"
+          "error",
+          error
         );
       }
     } finally {
@@ -20163,13 +20755,42 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       this.scheduleBackgroundMarkdownRefresh(workspaceId, "background-markdown");
     }
   }
-  recordLog(scope, message, level = "info") {
+  createClientErrorContext() {
+    const downloadedWorkspaceIds = this.getDownloadedRooms().map((room) => room.workspaceId).sort().slice(0, 20);
+    const connectedWorkspaceIds = [...this.roomRuntime.entries()].filter(([, runtime]) => runtime.streamStatus !== "stopped").map(([workspaceId]) => workspaceId).sort().slice(0, 20);
+    const activeBinaryTransfers = [...this.binaryTransferState.values()].filter(
+      (transfer) => transfer.status !== "done" && transfer.status !== "failed"
+    ).length;
+    return {
+      pluginId: "rolay",
+      pluginVersion: this.manifest.version,
+      obsidianVersion: import_obsidian10.apiVersion?.trim() || "unknown",
+      platform: getRuntimePlatformLabel(),
+      runtimeOrigin: getRuntimeOriginLabel(),
+      locale: getRuntimeLocaleLabel(),
+      userAgent: globalThis.navigator?.userAgent?.trim() || "unavailable",
+      online: globalThis.navigator?.onLine !== false,
+      nodeRuntime: hasNodeRuntime(),
+      installationId: this.data.deviceId,
+      activeFilePath: this.app.workspace.getActiveFile()?.path ?? null,
+      downloadedWorkspaceIds,
+      connectedWorkspaceIds,
+      pendingMarkdownCreates: Object.keys(this.data.pendingMarkdownCreates).length,
+      pendingMarkdownMerges: Object.keys(this.data.pendingMarkdownMerges).length,
+      pendingBinaryWrites: Object.keys(this.data.pendingBinaryWrites).length,
+      activeBinaryTransfers
+    };
+  }
+  recordLog(scope, message, level = "info", reportError) {
     const entry = {
       at: (/* @__PURE__ */ new Date()).toISOString(),
       level,
       scope,
       message
     };
+    if (level === "error" && scope !== "diagnostics") {
+      this.clientErrorReporter?.capture(scope, message, reportError);
+    }
     this.data.logs = [
       ...trimRecentLogEntries(this.data.logs, Date.now(), _RolayPlugin.LOG_FILE_RETENTION_MS, 99),
       entry
@@ -20182,7 +20803,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
   }
   handleError(title, error, showNotice = true) {
     const message = error instanceof Error ? error.message : String(error);
-    this.recordLog("error", `${title}: ${message}`, "error");
+    this.recordLog("error", `${title}: ${message}`, "error", error);
     if (showNotice) {
       new import_obsidian10.Notice(`${title}: ${message}`);
     }
@@ -21760,7 +22381,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         this.recordLog(
           "blob",
           `[${transfer.workspaceId}] Failed to cancel blob upload ${transfer.uploadId} for ${transfer.serverPath}: ${error instanceof Error ? error.message : String(error)}`,
-          "error"
+          "error",
+          error
         );
       }
     }
@@ -21833,7 +22455,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       this.recordLog(
         "blob",
         `[${blocked.workspaceId}] Failed to revert downloading binary rename for ${oldPath}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-downloading-binary-rename");
     }
@@ -21881,7 +22504,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       this.recordLog(
         "crdt",
         `[${blocked.workspaceId}] Failed to revert locked rename for ${oldPath}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-locked-rename");
     }
@@ -22852,8 +23476,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     this.scheduleExplorerLoadingDecorations();
     this.recordLog(
       "ops",
-      `[${workspaceId}] Keeping local markdown create for ${serverPath} pending until the next successful room refresh/connect: ${errorMessage}`,
-      "error"
+      `[${workspaceId}] Keeping local markdown create for ${serverPath} pending until the next successful room refresh/connect: ${errorMessage}`
     );
   }
   rememberPendingMarkdownMerge(workspaceId, entryId, localPath, filePath, error = null) {
@@ -22999,7 +23622,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       this.recordLog(
         "crdt",
         `Dropped invalid persisted CRDT cache for ${entryId}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       this.schedulePersist();
       return null;
@@ -23465,7 +24089,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       if (runtime.markdownBootstrap.runToken !== runToken) {
         return;
       }
-      const message = getErrorMessage(error);
+      const message = getErrorMessage2(error);
       if (isStaleMarkdownBootstrapError(error)) {
         runtime.markdownBootstrap.lastError = null;
         runtime.markdownBootstrap.status = "idle";
@@ -23482,7 +24106,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       this.recordLog(
         "crdt",
         `[${workspaceId}] HTTP markdown bootstrap failed: ${message}`,
-        "error"
+        "error",
+        error
       );
       this.updateStatusBar();
     }
@@ -23838,7 +24463,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
           currentLocalContent,
           0
         );
-      } catch {
+      } catch (error) {
+        this.handleError(
+          `Pending markdown create replay failed for ${currentServerPath}`,
+          error,
+          false
+        );
       }
     }
   }
@@ -23900,6 +24530,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         this.clearPendingMarkdownMerge(entry.id);
       } catch (error) {
         this.rememberPendingMarkdownMerge(workspaceId, entry.id, pendingMerge.localPath, currentServerPath, error);
+        this.handleError(
+          `Pending markdown merge replay failed for ${currentServerPath}`,
+          error,
+          false
+        );
       }
     }
   }
@@ -24217,7 +24852,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
               this.recordLog(
                 "blob",
                 `[${workspaceId}] Upload offset mismatch for ${desiredServerPath}; resuming from ${formatByteCount(expectedOffset)}.`,
-                "error"
+                "error",
+                error
               );
               this.traceBlob(
                 `[${workspaceId}] upload content mismatch entryId=${entry.id} uploadId=${ticket.uploadId} localPath=${desiredLocalPath} expectedOffset=${expectedOffset} chunkStart=${currentOffset} chunkEnd=${nextChunkEnd - 1}`,
@@ -24340,11 +24976,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         if (mismatchDetails) {
           this.recordLog(
             "blob",
-            `[${workspaceId}] Blob hash mismatch for ${finalServerPath}: ${mismatchDetails}`,
-            "error"
+            `[${workspaceId}] Blob hash mismatch for ${finalServerPath}: ${mismatchDetails}`
           );
         }
-        this.recordLog("blob", `[${workspaceId}] Binary sync failed for ${finalLocalPath}: ${message}`, "error");
         this.handleError(`Binary sync failed for ${finalLocalPath}`, error, false);
       }
       const transfer = this.binaryTransferState.get((0, import_obsidian10.normalizePath)(finalLocalPath));
@@ -24853,7 +25487,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         this.recordLog(
           "blob",
           `[${workspaceId}] Binary download failed for ${entry.path}: ${error instanceof Error ? error.message : String(error)}`,
-          "error"
+          "error",
+          error
         );
       } else if (!this.isUnloading) {
         this.recordLog("blob", `[${workspaceId}] Binary download aborted for ${entry.path}.`);
@@ -24982,7 +25617,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       this.recordLog(
         "blob",
         `[${workspaceId}] Failed to delete abandoned binary placeholder ${entry.path}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
     }
   }
@@ -25133,7 +25769,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       this.recordLog(
         "bridge",
         `Failed to read local markdown content for ${localPath}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       return fallback;
     }
@@ -25149,7 +25786,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       this.recordLog(
         "blob",
         `Failed to read local binary content for ${localPath}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       return fallback;
     }
@@ -25183,7 +25821,7 @@ _RolayPlugin.STARTUP_ROOM_CONNECT_STAGGER_MS = 900;
 _RolayPlugin.PLUGIN_UPDATE_QUIET_WINDOW_MS = 5e3;
 var RolayPlugin = _RolayPlugin;
 function normalizeSettingsEventEnvelope(event) {
-  const rawData = isRecord3(event.data) ? event.data : {};
+  const rawData = isRecord4(event.data) ? event.data : {};
   const eventId = typeof rawData["eventId"] === "number" ? rawData["eventId"] : event.id;
   const type = typeof rawData["type"] === "string" ? rawData["type"] : event.event;
   const occurredAt = typeof rawData["occurredAt"] === "string" ? rawData["occurredAt"] : (/* @__PURE__ */ new Date()).toISOString();
@@ -25297,7 +25935,7 @@ function extractInviteFromSettingsPayload(payload) {
   };
 }
 function extractRoomMembershipChangedPayload(payload) {
-  if (!isRecord3(payload)) {
+  if (!isRecord4(payload)) {
     return null;
   }
   const room = extractRoomFromSettingsPayload(payload);
@@ -25313,7 +25951,7 @@ function extractRoomMembershipChangedPayload(payload) {
   };
 }
 function extractWorkspaceIdFromSettingsPayload(payload) {
-  if (!isRecord3(payload)) {
+  if (!isRecord4(payload)) {
     return null;
   }
   if (typeof payload.workspaceId === "string") {
@@ -25323,7 +25961,7 @@ function extractWorkspaceIdFromSettingsPayload(payload) {
   return room?.workspace.id ?? null;
 }
 function extractUserIdFromSettingsPayload(payload) {
-  if (!isRecord3(payload)) {
+  if (!isRecord4(payload)) {
     return null;
   }
   if (typeof payload.userId === "string") {
@@ -25333,7 +25971,7 @@ function extractUserIdFromSettingsPayload(payload) {
   return user?.id ?? null;
 }
 function extractAdminRoomMembersPayload(payload) {
-  if (!isRecord3(payload) || typeof payload.workspaceId !== "string" || !Array.isArray(payload.members)) {
+  if (!isRecord4(payload) || typeof payload.workspaceId !== "string" || !Array.isArray(payload.members)) {
     return null;
   }
   const members = payload.members.map((member) => extractRoomMember(member)).filter((member) => member !== null).sort(compareRoomMembers);
@@ -25343,7 +25981,7 @@ function extractAdminRoomMembersPayload(payload) {
   };
 }
 function extractRoomPublicationUpdatedPayload(payload) {
-  if (!isRecord3(payload) || typeof payload.workspaceId !== "string") {
+  if (!isRecord4(payload) || typeof payload.workspaceId !== "string") {
     return null;
   }
   const publication = extractRoomPublicationState(payload.publication, payload.workspaceId);
@@ -25356,7 +25994,7 @@ function extractRoomPublicationUpdatedPayload(payload) {
   };
 }
 function extractRoomPublicationState(payload, fallbackWorkspaceId) {
-  if (!isRecord3(payload)) {
+  if (!isRecord4(payload)) {
     return createDefaultRoomPublicationState(fallbackWorkspaceId);
   }
   const workspaceId = typeof payload.workspaceId === "string" && payload.workspaceId.trim() ? payload.workspaceId : fallbackWorkspaceId;
@@ -25369,7 +26007,7 @@ function extractRoomPublicationState(payload, fallbackWorkspaceId) {
   };
 }
 function extractNotePresenceSnapshotPayload(payload) {
-  if (!isRecord3(payload) || typeof payload.workspaceId !== "string" || !Array.isArray(payload.notes)) {
+  if (!isRecord4(payload) || typeof payload.workspaceId !== "string" || !Array.isArray(payload.notes)) {
     return null;
   }
   const notes = payload.notes.map((note) => extractNotePresenceSnapshotNote(note)).filter((note) => note !== null);
@@ -25379,7 +26017,7 @@ function extractNotePresenceSnapshotPayload(payload) {
   };
 }
 function extractNotePresenceUpdatedPayload(payload) {
-  if (!isRecord3(payload) || typeof payload.workspaceId !== "string" || typeof payload.entryId !== "string" || !Array.isArray(payload.viewers)) {
+  if (!isRecord4(payload) || typeof payload.workspaceId !== "string" || typeof payload.entryId !== "string" || !Array.isArray(payload.viewers)) {
     return null;
   }
   const viewers = payload.viewers.map((viewer) => extractNotePresenceViewer(viewer)).filter((viewer) => viewer !== null).sort(compareNotePresenceViewers);
@@ -25391,7 +26029,7 @@ function extractNotePresenceUpdatedPayload(payload) {
   };
 }
 function extractNotePresenceSnapshotNote(payload) {
-  if (!isRecord3(payload) || typeof payload.entryId !== "string" || !Array.isArray(payload.viewers)) {
+  if (!isRecord4(payload) || typeof payload.entryId !== "string" || !Array.isArray(payload.viewers)) {
     return null;
   }
   const viewers = payload.viewers.map((viewer) => extractNotePresenceViewer(viewer)).filter((viewer) => viewer !== null).sort(compareNotePresenceViewers);
@@ -25402,7 +26040,7 @@ function extractNotePresenceSnapshotNote(payload) {
   };
 }
 function extractNotePresenceViewer(payload) {
-  if (!isRecord3(payload) || typeof payload.presenceId !== "string" || typeof payload.userId !== "string" || typeof payload.displayName !== "string" || typeof payload.color !== "string" || typeof payload.hasSelection !== "boolean") {
+  if (!isRecord4(payload) || typeof payload.presenceId !== "string" || typeof payload.userId !== "string" || typeof payload.displayName !== "string" || typeof payload.color !== "string" || typeof payload.hasSelection !== "boolean") {
     return null;
   }
   return {
@@ -25426,7 +26064,7 @@ function createEmptyNotePresenceDisplayState() {
   };
 }
 function extractRoomMember(payload) {
-  if (!isRecord3(payload)) {
+  if (!isRecord4(payload)) {
     return null;
   }
   const user = extractUserFromSettingsPayload(payload.user);
@@ -25440,7 +26078,7 @@ function extractRoomMember(payload) {
   };
 }
 function extractWorkspace(payload) {
-  if (!isRecord3(payload) || typeof payload.id !== "string" || typeof payload.name !== "string") {
+  if (!isRecord4(payload) || typeof payload.id !== "string" || typeof payload.name !== "string") {
     return null;
   }
   return {
@@ -25450,15 +26088,15 @@ function extractWorkspace(payload) {
   };
 }
 function unwrapSettingsPayloadObject(payload, nestedKey) {
-  if (!isRecord3(payload)) {
+  if (!isRecord4(payload)) {
     return null;
   }
-  if (isRecord3(payload[nestedKey])) {
+  if (isRecord4(payload[nestedKey])) {
     return payload[nestedKey];
   }
   return payload;
 }
-function isRecord3(value) {
+function isRecord4(value) {
   return typeof value === "object" && value !== null;
 }
 function compareRoomsByName(left, right) {
@@ -25566,18 +26204,18 @@ function formatBlobHashMismatchDetails(error) {
   }
   return parts.join(", ");
 }
-function getErrorMessage(error) {
+function getErrorMessage2(error) {
   return error instanceof Error ? error.message : String(error);
 }
 function isStaleMarkdownBootstrapError(error) {
-  const message = getErrorMessage(error).toLowerCase();
+  const message = getErrorMessage2(error).toLowerCase();
   return message.includes("markdown entry not found");
 }
 function isRetryableBackgroundMarkdownError(error) {
   if (error instanceof RolayApiError && [408, 429, 500, 502, 503, 504].includes(error.status)) {
     return true;
   }
-  const message = getErrorMessage(error);
+  const message = getErrorMessage2(error);
   return message.includes("ERR_CONTENT_LENGTH_MISMATCH") || message.includes("ERR_NETWORK_IO_SUSPENDED") || message.includes("Failed to fetch") || message.includes("NetworkError");
 }
 function getBinaryTransferProgressActivity(status) {
@@ -25728,6 +26366,13 @@ function getRuntimePlatformLabel() {
     return "mobile-ui";
   }
   return "unknown";
+}
+function getRuntimeLocaleLabel() {
+  try {
+    return (0, import_obsidian10.getLanguage)()?.trim() || globalThis.navigator?.language?.trim() || "unknown";
+  } catch {
+    return globalThis.navigator?.language?.trim() || "unknown";
+  }
 }
 function hasNodeRuntime() {
   const runtime = globalThis;

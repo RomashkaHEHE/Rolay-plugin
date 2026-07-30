@@ -23,6 +23,7 @@ The current MVP is built against the live Rolay `v1` contract and now follows th
 - settings/admin live updates through `GET /v1/events/settings`
 - room-level markdown note presence through `GET /v1/workspaces/{workspaceId}/note-presence/events`
 - public plugin update discovery through `GET /v1/plugin-updates/latest`
+- authenticated durable client error reporting through `POST /v1/client-errors`
 - CRDT bootstrap for markdown files through `crdt-token` and Yjs/Hocuspocus
 - room-level markdown bootstrap through `POST /v1/workspaces/{workspaceId}/markdown/bootstrap`
 - binary/blob sync for every non-markdown file through upload/download tickets and `commit_blob_revision`
@@ -42,6 +43,7 @@ The plugin treats Rolay as a layered sync system:
 - Password change lives under `PATCH /v1/auth/me/password` and rotates the active session
 - Room publication lives under `GET/PATCH /v1/rooms/{workspaceId}/publication`
 - Plugin update discovery and verified release files live under public read-only `/v1/plugin-updates/...` routes
+- Operational plugin errors use authenticated `POST /v1/client-errors`
 
 Important product rules reflected in the plugin:
 
@@ -133,14 +135,17 @@ the plugin checks the Rolay server itself and BRAT is no longer required for lat
 6. Confirm installation.
 7. Install the latest Rolay release.
 
-Updater-enabled builds check shortly after startup, every 15 minutes, and immediately after network
-connectivity returns. A newer release is downloaded, verified, and installed automatically after
-active tree operations, transfers, Markdown preload, and room reconciliation reach a safe idle
-window. Rolay preserves all local plugin data and attempts a soft plugin reload. There are no
-required refresh/check/install actions. Healthy update work stays hidden; the ribbon/settings UI is
-shown only when Obsidian must be restarted or repeated automatic retries keep failing. For release
-testing and diagnostics, `General -> Plugin Version` has an optional refresh icon that starts the
-same automatic check immediately; it does not bypass verification or force installation.
+Updater-enabled builds check immediately after plugin load without blocking Obsidian, every
+15 minutes after that, and immediately after network connectivity returns. Until the first
+successful startup check, offline/deferred checks retry within at most one minute instead of
+falling through to the periodic interval. A newer release is downloaded, verified, and installed
+automatically after active tree operations, transfers, Markdown preload, and room reconciliation
+reach a safe idle window. Rolay preserves all local plugin data and attempts a soft plugin reload.
+There are no required refresh/check/install actions. Healthy update work stays hidden; the
+ribbon/settings UI is shown only when Obsidian must be restarted or repeated automatic retries keep
+failing. For release testing and diagnostics, `General -> Plugin Version` has an optional refresh
+icon that starts the same automatic check immediately; it does not bypass verification or force
+installation.
 
 Notes:
 
@@ -233,6 +238,11 @@ Tag note:
   at `0%` the moment the file path appears.
 - Settings still do an initial REST snapshot on open, but further profile/rooms/invite/admin updates now come from a dedicated settings SSE stream instead of periodic polling.
 - Runtime sync logs are mirrored into `.obsidian/plugins/rolay/rolay-sync.log` so support/debugging does not depend only on the in-settings log widget. The persistent log keeps roughly the last 48 hours and is capped to a compact recent tail, so attached logs stay useful without growing indefinitely.
+- Runtime errors are also queued in a bounded, deduplicated diagnostic outbox and delivered
+  automatically after authentication/network recovery. Reports include plugin/Obsidian/platform
+  versions, request correlation, room/pending-work state, and a short recent-log tail. They exclude
+  note bodies, passwords, tokens, arbitrary headers, and arbitrary metadata; credentials are
+  redacted again by the server.
 - If a locally created offline markdown note collides with a server path on reconnect, the plugin keeps both by renaming the local file to the next free name such as `file(1).md` before retrying the create.
 - When a markdown file with existing local text is created or moved into a room, the plugin now turns that text into a reusable Yjs update, persists it locally, and retries CRDT merge until the remote document has absorbed it. This avoids the old "empty file first, content only after reopen" race.
 - Non-markdown local creates and modifications now upload through `create_binary_placeholder -> upload-ticket -> PUT /v1/files/{entryId}/blob/uploads/{uploadId}/content -> commit_blob_revision`, with byte-based room progress and cancel support. Blob hashes are normalized to canonical `sha256:<base64>`, while legacy hex hashes are still accepted on read. The legacy raw `upload.url` is kept only as a fallback, not the main path.

@@ -452,3 +452,66 @@ export interface PluginUpdateManifest {
   releasedAt: string;
   files: PluginUpdateFileDescriptor[];
 }
+
+export type ClientErrorPlatform =
+  | "desktop"
+  | "android"
+  | "ios"
+  | "mobile-ui"
+  | "unknown";
+
+export interface ClientErrorException {
+  name: string;
+  stack: string | null;
+  code: string | null;
+  status: number | null;
+  requestId: string | null;
+}
+
+export interface ClientErrorBreadcrumb {
+  at: string;
+  level: "info" | "error";
+  scope: string;
+  message: string;
+}
+
+export interface ClientErrorContext {
+  pluginId: "rolay";
+  pluginVersion: string;
+  obsidianVersion: string;
+  platform: ClientErrorPlatform;
+  runtimeOrigin: string;
+  locale: string;
+  userAgent: string;
+  online: boolean;
+  nodeRuntime: boolean;
+  installationId: string;
+  activeFilePath: string | null;
+  downloadedWorkspaceIds: string[];
+  connectedWorkspaceIds: string[];
+  pendingMarkdownCreates: number;
+  pendingMarkdownMerges: number;
+  pendingBinaryWrites: number;
+  activeBinaryTransfers: number;
+}
+
+export interface ClientErrorReport {
+  reportId: string;
+  firstOccurredAt: string;
+  lastOccurredAt: string;
+  occurrenceCount: number;
+  scope: string;
+  message: string;
+  error: ClientErrorException | null;
+  context: ClientErrorContext;
+  breadcrumbs: ClientErrorBreadcrumb[];
+}
+
+export interface ClientErrorBatchRequest {
+  reports: ClientErrorReport[];
+}
+
+export interface ClientErrorBatchResponse {
+  accepted: number;
+  requestId: string;
+}

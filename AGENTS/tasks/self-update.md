@@ -2,7 +2,7 @@
 
 Status: DONE
 Priority: High
-Last updated: 2026-07-28
+Last updated: 2026-07-30
 
 ## Goal
 
@@ -53,6 +53,10 @@ any manual refresh/check/install action.
 - 2026-07-28: Added a compact optional check-now icon to `General -> Plugin Version` for release
   testing. It only schedules the existing automatic check immediately; verification, safe-idle
   waiting, install, retries, and reload behavior remain identical to background discovery.
+- 2026-07-30: Startup discovery now runs on the first event-loop turn instead of waiting eight
+  seconds. Until that startup check succeeds, offline/deferred attempts retry after
+  `5s -> 15s -> 30s -> 60s` (then remain capped at `60s`) rather than falling through to the
+  15-minute periodic interval. Connectivity recovery also requests the same check immediately.
 - 2026-07-28: Added an explicit safe-install gate for active operation queue work, binary transport,
   startup/recovery, room snapshot/background reconciliation, Markdown preload, and recent
   editor/vault activity. Failed pending records remain durable across reload and do not permanently

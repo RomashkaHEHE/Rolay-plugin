@@ -1,5 +1,6 @@
 import { Platform } from "obsidian";
-import type { GlobalRole, User } from "../types/protocol";
+import { normalizePendingClientErrorReports } from "../diagnostics/client-error";
+import type { ClientErrorReport, GlobalRole, User } from "../types/protocol";
 import { normalizeSha256Hash } from "../utils/sha256";
 
 export const ROLAY_SERVER_URL = "https://rolay.ru";
@@ -138,6 +139,7 @@ export interface RolayPluginData {
   pendingMarkdownMerges: Record<string, RolayPendingMarkdownMergeEntry>;
   pendingBinaryWrites: Record<string, RolayPendingBinaryWriteEntry>;
   binaryTransfers: Record<string, RolayBinaryTransferEntry>;
+  pendingClientErrors: ClientErrorReport[];
   deviceId: string;
   logs: RolayLogEntry[];
 }
@@ -200,6 +202,7 @@ export function createDefaultPluginData(): RolayPluginData {
     pendingMarkdownMerges: {},
     pendingBinaryWrites: {},
     binaryTransfers: {},
+    pendingClientErrors: [],
     deviceId: createDeviceId(),
     logs: []
   };
@@ -245,6 +248,7 @@ export function mergePluginData(rawData: Partial<RolayPluginData> | null | undef
     pendingMarkdownMerges: normalizePendingMarkdownMerges(rawData?.pendingMarkdownMerges),
     pendingBinaryWrites: normalizePendingBinaryWrites(rawData?.pendingBinaryWrites),
     binaryTransfers: normalizeBinaryTransfers(rawData?.binaryTransfers),
+    pendingClientErrors: normalizePendingClientErrorReports(rawData?.pendingClientErrors),
     deviceId: rawData?.deviceId ?? defaults.deviceId,
     logs: Array.isArray(rawData?.logs) ? rawData.logs.slice(-100) : defaults.logs
   };

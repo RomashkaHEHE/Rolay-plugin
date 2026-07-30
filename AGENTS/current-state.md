@@ -4,8 +4,9 @@ Last updated: 2026-07-30
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.23`
-- Release baseline: `1.2.23` queue-aware byte-weighted binary transfer progress
+- Plugin version: `1.2.24`
+- Release baseline: `1.2.24` immediate startup update discovery and authenticated client error
+  reporting
 
 ## Current Priorities
 
@@ -54,12 +55,18 @@ These should be treated as high-confidence truths unless code/docs are intention
 - An HTTPS authority must not return insecure `ws:` CRDT or `http:` blob fallback targets; the client
   rejects them instead of downgrading.
 - Self-update may replace only `main.js`, `manifest.json`, and `styles.css` after complete size/hash/manifest verification. It must preserve `data.json`, logs, caches, room bindings, and vault content.
-- Self-update is autonomous: no update action is required. Discovery runs after startup, every
-  15 minutes, and after network recovery; install waits for a safe sync/editor idle window and
-  temporary failures retry with backoff. `General -> Plugin Version` may expose an optional
-  check-now diagnostic for release testing, but it must use the same verified pipeline and never
-  become a force-install bypass. Only restart-required or persistent retry failure is shown.
+- Self-update is autonomous: no update action is required. Discovery runs immediately after plugin
+  load on a non-blocking timer, every 15 minutes after that, and after network recovery. Before the
+  first successful startup check, deferred/offline retries are capped at one minute; install waits
+  for a safe sync/editor idle window and temporary failures retry with backoff.
+  `General -> Plugin Version` may expose an optional check-now diagnostic for release testing, but
+  it must use the same verified pipeline and never become a force-install bypass. Only
+  restart-required or persistent retry failure is shown.
 - Persistent `rolay-sync.log` is intentionally short-lived: entries older than 48 hours are removed, and noisy files are capped to a compact recent tail.
+- Client error delivery is authenticated operational diagnostics, not product telemetry. Errors
+  use a bounded durable outbox, short-window dedupe, automatic recovery flush, strict field limits,
+  and symmetric credential redaction. Never add note bodies, credentials, arbitrary headers, or
+  unrestricted metadata to reports, and never let reporter failure affect sync.
 - Startup sync is deferred until after Obsidian workspace layout is ready; downloaded rooms then resume with a small stagger so auth/snapshot/preload work does not block the plugin loading screen.
 - Room Disconnect is a hard per-room pause: it stops room SSE/presence, cancels scheduled snapshot/background markdown work, aborts active binary transfers for that workspace, invalidates in-flight upload tokens, and ignores late snapshot/bootstrap/download results without affecting other connected rooms.
 - Disconnected/stopped rooms must not persist new markdown/binary create replay records from Obsidian vault `create` events. Existing remote files can otherwise be misclassified as local creates on startup/reconnect, causing runaway `(1)`, `(2)`, ... duplicates.
@@ -265,6 +272,12 @@ These are important because future regressions will often land in these areas:
   completed-cohort contribution, muted queued download/upload styling, stale-worker guards, and a
   local-size guard for persisted cache hits; GitHub workflow `30527292378`, all five assets,
   archive contents, and production updater bytes were verified
+- Prepared `1.2.24` with immediate startup update discovery and capped pre-success
+  offline/deferred retries, so a missed startup connectivity window cannot postpone discovery for
+  15 minutes
+- Prepared `1.2.24` with authenticated client error reporting, durable offline queueing, dedupe,
+  plugin/Obsidian/platform/request correlation, strict redaction, and structured server ingestion;
+  server support is deployed in `a23133e`
 
 ## First Places To Look By Task Type
 

@@ -10,7 +10,8 @@ const outputDirectory = await mkdtemp(path.join(tmpdir(), "rolay-plugin-tests-")
 const entryPoints = [
   path.join(testsDirectory, "operations.test.ts"),
   path.join(testsDirectory, "snapshot-refresh.test.ts"),
-  path.join(testsDirectory, "transfer-progress.test.ts")
+  path.join(testsDirectory, "transfer-progress.test.ts"),
+  path.join(testsDirectory, "client-error.test.ts")
 ];
 
 try {

@@ -1,6 +1,18 @@
-import { MarkdownView, Notice, Platform, Plugin, TFile, normalizePath, setIcon, type TAbstractFile } from "obsidian";
+import {
+  MarkdownView,
+  Notice,
+  Platform,
+  Plugin,
+  TFile,
+  apiVersion,
+  getLanguage,
+  normalizePath,
+  setIcon,
+  type TAbstractFile
+} from "obsidian";
 import * as Y from "yjs";
 import { RolayApiClient, RolayApiError } from "./api/client";
+import { ClientErrorReporter } from "./diagnostics/client-error-reporter";
 import { FileBridge } from "./obsidian/file-bridge";
 import {
   buildPresenceColor,
@@ -62,6 +74,8 @@ import { TreeStore } from "./sync/tree-store";
 import type {
   AddRoomMemberRequest,
   AdminRoomListItem,
+  ClientErrorContext,
+  ClientErrorPlatform,
   CreateManagedUserRequest,
   CreateRoomRequest,
   FileEntry,
@@ -263,6 +277,7 @@ export default class RolayPlugin extends Plugin {
   private static readonly PLUGIN_UPDATE_QUIET_WINDOW_MS = 5_000;
   private data!: RolayPluginData;
   private apiClient!: RolayApiClient;
+  private clientErrorReporter: ClientErrorReporter | null = null;
   private crdtManager!: CrdtSessionManager;
   private operationsQueue!: OperationsQueue;
   private fileBridge!: FileBridge;
@@ -348,7 +363,26 @@ export default class RolayPlugin extends Plugin {
           this.stopSettingsEventStream();
         }
         await this.persistNow();
+        if (session) {
+          this.clientErrorReporter?.notifyDeliveryAvailable();
+        }
         this.updateStatusBar();
+      }
+    });
+    this.clientErrorReporter = new ClientErrorReporter({
+      apiClient: this.apiClient,
+      getPendingReports: () => this.data.pendingClientErrors,
+      replacePendingReports: (reports) => {
+        this.data.pendingClientErrors = reports;
+        this.schedulePersist();
+      },
+      canSend: () => Boolean(
+        this.data.session?.accessToken || this.data.session?.refreshToken
+      ),
+      getContext: () => this.createClientErrorContext(),
+      getBreadcrumbs: () => this.data.logs.slice(-8),
+      log: (message) => {
+        this.recordLog("diagnostics", message);
       }
     });
     this.pluginUpdater = new PluginUpdater({
@@ -364,8 +398,13 @@ export default class RolayPlugin extends Plugin {
         this.updatePluginUpdateUi();
         this.requestSettingsRender();
       },
-      log: (message, error = false) => {
-        this.recordLog("update", message, error ? "error" : "info");
+      log: (message, error) => {
+        this.recordLog(
+          "update",
+          message,
+          error === undefined ? "info" : "error",
+          error
+        );
       }
     });
     this.updateRibbonEl = this.addRibbonIcon(
@@ -385,7 +424,12 @@ export default class RolayPlugin extends Plugin {
       getPersistedCrdtState: (entryId) => this.getPersistedCrdtState(entryId),
       persistCrdtState: (entryId, filePath, state) => this.persistCrdtState(entryId, filePath, state),
       resolveEntryByLocalPath: (localPath) => this.resolveEntryByLocalPath(localPath),
-      log: (message) => this.recordLog("crdt", message)
+      log: (message, error) => this.recordLog(
+        "crdt",
+        message,
+        error === undefined ? "info" : "error",
+        error
+      )
     });
     this.registerEditorExtension(
       createSharedPresenceExtension(({ filePath, editor, focused }) => {
@@ -424,7 +468,12 @@ export default class RolayPlugin extends Plugin {
       hasPendingCreate: (workspaceId, path) => this.hasPendingLocalCreate(workspaceId, path),
       hasPendingDelete: (workspaceId, path) => this.hasPendingLocalDelete(workspaceId, path),
       hasPendingBinaryWrite: (localPath) => normalizePath(localPath) in this.data.pendingBinaryWrites,
-      log: (message) => this.recordLog("bridge", message),
+      log: (message, error) => this.recordLog(
+        "bridge",
+        message,
+        error === undefined ? "info" : "error",
+        error
+      ),
       onCreateFolder: (workspaceId, path) => this.queueCreateFolder(workspaceId, path),
       onCreateMarkdown: (workspaceId, path, localContent) => this.queueCreateMarkdown(workspaceId, path, localContent),
       onCreateBinary: (workspaceId, path, localContent) => this.queueBinaryWrite(workspaceId, path, localContent, null),
@@ -468,6 +517,7 @@ export default class RolayPlugin extends Plugin {
     );
     this.registerDomEvent(window, "online", () => {
       this.pluginUpdater.notifyConnectivityRestored();
+      this.clientErrorReporter?.notifyDeliveryAvailable();
       this.scheduleLiveTransportRecovery("network-online");
     });
     if (Platform.isMobileApp) {
@@ -523,6 +573,7 @@ export default class RolayPlugin extends Plugin {
     this.register(() => {
       this.isUnloading = true;
       this.pluginUpdater.stop();
+      this.clientErrorReporter?.stop();
       this.stopSettingsEventStream();
       this.clearLifecycleRecovery();
       if (this.persistHandle !== null) {
@@ -591,6 +642,7 @@ export default class RolayPlugin extends Plugin {
     );
 
     this.scheduleStartupBootstrap("startup");
+    this.clientErrorReporter.start();
     this.pluginUpdater.start();
   }
 
@@ -1066,7 +1118,12 @@ export default class RolayPlugin extends Plugin {
     } catch (error) {
       const friendlyMessage = this.getPasswordChangeErrorMessage(error);
       if (friendlyMessage) {
-        this.recordLog("error", `Password change failed: ${friendlyMessage}`, "error");
+        this.recordLog(
+          "error",
+          `Password change failed: ${friendlyMessage}`,
+          "error",
+          error
+        );
         new Notice(friendlyMessage);
         throw new Error(friendlyMessage);
       }
@@ -1540,7 +1597,8 @@ export default class RolayPlugin extends Plugin {
       this.recordLog(
         "rooms",
         `Failed to load members for room ${workspaceId}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       return this.getRoomMembers(workspaceId);
     }
@@ -2697,7 +2755,8 @@ export default class RolayPlugin extends Plugin {
         this.recordLog(
           "crdt",
           `[${workspaceId}] Background markdown refresh failed: ${message}`,
-          "error"
+          "error",
+          error
         );
       }
     } finally {
@@ -2713,13 +2772,57 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
-  private recordLog(scope: string, message: string, level: RolayLogEntry["level"] = "info"): void {
+  private createClientErrorContext(): ClientErrorContext {
+    const downloadedWorkspaceIds = this.getDownloadedRooms()
+      .map((room) => room.workspaceId)
+      .sort()
+      .slice(0, 20);
+    const connectedWorkspaceIds = [...this.roomRuntime.entries()]
+      .filter(([, runtime]) => runtime.streamStatus !== "stopped")
+      .map(([workspaceId]) => workspaceId)
+      .sort()
+      .slice(0, 20);
+    const activeBinaryTransfers = [...this.binaryTransferState.values()].filter(
+      (transfer) => transfer.status !== "done" && transfer.status !== "failed"
+    ).length;
+
+    return {
+      pluginId: "rolay",
+      pluginVersion: this.manifest.version,
+      obsidianVersion: apiVersion?.trim() || "unknown",
+      platform: getRuntimePlatformLabel(),
+      runtimeOrigin: getRuntimeOriginLabel(),
+      locale: getRuntimeLocaleLabel(),
+      userAgent: globalThis.navigator?.userAgent?.trim() || "unavailable",
+      online: globalThis.navigator?.onLine !== false,
+      nodeRuntime: hasNodeRuntime(),
+      installationId: this.data.deviceId,
+      activeFilePath: this.app.workspace.getActiveFile()?.path ?? null,
+      downloadedWorkspaceIds,
+      connectedWorkspaceIds,
+      pendingMarkdownCreates: Object.keys(this.data.pendingMarkdownCreates).length,
+      pendingMarkdownMerges: Object.keys(this.data.pendingMarkdownMerges).length,
+      pendingBinaryWrites: Object.keys(this.data.pendingBinaryWrites).length,
+      activeBinaryTransfers
+    };
+  }
+
+  private recordLog(
+    scope: string,
+    message: string,
+    level: RolayLogEntry["level"] = "info",
+    reportError?: unknown
+  ): void {
     const entry: RolayLogEntry = {
       at: new Date().toISOString(),
       level,
       scope,
       message
     };
+
+    if (level === "error" && scope !== "diagnostics") {
+      this.clientErrorReporter?.capture(scope, message, reportError);
+    }
 
     this.data.logs = [
       ...trimRecentLogEntries(this.data.logs, Date.now(), RolayPlugin.LOG_FILE_RETENTION_MS, 99),
@@ -2734,7 +2837,7 @@ export default class RolayPlugin extends Plugin {
 
   private handleError(title: string, error: unknown, showNotice = true): void {
     const message = error instanceof Error ? error.message : String(error);
-    this.recordLog("error", `${title}: ${message}`, "error");
+    this.recordLog("error", `${title}: ${message}`, "error", error);
 
     if (showNotice) {
       new Notice(`${title}: ${message}`);
@@ -4825,7 +4928,8 @@ export default class RolayPlugin extends Plugin {
         this.recordLog(
           "blob",
           `[${transfer.workspaceId}] Failed to cancel blob upload ${transfer.uploadId} for ${transfer.serverPath}: ${error instanceof Error ? error.message : String(error)}`,
-          "error"
+          "error",
+          error
         );
       }
     }
@@ -4918,7 +5022,8 @@ export default class RolayPlugin extends Plugin {
       this.recordLog(
         "blob",
         `[${blocked.workspaceId}] Failed to revert downloading binary rename for ${oldPath}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-downloading-binary-rename");
     }
@@ -4974,7 +5079,8 @@ export default class RolayPlugin extends Plugin {
       this.recordLog(
         "crdt",
         `[${blocked.workspaceId}] Failed to revert locked rename for ${oldPath}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       this.scheduleSnapshotRefresh(blocked.workspaceId, "restore-locked-rename");
     }
@@ -6204,8 +6310,7 @@ export default class RolayPlugin extends Plugin {
 
     this.recordLog(
       "ops",
-      `[${workspaceId}] Keeping local markdown create for ${serverPath} pending until the next successful room refresh/connect: ${errorMessage}`,
-      "error"
+      `[${workspaceId}] Keeping local markdown create for ${serverPath} pending until the next successful room refresh/connect: ${errorMessage}`
     );
   }
 
@@ -6413,7 +6518,8 @@ export default class RolayPlugin extends Plugin {
       this.recordLog(
         "crdt",
         `Dropped invalid persisted CRDT cache for ${entryId}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       this.schedulePersist();
       return null;
@@ -7054,7 +7160,8 @@ export default class RolayPlugin extends Plugin {
       this.recordLog(
         "crdt",
         `[${workspaceId}] HTTP markdown bootstrap failed: ${message}`,
-        "error"
+        "error",
+        error
       );
       this.updateStatusBar();
     }
@@ -7507,7 +7614,12 @@ export default class RolayPlugin extends Plugin {
           currentLocalContent,
           0
         );
-      } catch {
+      } catch (error) {
+        this.handleError(
+          `Pending markdown create replay failed for ${currentServerPath}`,
+          error,
+          false
+        );
         // Keep the pending create registered for the next room refresh/connect.
       }
     }
@@ -7580,6 +7692,11 @@ export default class RolayPlugin extends Plugin {
         this.clearPendingMarkdownMerge(entry.id);
       } catch (error) {
         this.rememberPendingMarkdownMerge(workspaceId, entry.id, pendingMerge.localPath, currentServerPath, error);
+        this.handleError(
+          `Pending markdown merge replay failed for ${currentServerPath}`,
+          error,
+          false
+        );
       }
     }
   }
@@ -7987,7 +8104,8 @@ export default class RolayPlugin extends Plugin {
               this.recordLog(
                 "blob",
                 `[${workspaceId}] Upload offset mismatch for ${desiredServerPath}; resuming from ${formatByteCount(expectedOffset)}.`,
-                "error"
+                "error",
+                error
               );
               this.traceBlob(
                 `[${workspaceId}] upload content mismatch entryId=${entry.id} uploadId=${ticket.uploadId} localPath=${desiredLocalPath} ` +
@@ -8129,11 +8247,9 @@ export default class RolayPlugin extends Plugin {
         if (mismatchDetails) {
           this.recordLog(
             "blob",
-            `[${workspaceId}] Blob hash mismatch for ${finalServerPath}: ${mismatchDetails}`,
-            "error"
+            `[${workspaceId}] Blob hash mismatch for ${finalServerPath}: ${mismatchDetails}`
           );
         }
-        this.recordLog("blob", `[${workspaceId}] Binary sync failed for ${finalLocalPath}: ${message}`, "error");
         this.handleError(`Binary sync failed for ${finalLocalPath}`, error, false);
       }
 
@@ -8824,7 +8940,8 @@ export default class RolayPlugin extends Plugin {
         this.recordLog(
           "blob",
           `[${workspaceId}] Binary download failed for ${entry.path}: ${error instanceof Error ? error.message : String(error)}`,
-          "error"
+          "error",
+          error
         );
       } else if (!this.isUnloading) {
         this.recordLog("blob", `[${workspaceId}] Binary download aborted for ${entry.path}.`);
@@ -8995,7 +9112,8 @@ export default class RolayPlugin extends Plugin {
       this.recordLog(
         "blob",
         `[${workspaceId}] Failed to delete abandoned binary placeholder ${entry.path}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
     }
   }
@@ -9182,7 +9300,8 @@ export default class RolayPlugin extends Plugin {
       this.recordLog(
         "bridge",
         `Failed to read local markdown content for ${localPath}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       return fallback;
     }
@@ -9200,7 +9319,8 @@ export default class RolayPlugin extends Plugin {
       this.recordLog(
         "blob",
         `Failed to read local binary content for ${localPath}: ${error instanceof Error ? error.message : String(error)}`,
-        "error"
+        "error",
+        error
       );
       return fallback;
     }
@@ -9948,7 +10068,7 @@ function getTextByteLength(text: string): number {
   return new TextEncoder().encode(text).byteLength;
 }
 
-function getRuntimePlatformLabel(): string {
+function getRuntimePlatformLabel(): ClientErrorPlatform {
   if (Platform.isAndroidApp) {
     return "android";
   }
@@ -9962,6 +10082,14 @@ function getRuntimePlatformLabel(): string {
     return "mobile-ui";
   }
   return "unknown";
+}
+
+function getRuntimeLocaleLabel(): string {
+  try {
+    return getLanguage()?.trim() || globalThis.navigator?.language?.trim() || "unknown";
+  } catch {
+    return globalThis.navigator?.language?.trim() || "unknown";
+  }
 }
 
 function hasNodeRuntime(): boolean {

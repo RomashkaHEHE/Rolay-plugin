@@ -35,7 +35,7 @@ interface FileBridgeConfig {
   hasPendingCreate: (workspaceId: string, path: string) => boolean;
   hasPendingDelete: (workspaceId: string, path: string) => boolean;
   hasPendingBinaryWrite: (localPath: string) => boolean;
-  log: (message: string) => void;
+  log: (message: string, error?: unknown) => void;
   onCreateFolder: (workspaceId: string, path: string) => Promise<void>;
   onCreateMarkdown: (workspaceId: string, path: string, localContent: string) => Promise<void>;
   onCreateBinary: (workspaceId: string, path: string, localContent: ArrayBuffer) => Promise<void>;
@@ -64,7 +64,7 @@ export class FileBridge {
   private readonly hasPendingCreate: (workspaceId: string, path: string) => boolean;
   private readonly hasPendingDelete: (workspaceId: string, path: string) => boolean;
   private readonly hasPendingBinaryWrite: (localPath: string) => boolean;
-  private readonly log: (message: string) => void;
+  private readonly log: (message: string, error?: unknown) => void;
   private readonly onCreateFolder: (workspaceId: string, path: string) => Promise<void>;
   private readonly onCreateMarkdown: (workspaceId: string, path: string, localContent: string) => Promise<void>;
   private readonly onCreateBinary: (workspaceId: string, path: string, localContent: ArrayBuffer) => Promise<void>;
@@ -565,7 +565,10 @@ export class FileBridge {
     try {
       return await this.app.vault.cachedRead(file);
     } catch (error) {
-      this.log(`Failed to read markdown content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
+      this.log(
+        `Failed to read markdown content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
       return "";
     }
   }
@@ -574,7 +577,10 @@ export class FileBridge {
     try {
       return await this.app.vault.readBinary(file);
     } catch (error) {
-      this.log(`Failed to read binary content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`);
+      this.log(
+        `Failed to read binary content for ${file.path}: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
       return new ArrayBuffer(0);
     }
   }
@@ -671,7 +677,10 @@ export class FileBridge {
     try {
       await work();
     } catch (error) {
-      this.log(`${label} failed: ${error instanceof Error ? error.message : String(error)}`);
+      this.log(
+        `${label} failed: ${error instanceof Error ? error.message : String(error)}`,
+        error
+      );
     }
   }
 

@@ -36,7 +36,7 @@ interface CrdtSessionManagerConfig {
   getPersistedCrdtState: (entryId: string) => Uint8Array | null;
   persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void;
   resolveEntryByLocalPath: (localPath: string) => FileEntry | null;
-  log: (message: string) => void;
+  log: (message: string, error?: unknown) => void;
 }
 
 export class CrdtSessionManager {
@@ -49,7 +49,7 @@ export class CrdtSessionManager {
   private readonly getPersistedCrdtState: (entryId: string) => Uint8Array | null;
   private readonly persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void;
   private readonly resolveEntryByLocalPath: (localPath: string) => FileEntry | null;
-  private readonly log: (message: string) => void;
+  private readonly log: (message: string, error?: unknown) => void;
   private readonly pendingOfflineUpdates = new Map<string, Uint8Array>();
   private activeSession: BoundCrdtSession | null = null;
   private sessionOperationQueue = Promise.resolve();
@@ -367,7 +367,7 @@ class BoundCrdtSession {
 
   private readonly app: App;
   private readonly currentUser: User;
-  private readonly log: (message: string) => void;
+  private readonly log: (message: string, error?: unknown) => void;
   private readonly persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void;
   private readonly docId: string;
   private readonly wsUrl: string | null;
@@ -394,7 +394,7 @@ class BoundCrdtSession {
     docId: string,
     wsUrl: string | null,
     token: string | (() => Promise<string>) | null,
-    log: (message: string) => void,
+    log: (message: string, error?: unknown) => void,
     persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void,
     initialState: Uint8Array | null = null
   ) {
@@ -457,7 +457,8 @@ class BoundCrdtSession {
         this.clearRemotePresence();
       },
       onAuthenticationFailed: ({ reason }) => {
-        this.log(`CRDT auth failed for ${this.file.path}: ${reason}`);
+        const error = new Error(`CRDT auth failed for ${this.file.path}: ${reason}`);
+        this.log(error.message, error);
         this.clearLocalPresence();
         this.clearRemotePresence();
         this.provider?.disconnect();
@@ -942,7 +943,7 @@ interface RemoteMarkdownSeedOptions {
   docId: string;
   token: string | (() => Promise<string>);
   localState: Uint8Array;
-  log: (message: string) => void;
+  log: (message: string, error?: unknown) => void;
   contextLabel: string;
 }
 

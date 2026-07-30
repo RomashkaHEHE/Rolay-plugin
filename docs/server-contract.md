@@ -39,7 +39,8 @@ The plugin therefore stores:
 
 Expected client order:
 
-1. After plugin load, schedule automatic public update discovery without blocking Obsidian
+1. Immediately after plugin load, schedule automatic public update discovery on a deferred task
+   without blocking Obsidian
    workspace startup or waiting for authentication. Newer verified files install automatically
    after local sync reaches a safe idle window.
 2. Authenticate with `login` or `refresh`.
@@ -85,13 +86,37 @@ The plugin must reject the update before replacing anything if:
 
 `data.json`, logs, caches, transfer parts, and room bindings are never update assets.
 
-The client checks this API shortly after startup, every 15 minutes, and after connectivity returns.
-Temporary discovery/download/install failures use automatic backoff. No manual action is required.
+The client checks this API immediately after plugin load on a non-blocking deferred task, every
+15 minutes after a successful check, and after connectivity returns. Before the first successful
+startup check, an offline or temporarily deferred check retries with delays capped at one minute
+instead of waiting for the periodic interval. Temporary discovery/download/install failures use
+automatic backoff. No manual action is required.
 An optional settings diagnostic can request the same check immediately, but there is no separate
 force-install path. Before replacing runtime files and attempting a soft reload, it waits for
 active tree operations, binary transfers, Markdown preload, snapshot reconciliation, and recent
 vault/editor activity to settle, then persists plugin state. Only persistent retry failure or a
 required Obsidian restart becomes visible to the user.
+
+### Client Error Diagnostics
+
+- `POST /v1/client-errors`
+
+The plugin submits authenticated batches of at most five bounded error reports. Error capture must
+never block tree, CRDT, presence, or blob work. Reports are deduplicated for five minutes, the local
+outbox is capped at 25 entries, and unsent entries remain in `data.json` across offline periods and
+plugin restarts. Login, token refresh, and network recovery trigger an immediate retry; delivery
+failures use backoff and must not recursively report themselves.
+
+Each report includes the Rolay and Obsidian versions, platform/runtime details, persistent
+installation ID, active path, connected/downloaded room IDs, pending-work counts, optional
+stack/code/status/originating `X-Rolay-Request-Id`, and at most eight preceding log breadcrumbs.
+The schema does not permit note bodies, credentials, arbitrary request headers, or arbitrary
+metadata. The client redacts common credential forms before persistence, and the server validates
+every field and applies the same redaction again.
+
+The endpoint requires bearer authentication, derives user/session-device identity server-side,
+rate-limits by authenticated device, and returns `202 { accepted, requestId }`. Reports go only to
+structured operational server logs; they never enter room/tree state.
 
 ### Auth
 

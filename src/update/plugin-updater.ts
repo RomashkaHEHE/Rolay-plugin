@@ -46,7 +46,7 @@ interface PluginUpdaterConfig {
   getInstallBlockers: () => string[];
   prepareForInstall: () => Promise<boolean>;
   onStateChange: (state: PluginUpdateState) => void;
-  log: (message: string, error?: boolean) => void;
+  log: (message: string, error?: unknown) => void;
 }
 
 interface DownloadedUpdateFile {
@@ -82,8 +82,14 @@ const INSTALL_ORDER: readonly PluginUpdateFileName[] = [
   "manifest.json"
 ];
 const PLAIN_SEMVER_PATTERN = /^\d+\.\d+\.\d+$/;
-const INITIAL_CHECK_DELAY_MS = 8_000;
+const INITIAL_CHECK_DELAY_MS = 0;
 const CHECK_INTERVAL_MS = 15 * 60 * 1000;
+const STARTUP_DEFERRED_CHECK_DELAYS_MS = [
+  5_000,
+  15_000,
+  30_000,
+  60_000
+] as const;
 const INSTALL_RETRY_DELAY_MS = 5_000;
 const RETRY_DELAYS_MS = [
   30_000,
@@ -110,6 +116,8 @@ export class PluginUpdater {
   private failurePhase: "check" | "installation" | null = null;
   private lastBlockerSignature = "";
   private lastBlockerLoggedAt = 0;
+  private startupCheckCompleted = false;
+  private startupDeferredCheckAttempt = 0;
   private started = false;
   private stopped = false;
 
@@ -135,6 +143,8 @@ export class PluginUpdater {
     }
     this.started = true;
     this.stopped = false;
+    this.startupCheckCompleted = false;
+    this.startupDeferredCheckAttempt = 0;
     this.scheduleCheck(INITIAL_CHECK_DELAY_MS);
   }
 
@@ -172,7 +182,8 @@ export class PluginUpdater {
     if (isPluginUpdateAvailable(this.state)) {
       this.scheduleInstall(0);
     }
-    this.scheduleCheck(2_000);
+    this.startupDeferredCheckAttempt = 0;
+    this.scheduleCheck(0);
   }
 
   private scheduleCheck(delayMs: number): void {
@@ -234,11 +245,18 @@ export class PluginUpdater {
       return;
     }
     if (navigator.onLine === false) {
-      this.scheduleCheck(CHECK_INTERVAL_MS);
+      this.scheduleCheck(this.getDeferredCheckDelay());
       return;
     }
-    if (this.checkPromise || this.installPromise) {
-      this.scheduleCheck(CHECK_INTERVAL_MS);
+    if (this.checkPromise) {
+      return;
+    }
+    if (this.installPromise) {
+      this.scheduleCheck(
+        this.startupCheckCompleted
+          ? CHECK_INTERVAL_MS
+          : this.getDeferredCheckDelay()
+      );
       return;
     }
 
@@ -246,6 +264,8 @@ export class PluginUpdater {
     this.checkPromise = check;
     try {
       const state = await check;
+      this.startupCheckCompleted = true;
+      this.startupDeferredCheckAttempt = 0;
       if (isPluginUpdateAvailable(state)) {
         this.scheduleInstall(0);
       }
@@ -260,6 +280,19 @@ export class PluginUpdater {
         this.checkPromise = null;
       }
     }
+  }
+
+  private getDeferredCheckDelay(): number {
+    if (this.startupCheckCompleted) {
+      return CHECK_INTERVAL_MS;
+    }
+
+    const index = Math.min(
+      this.startupDeferredCheckAttempt,
+      STARTUP_DEFERRED_CHECK_DELAYS_MS.length - 1
+    );
+    this.startupDeferredCheckAttempt += 1;
+    return STARTUP_DEFERRED_CHECK_DELAYS_MS[index];
   }
 
   private async runAutomaticInstall(): Promise<void> {
@@ -349,7 +382,7 @@ export class PluginUpdater {
     });
     this.log(
       `Plugin update ${phase} failed (attempt ${consecutiveFailures}); retrying automatically: ${message}`,
-      true
+      error
     );
     return retryDelay;
   }
@@ -647,7 +680,7 @@ export class PluginUpdater {
     }
   }
 
-  private log(message: string, error = false): void {
+  private log(message: string, error?: unknown): void {
     if (!this.stopped) {
       this.config.log(message, error);
     }
