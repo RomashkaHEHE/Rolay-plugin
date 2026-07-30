@@ -57,8 +57,9 @@ transferring paths from queued paths without adding interface noise.
   local bytes.
 - 2026-07-30: `npm test` passes 12 tests, `npm run check` passes, `npm run build` succeeds, and
   `git diff --check` reports no whitespace errors.
-- 2026-07-30: Prepared plugin release `1.2.23`; keep this task at `WATCH` until sequential
-  multi-file upload/download behavior is exercised in a real vault.
+- 2026-07-30: Released plugin `1.2.23` from commit `e8c98bc`; GitHub Actions run `30527292378`,
+  all five release assets, archive contents, and production updater bytes were verified. Keep this
+  task at `WATCH` until sequential multi-file upload/download behavior is exercised in a real vault.
 
 ## Open Questions / Risks
 

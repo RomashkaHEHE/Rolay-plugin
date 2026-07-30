@@ -261,9 +261,10 @@ These are important because future regressions will often land in these areas:
 - Released `1.2.22` with cursor-aware snapshot coalescing and conditional Markdown preload; GitHub
   workflow `30453648991`, all five assets, archive contents, and production updater bytes were
   verified
-- Prepared `1.2.23` with queue-aware binary progress: full known byte totals, monotonic
+- Released `1.2.23` with queue-aware binary progress: full known byte totals, monotonic
   completed-cohort contribution, muted queued download/upload styling, stale-worker guards, and a
-  local-size guard for persisted cache hits
+  local-size guard for persisted cache hits; GitHub workflow `30527292378`, all five assets,
+  archive contents, and production updater bytes were verified
 
 ## First Places To Look By Task Type
 
