@@ -1,11 +1,11 @@
 # Current State
 
-Last updated: 2026-07-29
+Last updated: 2026-07-30
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.22`
-- Release baseline: `1.2.22` cursor-aware snapshot coalescing and safe conditional Markdown preload
+- Plugin version: `1.2.23`
+- Release baseline: `1.2.23` queue-aware byte-weighted binary transfer progress
 
 ## Current Priorities
 
@@ -41,6 +41,10 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Explorer presence badges use minimal-visible-parent aggregation: a note shows its own badge when visible, otherwise the badge rolls up only to the deepest visible collapsed parent inside the room root. Anonymous public viewers remain separate gray eye indicators and follow the same roll-up rule.
 - Explorer folder expand/collapse interactions must refresh presence/transfer decorations immediately. Use both interaction hooks and the file-explorer DOM mutation observer; do not rely only on the slower general decoration debounce for visible-parent recalculation.
 - Red downloading/protected explorer paths and yellow uploading paths should always show a `0-100%` badge. Binary transfers use byte progress, remote placeholders start at `0%`, and markdown locks use bootstrap metadata/cache state. Explorer transfer badges use the same minimal-visible-parent roll-up model as note presence: visible files show their own progress, collapsed parents aggregate hidden children, and expanded ancestors should not stay red/yellow just because a descendant is active. Do not hide badges merely because progress is `100%`; visibility should be driven by whether there is still an active transfer/protection/install phase.
+- Binary folder progress is byte-weighted across the full known queue. Queued files use muted
+  transfer colors, active workers use the stronger colors, and completed siblings remain in their
+  cohort aggregate until all cohort work finishes so parent percentages cannot reset between
+  sequential files.
 - Room-wide markdown preload requires a large persistent CRDT cache. Do not lower `MAX_PERSISTED_CRDT_DOCS` back to tiny LRU values: downloaded notes will be pruned from `data.json`, then flicker red/normal and retrigger bootstrap loops even though the room was already downloaded.
 - Local delete operations keep a short pending-delete guard so stale snapshots cannot resurrect files while multi-file delete operations are still settling.
 - Bulk duplicate cleanup must stay possible even while markdown preload/locked-state is stale. Remote/suppressed delete echoes and already-pending deletes must be ignored before protected-markdown delete restoration, and safe `entryVersion=0` suffix-copy markdown duplicates may bypass the locked-delete restore so their `delete_entry` can reach the server.
@@ -62,6 +66,9 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Binary pending-write reconciliation must not request a rerun for an upload worker that is already
   active. Publishing the same committed hash, size, and MIME type is a client no-op, and the server
   must also treat an identical revision as idempotent after validating preconditions.
+- A local binary write supersedes an older same-path download. The download is canceled first, and
+  every late ticket/chunk/progress/finalize callback is gated by its persisted transfer `cohortId`
+  so it cannot replace the queued upload state or write stale bytes into the vault.
 - Remote markdown patches should preserve the local viewport.
 - Remote cursor rendering has extra stabilization against stale backward awareness offsets.
 - Full-room closed-Markdown reconciliation is a safety fallback, not a hot poll. Snapshots hydrate
@@ -254,6 +261,9 @@ These are important because future regressions will often land in these areas:
 - Released `1.2.22` with cursor-aware snapshot coalescing and conditional Markdown preload; GitHub
   workflow `30453648991`, all five assets, archive contents, and production updater bytes were
   verified
+- Prepared `1.2.23` with queue-aware binary progress: full known byte totals, monotonic
+  completed-cohort contribution, muted queued download/upload styling, stale-worker guards, and a
+  local-size guard for persisted cache hits
 
 ## First Places To Look By Task Type
 

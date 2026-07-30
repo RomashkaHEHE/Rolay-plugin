@@ -100,6 +100,7 @@ export interface RolayPendingBinaryWriteEntry {
 export type RolayBinaryTransferKind = "upload" | "download";
 
 export type RolayBinaryTransferStatus =
+  | "queued"
   | "preparing"
   | "uploading"
   | "canceling"
@@ -123,6 +124,7 @@ export interface RolayBinaryTransferEntry {
   rangeSupported: boolean;
   createdAt: string;
   updatedAt: string;
+  cohortId: string;
   lastError: string | null;
 }
 
@@ -553,6 +555,10 @@ function normalizeBinaryTransfers(
       rangeSupported: Boolean(candidate.rangeSupported),
       createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : new Date().toISOString(),
       updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : new Date().toISOString(),
+      cohortId:
+        typeof candidate.cohortId === "string" && candidate.cohortId.trim()
+          ? candidate.cohortId.trim()
+          : `legacy:${kind}:${workspaceId}:${localPath}`,
       lastError: typeof candidate.lastError === "string" ? candidate.lastError : null
     };
   }
@@ -564,6 +570,7 @@ function normalizeBinaryTransferStatus(
   status: unknown
 ): RolayBinaryTransferStatus | null {
   switch (status) {
+    case "queued":
     case "preparing":
     case "uploading":
     case "canceling":

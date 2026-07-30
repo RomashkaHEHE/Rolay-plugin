@@ -47,10 +47,17 @@ These exist because past failures were caused by races such as:
 - stale snapshot deletes a newly recreated file
 - remote placeholder is mistaken for a local user modification
 - quick move-out / move-back cycles destroying content
+- an old download ticket or chunk arrives after a local write has already taken ownership of the
+  same path
 
 ## Important Safety Intent
 
 If something is not fully hydrated yet, the system should bias toward blocking risky local actions rather than allowing silent data loss.
+
+Transfer ownership is generation-sensitive. A local binary write cancels an older same-path
+download, and asynchronous download callbacks must verify their `cohortId` before changing transfer
+state or applying bytes. Path equality alone is not enough because the path may already belong to a
+new upload generation.
 
 Examples:
 

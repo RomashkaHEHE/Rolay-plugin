@@ -14643,6 +14643,7 @@ function normalizeBinaryTransfers(rawTransfers) {
       rangeSupported: Boolean(candidate.rangeSupported),
       createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : (/* @__PURE__ */ new Date()).toISOString(),
       updatedAt: typeof candidate.updatedAt === "string" ? candidate.updatedAt : (/* @__PURE__ */ new Date()).toISOString(),
+      cohortId: typeof candidate.cohortId === "string" && candidate.cohortId.trim() ? candidate.cohortId.trim() : `legacy:${kind}:${workspaceId}:${localPath}`,
       lastError: typeof candidate.lastError === "string" ? candidate.lastError : null
     };
   }
@@ -14650,6 +14651,7 @@ function normalizeBinaryTransfers(rawTransfers) {
 }
 function normalizeBinaryTransferStatus(status) {
   switch (status) {
+    case "queued":
     case "preparing":
     case "uploading":
     case "canceling":
@@ -17965,6 +17967,48 @@ function mergeReasons(left, right) {
   return [.../* @__PURE__ */ new Set([...left.split("+"), ...right.split("+")])].slice(0, 4).join("+");
 }
 
+// src/sync/transfer-progress.ts
+function mergeTransferProgress(existing, kind, completedBytes, totalBytes, activity) {
+  const normalizedTotalBytes = Math.max(1, Math.trunc(totalBytes));
+  const normalizedCompletedBytes = Math.max(
+    0,
+    Math.min(Math.trunc(completedBytes), normalizedTotalBytes)
+  );
+  const unfinished = activity === "completed" ? 0 : 1;
+  const active = activity === "active" ? 1 : 0;
+  if (!existing) {
+    return {
+      kind,
+      completedBytes: normalizedCompletedBytes,
+      totalBytes: normalizedTotalBytes,
+      itemCount: 1,
+      unfinishedItemCount: unfinished,
+      activeItemCount: active
+    };
+  }
+  return {
+    kind: existing.kind === "download" || kind === "download" ? "download" : "upload",
+    completedBytes: existing.completedBytes + normalizedCompletedBytes,
+    totalBytes: existing.totalBytes + normalizedTotalBytes,
+    itemCount: existing.itemCount + 1,
+    unfinishedItemCount: existing.unfinishedItemCount + unfinished,
+    activeItemCount: existing.activeItemCount + active
+  };
+}
+function formatTransferProgressPercent(state) {
+  if (state.totalBytes <= 0) {
+    return "0%";
+  }
+  const percent = Math.round(state.completedBytes / state.totalBytes * 100);
+  return `${Math.max(0, Math.min(100, percent))}%`;
+}
+function getTransferProgressActivity(state) {
+  if (state.unfinishedItemCount <= 0) {
+    return null;
+  }
+  return state.activeItemCount > 0 ? "active" : "queued";
+}
+
 // src/sync/tree-store.ts
 var TreeStore = class {
   constructor() {
@@ -20631,6 +20675,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         "rolay-loading-ancestor",
         "rolay-uploading-path",
         "rolay-uploading-ancestor",
+        "rolay-transfer-queued",
         "rolay-room-folder",
         "rolay-room-folder-disconnected",
         "rolay-room-folder-connecting",
@@ -20648,6 +20693,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       }
       if (transferBadge?.kind === "upload") {
         element2.classList.add("rolay-uploading-path");
+      }
+      if (transferBadge?.activity === "queued") {
+        element2.classList.add("rolay-transfer-queued");
       }
       if (roomFolderStatus) {
         element2.classList.add("rolay-room-folder");
@@ -21021,10 +21069,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     const aggregate = /* @__PURE__ */ new Map();
     const exactTransferPaths = /* @__PURE__ */ new Set();
     const markdownBootstrapCoveredPaths = /* @__PURE__ */ new Set();
+    const unfinishedBinaryCohortIds = new Set(
+      [...this.binaryTransferState.values()].filter((transfer) => transfer.status !== "done").map((transfer) => transfer.cohortId)
+    );
     for (const transfer of this.binaryTransferState.values()) {
-      const activeUpload = transfer.kind === "upload" && (transfer.status === "preparing" || transfer.status === "uploading" || transfer.status === "canceling" || transfer.status === "committing");
-      const activeDownload = transfer.kind === "download" && (transfer.status === "preparing" || transfer.status === "downloading");
-      if (!activeUpload && !activeDownload) {
+      if (transfer.status === "done" && !unfinishedBinaryCohortIds.has(transfer.cohortId)) {
         continue;
       }
       exactTransferPaths.add((0, import_obsidian10.normalizePath)(transfer.localPath));
@@ -21034,7 +21083,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         transfer.kind,
         Math.max(0, transfer.bytesDone),
         Math.max(0, transfer.bytesTotal),
-        visibleExplorerPaths
+        visibleExplorerPaths,
+        getBinaryTransferProgressActivity(transfer.status)
       );
     }
     for (const placeholderPath of this.fileBridge.getProtectedRemoteBinaryPlaceholderPaths()) {
@@ -21050,7 +21100,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         "download",
         0,
         entry?.blob?.sizeBytes ?? 1,
-        visibleExplorerPaths
+        visibleExplorerPaths,
+        "queued"
       );
     }
     for (const [workspaceId, runtime] of this.roomRuntime.entries()) {
@@ -21075,7 +21126,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
           "download",
           progress.completedBytes,
           progress.totalBytes,
-          visibleExplorerPaths
+          visibleExplorerPaths,
+          "active"
         );
       }
     }
@@ -21091,7 +21143,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         "upload",
         0,
         this.getLocalFileSizeOrOne(normalizedPath),
-        visibleExplorerPaths
+        visibleExplorerPaths,
+        "queued"
       );
     }
     for (const pendingMerge of Object.values(this.data.pendingMarkdownMerges)) {
@@ -21106,7 +21159,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         "upload",
         0,
         this.getLocalFileSizeOrOne(normalizedPath),
-        visibleExplorerPaths
+        visibleExplorerPaths,
+        "queued"
       );
     }
     for (const pendingWrite of Object.values(this.data.pendingBinaryWrites)) {
@@ -21121,33 +21175,56 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         "upload",
         0,
         this.getLocalFileSizeOrOne(normalizedPath),
-        visibleExplorerPaths
+        visibleExplorerPaths,
+        "queued"
       );
     }
     return new Map(
-      [...aggregate.entries()].filter(([, state]) => state.activeItemCount > 0).map(([localPath, state]) => [
-        localPath,
-        {
-          label: this.formatExplorerTransferAggregatePercentLabel(state),
-          kind: state.kind
-        }
-      ])
+      [...aggregate.entries()].map(([localPath, state]) => {
+        const activity = getTransferProgressActivity(state);
+        return activity ? [
+          localPath,
+          {
+            label: formatTransferProgressPercent(state),
+            kind: state.kind,
+            activity
+          }
+        ] : null;
+      }).filter((entry) => entry !== null)
     );
   }
-  addExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes, visibleExplorerPaths) {
+  addExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes, visibleExplorerPaths, activity = "active") {
     const normalizedPath = (0, import_obsidian10.normalizePath)(localPath);
     const room = this.resolveDownloadedRoomByLocalPath(normalizedPath);
     if (!room) {
-      this.mergeExplorerTransferProgress(aggregate, normalizedPath, kind, completedBytes, totalBytes);
+      if (activity !== "completed") {
+        this.mergeExplorerTransferProgress(
+          aggregate,
+          normalizedPath,
+          kind,
+          completedBytes,
+          totalBytes,
+          activity
+        );
+      }
       return;
     }
     const roomRoot = (0, import_obsidian10.normalizePath)(getRoomRoot(this.data.settings.syncRoot, room.folderName));
+    const targetPath = this.getMinimalVisibleExplorerRollupPath(
+      normalizedPath,
+      roomRoot,
+      visibleExplorerPaths
+    );
+    if (activity === "completed" && targetPath === normalizedPath) {
+      return;
+    }
     this.mergeExplorerTransferProgress(
       aggregate,
-      this.getMinimalVisibleExplorerRollupPath(normalizedPath, roomRoot, visibleExplorerPaths),
+      targetPath,
       kind,
       completedBytes,
-      totalBytes
+      totalBytes,
+      activity
     );
   }
   addMarkdownBootstrapVisibleProgress(aggregate, workspaceId, runtime, visibleExplorerPaths, coveredLocalPaths) {
@@ -21186,41 +21263,21 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         "download",
         completed ? totalBytes : 0,
         totalBytes,
-        !completed
+        completed ? "completed" : "active"
       );
     }
   }
-  mergeExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes, active = true) {
-    const normalizedTotalBytes = Math.max(1, Math.trunc(totalBytes));
-    const normalizedCompletedBytes = Math.max(
-      0,
-      Math.min(Math.trunc(completedBytes), normalizedTotalBytes)
-    );
-    const existing = aggregate.get(localPath);
-    if (!existing) {
-      aggregate.set(localPath, {
+  mergeExplorerTransferProgress(aggregate, localPath, kind, completedBytes, totalBytes, activity = "active") {
+    aggregate.set(
+      localPath,
+      mergeTransferProgress(
+        aggregate.get(localPath),
         kind,
-        completedBytes: normalizedCompletedBytes,
-        totalBytes: normalizedTotalBytes,
-        itemCount: 1,
-        activeItemCount: active ? 1 : 0
-      });
-      return;
-    }
-    aggregate.set(localPath, {
-      kind: existing.kind === "download" || kind === "download" ? "download" : "upload",
-      completedBytes: existing.completedBytes + normalizedCompletedBytes,
-      totalBytes: existing.totalBytes + normalizedTotalBytes,
-      itemCount: existing.itemCount + 1,
-      activeItemCount: existing.activeItemCount + (active ? 1 : 0)
-    });
-  }
-  formatExplorerTransferAggregatePercentLabel(state) {
-    if (state.totalBytes <= 0) {
-      return "0%";
-    }
-    const percent = Math.round(state.completedBytes / state.totalBytes * 100);
-    return `${Math.max(0, Math.min(100, percent))}%`;
+        completedBytes,
+        totalBytes,
+        activity
+      )
+    );
   }
   getMarkdownLockProgress(workspaceId, localPath) {
     const runtime = this.roomRuntime.get(workspaceId);
@@ -21299,9 +21356,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     badge.textContent = badgeState.label;
     badge.classList.toggle("rolay-transfer-progress-badge-upload", badgeState.kind === "upload");
     badge.classList.toggle("rolay-transfer-progress-badge-download", badgeState.kind === "download");
+    badge.classList.toggle("rolay-transfer-progress-badge-queued", badgeState.activity === "queued");
     badge.setAttribute(
       "aria-label",
-      badgeState.kind === "upload" ? `Upload progress ${badgeState.label}` : `Download progress ${badgeState.label}`
+      `${badgeState.activity === "queued" ? "Queued" : "Active"} ${badgeState.kind === "upload" ? "upload" : "download"} progress ${badgeState.label}`
     );
   }
   findExplorerTitleHost(element2) {
@@ -21389,14 +21447,22 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     return [...this.binaryTransferState.values()].filter((transfer) => transfer.workspaceId === workspaceId);
   }
   formatRoomBinaryTransferLabel(workspaceId) {
-    const transfers = this.getBinaryTransfersForWorkspace(workspaceId).filter((transfer) => {
-      return transfer.status !== "done";
+    const workspaceTransfers = this.getBinaryTransfersForWorkspace(workspaceId);
+    const unfinishedCohortIds = new Set(
+      workspaceTransfers.filter((transfer) => transfer.status !== "done").map((transfer) => transfer.cohortId)
+    );
+    const transfers = workspaceTransfers.filter((transfer) => {
+      return transfer.status !== "done" || unfinishedCohortIds.has(transfer.cohortId);
     });
     if (transfers.length === 0) {
       return "idle";
     }
-    const activeUploads = transfers.filter((transfer) => transfer.kind === "upload");
-    const activeDownloads = transfers.filter((transfer) => transfer.kind === "download");
+    const activeUploads = transfers.filter((transfer) => {
+      return transfer.kind === "upload" && transfer.status !== "done";
+    });
+    const activeDownloads = transfers.filter((transfer) => {
+      return transfer.kind === "download" && transfer.status !== "done";
+    });
     const totalBytes = transfers.reduce((sum, transfer) => sum + Math.max(0, transfer.bytesTotal), 0);
     const completedBytes = transfers.reduce((sum, transfer) => {
       return sum + Math.min(Math.max(0, transfer.bytesDone), Math.max(0, transfer.bytesTotal));
@@ -21450,6 +21516,71 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
   getBinarySyncPathForToken(token) {
     return this.binarySyncPathsByToken.get(token) ?? null;
   }
+  createBinaryTransferCohortId(workspaceId, kind) {
+    const nonce = typeof globalThis.crypto?.randomUUID === "function" ? globalThis.crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return `${kind}:${workspaceId}:${nonce}`;
+  }
+  findReusableUploadCohortId(workspaceId) {
+    const reusable = this.getBinaryTransfersForWorkspace(workspaceId).find((transfer) => {
+      return transfer.kind === "upload" && transfer.status !== "done" && transfer.status !== "failed";
+    });
+    return reusable?.cohortId ?? null;
+  }
+  markBinaryTransferCompleted(localPath, kind, bytesTotal, cohortId) {
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
+    const existing = this.binaryTransferState.get(normalizedLocalPath);
+    if (!existing || existing.kind !== kind || cohortId !== void 0 && existing.cohortId !== cohortId) {
+      return;
+    }
+    const normalizedTotal = Math.max(0, Math.trunc(bytesTotal));
+    this.updateBinaryTransferState(normalizedLocalPath, {
+      status: "done",
+      bytesDone: normalizedTotal,
+      bytesTotal: normalizedTotal,
+      uploadId: null,
+      cancelUrl: null,
+      lastError: null,
+      abortController: null
+    });
+  }
+  isBinaryTransferCohortCurrent(localPath, kind, cohortId) {
+    const transfer = this.binaryTransferState.get((0, import_obsidian10.normalizePath)(localPath));
+    return transfer?.kind === kind && transfer.cohortId === cohortId;
+  }
+  maybeUpdateBinaryTransferCohort(localPath, kind, cohortId, patch) {
+    if (!this.isBinaryTransferCohortCurrent(localPath, kind, cohortId)) {
+      return null;
+    }
+    return this.updateBinaryTransferState(localPath, patch);
+  }
+  clearIdleCompletedBinaryTransferCohorts(workspaceId, kind) {
+    const transfers = this.getBinaryTransfersForWorkspace(workspaceId).filter((transfer) => {
+      return transfer.kind === kind;
+    });
+    const cohorts = /* @__PURE__ */ new Map();
+    for (const transfer of transfers) {
+      const cohort = cohorts.get(transfer.cohortId);
+      if (cohort) {
+        cohort.push(transfer);
+      } else {
+        cohorts.set(transfer.cohortId, [transfer]);
+      }
+    }
+    let clearedAny = false;
+    for (const cohort of cohorts.values()) {
+      if (cohort.some((transfer) => transfer.status !== "done")) {
+        continue;
+      }
+      for (const transfer of cohort) {
+        this.clearBinaryTransferState(transfer.localPath, false);
+        clearedAny = true;
+      }
+    }
+    if (clearedAny) {
+      this.scheduleExplorerLoadingDecorations();
+      this.updateStatusBar();
+    }
+  }
   updateBinaryTransferState(localPath, patch) {
     const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     const existing = this.binaryTransferState.get(normalizedLocalPath);
@@ -21476,7 +21607,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     }
     return this.updateBinaryTransferState(normalizedLocalPath, patch);
   }
-  setBinaryTransferState(state) {
+  setBinaryTransferState(state, notify = true) {
     const normalizedLocalPath = (0, import_obsidian10.normalizePath)(state.localPath);
     const nextState = {
       ...state,
@@ -21484,8 +21615,10 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     };
     this.binaryTransferState.set(normalizedLocalPath, nextState);
     this.persistBinaryTransferState(nextState);
-    this.scheduleExplorerLoadingDecorations();
-    this.updateStatusBar();
+    if (notify) {
+      this.scheduleExplorerLoadingDecorations();
+      this.updateStatusBar();
+    }
   }
   traceBlob(message, level = "info") {
     if (!_RolayPlugin.ENABLE_BLOB_TRANSFER_TRACE) {
@@ -21493,17 +21626,19 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     }
     this.recordLog("blob-trace", message, level);
   }
-  clearBinaryTransferRuntimeState(localPath) {
+  clearBinaryTransferRuntimeState(localPath, notify = true) {
     if (!this.binaryTransferState.delete((0, import_obsidian10.normalizePath)(localPath))) {
       return;
     }
-    this.scheduleExplorerLoadingDecorations();
-    this.updateStatusBar();
+    if (notify) {
+      this.scheduleExplorerLoadingDecorations();
+      this.updateStatusBar();
+    }
   }
-  clearBinaryTransferState(localPath) {
+  clearBinaryTransferState(localPath, notify = true) {
     const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     this.clearPersistedBinaryTransferState(normalizedLocalPath);
-    this.clearBinaryTransferRuntimeState(normalizedLocalPath);
+    this.clearBinaryTransferRuntimeState(normalizedLocalPath, notify);
   }
   restorePersistedBinaryTransfers() {
     for (const persisted of Object.values(this.data.binaryTransfers)) {
@@ -21513,7 +21648,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         localPath: (0, import_obsidian10.normalizePath)(persisted.localPath),
         serverPath: persisted.serverPath,
         kind: persisted.kind,
-        status: persisted.status,
+        status: persisted.status === "done" || persisted.status === "failed" ? persisted.status : "queued",
         bytesTotal: persisted.bytesTotal,
         bytesDone: persisted.bytesDone,
         hash: persisted.hash,
@@ -21524,6 +21659,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         rangeSupported: persisted.rangeSupported,
         createdAt: persisted.createdAt,
         updatedAt: persisted.updatedAt,
+        cohortId: persisted.cohortId,
         rerunRequested: false,
         abortController: null
       });
@@ -21546,6 +21682,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       rangeSupported: state.rangeSupported,
       createdAt: state.createdAt,
       updatedAt: state.updatedAt,
+      cohortId: state.cohortId,
       lastError: state.lastError
     };
     this.schedulePersist();
@@ -21606,13 +21743,13 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     if (!transfer) {
       return;
     }
-    if (transfer.kind === "upload" && transfer.uploadId && transfer.entryId) {
+    if (transfer.kind === "upload" && transfer.status !== "done" && transfer.uploadId && transfer.entryId) {
       this.updateBinaryTransferState(normalizedLocalPath, {
         status: "canceling"
       });
     }
     transfer.abortController?.abort();
-    if (transfer.kind === "upload" && transfer.uploadId && transfer.entryId) {
+    if (transfer.kind === "upload" && transfer.status !== "done" && transfer.uploadId && transfer.entryId) {
       try {
         await this.apiClient.cancelBlobUpload(transfer.entryId, transfer.uploadId);
         this.recordLog(
@@ -21647,7 +21784,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     }
     this.recordLog(
       "blob",
-      `[${workspaceId}] Canceling ${transfers.length} active binary transfer(s) because room sync was disconnected.`
+      `[${workspaceId}] Clearing ${transfers.length} queued/active binary transfer state(s) because room sync was disconnected.`
     );
     await Promise.all(
       transfers.map((transfer) => this.cancelBinaryTransferForLocalPath(transfer.localPath, reason))
@@ -21656,7 +21793,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
   findDownloadingBinaryPathAtOrBelow(localPath) {
     const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
     for (const transfer of this.binaryTransferState.values()) {
-      if (transfer.kind !== "download" || transfer.status !== "preparing" && transfer.status !== "downloading") {
+      if (transfer.kind !== "download" || transfer.status === "done") {
         continue;
       }
       const transferLocalPath = (0, import_obsidian10.normalizePath)(transfer.localPath);
@@ -23779,8 +23916,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       if (requestRerunIfActive) {
         this.pendingBinarySyncReruns.add(localPath);
         this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
-        const existingTransfer = this.binaryTransferState.get(localPath);
-        if (existingTransfer?.kind === "upload") {
+        const existingTransfer2 = this.binaryTransferState.get(localPath);
+        if (existingTransfer2?.kind === "upload") {
           this.updateBinaryTransferState(localPath, {
             rerunRequested: true
           });
@@ -23788,7 +23925,38 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       }
       return;
     }
+    const activeDownload = this.binaryTransferState.get(localPath);
+    if (activeDownload?.kind === "download" && activeDownload.status !== "done") {
+      await this.cancelBinaryTransferForLocalPath(localPath, "superseded-by-local-write");
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
+    }
     this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
+    const existingTransfer = this.binaryTransferState.get(localPath);
+    const reusableExistingUpload = existingTransfer?.kind === "upload" && existingTransfer.status !== "done" ? existingTransfer : null;
+    const queuedAt = (/* @__PURE__ */ new Date()).toISOString();
+    this.setBinaryTransferState({
+      workspaceId,
+      entryId: existingEntry?.id ?? reusableExistingUpload?.entryId ?? null,
+      localPath,
+      serverPath,
+      kind: "upload",
+      status: "queued",
+      bytesTotal: localContent?.byteLength ?? this.getLocalFileSizeOrOne(localPath),
+      bytesDone: 0,
+      hash: null,
+      mimeType: guessMimeTypeFromPath(localPath),
+      uploadId: null,
+      cancelUrl: null,
+      lastError: null,
+      rangeSupported: false,
+      createdAt: reusableExistingUpload?.createdAt ?? queuedAt,
+      updatedAt: queuedAt,
+      cohortId: reusableExistingUpload?.cohortId ?? this.findReusableUploadCohortId(workspaceId) ?? this.createBinaryTransferCohortId(workspaceId, "upload"),
+      rerunRequested: false,
+      abortController: null
+    });
     const token = this.createBinarySyncToken(localPath);
     void this.syncBinaryWrite(
       workspaceId,
@@ -23926,7 +24094,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
           entry.blob.mimeType || entry.mimeType || mimeType
         );
         await this.clearPendingBinaryWriteForLocalPath(desiredLocalPath, false);
-        this.clearBinaryTransferState(desiredLocalPath);
+        this.markBinaryTransferCompleted(desiredLocalPath, "upload", sizeBytes);
         this.invalidateBinarySyncToken(desiredLocalPath);
         this.traceBlob(
           `[${workspaceId}] upload skipped entryId=${entry.id} localPath=${desiredLocalPath} hash=${hash} sizeBytes=${sizeBytes} mimeType=${mimeType} reason=committed-revision-match`
@@ -23951,6 +24119,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         rangeSupported: false,
         createdAt: existingTransfer?.createdAt ?? (/* @__PURE__ */ new Date()).toISOString(),
         updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        cohortId: existingTransfer?.cohortId ?? this.createBinaryTransferCohortId(workspaceId, "upload"),
         rerunRequested: false,
         abortController: null
       });
@@ -24151,7 +24320,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       }
       this.persistBinaryCacheEntry(entry.id, desiredLocalPath, commitHash, totalUploadBytes, ticket.mimeType);
       await this.clearPendingBinaryWriteForLocalPath(desiredLocalPath, false);
-      this.clearBinaryTransferState(desiredLocalPath);
+      this.markBinaryTransferCompleted(desiredLocalPath, "upload", totalUploadBytes);
       this.invalidateBinarySyncToken(desiredLocalPath);
       this.recordLog(
         "blob",
@@ -24205,8 +24374,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       } else if (this.isBinarySyncTokenCurrent(normalizedFinalLocalPath, token)) {
         this.invalidateBinarySyncToken(normalizedFinalLocalPath);
       }
-      if (!shouldRerun && transfer?.status !== "failed") {
-        this.clearBinaryTransferState(transfer?.localPath ?? rerunLocalPath);
+      if (!shouldRerun && transfer && transfer.status !== "failed" && transfer.status !== "done" && !((0, import_obsidian10.normalizePath)(transfer.localPath) in this.data.pendingBinaryWrites)) {
+        this.clearBinaryTransferState(transfer.localPath);
       }
       if (shouldRerun) {
         this.clearBinaryTransferState(transfer?.localPath ?? rerunLocalPath);
@@ -24228,6 +24397,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
           );
         }
       }
+      this.clearIdleCompletedBinaryTransferCohorts(workspaceId, "upload");
     }
   }
   async resolveBinaryWritePathConflict(workspaceId, originalServerPath, originalLocalPath, suggestedPath, token) {
@@ -24342,10 +24512,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     }
     const binaryEntries = entries.filter((entry) => !entry.deleted && entry.kind === "binary");
     await this.cancelStaleBinaryDownloads(workspaceId, binaryEntries);
+    this.clearIdleCompletedBinaryTransferCohorts(workspaceId, "download");
     if (binaryEntries.length === 0) {
       return;
     }
-    const queue = [...binaryEntries];
+    const queue = this.prepareBinaryDownloadQueue(workspaceId, binaryEntries);
     const workers = Array.from(
       { length: Math.min(_RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY, queue.length) },
       async () => {
@@ -24362,6 +24533,71 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       }
     );
     await Promise.all(workers);
+    this.clearIdleCompletedBinaryTransferCohorts(workspaceId, "download");
+  }
+  prepareBinaryDownloadQueue(workspaceId, entries) {
+    const queuedEntryIds = /* @__PURE__ */ new Set();
+    const newCohortId = this.createBinaryTransferCohortId(workspaceId, "download");
+    for (const entry of entries) {
+      if (entry.deleted || entry.kind !== "binary" || !entry.blob) {
+        continue;
+      }
+      const localPath = (0, import_obsidian10.normalizePath)(
+        this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path
+      );
+      if (localPath in this.data.pendingBinaryWrites) {
+        continue;
+      }
+      const existingTransfer = this.binaryTransferState.get(localPath);
+      if (existingTransfer?.kind === "upload" && existingTransfer.status !== "done") {
+        continue;
+      }
+      const remoteHash = normalizeSha256Hash(entry.blob.hash);
+      if (!remoteHash) {
+        continue;
+      }
+      const localFile = this.app.vault.getAbstractFileByPath(localPath);
+      const cached = this.findPersistedBinaryCacheEntry(entry.id);
+      if (localFile instanceof import_obsidian10.TFile && cached?.hash === remoteHash && localFile.stat.size === entry.blob.sizeBytes) {
+        continue;
+      }
+      const sameRevision = existingTransfer?.kind === "download" && existingTransfer.entryId === entry.id && existingTransfer.serverPath === entry.path && existingTransfer.hash === remoteHash;
+      const alreadyActive = sameRevision && (existingTransfer.status === "preparing" || existingTransfer.status === "downloading") && existingTransfer.abortController !== null;
+      if (alreadyActive) {
+        queuedEntryIds.add(entry.id);
+        continue;
+      }
+      const queuedAt = (/* @__PURE__ */ new Date()).toISOString();
+      this.setBinaryTransferState({
+        workspaceId,
+        entryId: entry.id,
+        localPath,
+        serverPath: entry.path,
+        kind: "download",
+        status: "queued",
+        bytesTotal: entry.blob.sizeBytes,
+        bytesDone: sameRevision && existingTransfer.status !== "done" ? clampTransferBytes(existingTransfer.bytesDone, entry.blob.sizeBytes) : 0,
+        hash: remoteHash,
+        mimeType: entry.blob.mimeType || entry.mimeType || "application/octet-stream",
+        uploadId: null,
+        cancelUrl: null,
+        lastError: null,
+        rangeSupported: sameRevision ? existingTransfer.rangeSupported : false,
+        createdAt: sameRevision ? existingTransfer.createdAt : queuedAt,
+        updatedAt: queuedAt,
+        cohortId: sameRevision ? existingTransfer.cohortId : newCohortId,
+        rerunRequested: false,
+        abortController: null
+      }, false);
+      queuedEntryIds.add(entry.id);
+    }
+    if (queuedEntryIds.size > 0) {
+      this.scheduleExplorerLoadingDecorations();
+      this.updateStatusBar();
+    }
+    return [...entries].sort((left, right) => {
+      return Number(queuedEntryIds.has(right.id)) - Number(queuedEntryIds.has(left.id));
+    });
   }
   async cancelStaleBinaryDownloads(workspaceId, entries) {
     const activeEntries = new Map(entries.map((entry) => [entry.id, entry]));
@@ -24391,7 +24627,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       }
     }
     const activeUpload = this.binaryTransferState.get(localPath);
-    if (activeUpload && activeUpload.kind === "upload") {
+    if (activeUpload && activeUpload.kind === "upload" && activeUpload.status !== "done") {
       return;
     }
     const existingTransfer = this.binaryTransferState.get(localPath);
@@ -24402,23 +24638,48 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     if (existingTransfer && existingTransfer.kind === "download" && existingTransfer.hash === remoteHash && (existingTransfer.status === "preparing" || existingTransfer.status === "downloading") && existingTransfer.abortController) {
       return;
     }
+    const downloadCohortId = existingTransfer?.kind === "download" && existingTransfer.hash === remoteHash ? existingTransfer.cohortId : null;
+    let downloadAbortController = null;
+    if (existingTransfer?.kind === "download" && existingTransfer.hash === remoteHash && (existingTransfer.status === "queued" || existingTransfer.status === "failed" || existingTransfer.status === "preparing" && existingTransfer.abortController === null)) {
+      downloadAbortController = new AbortController();
+      this.updateBinaryTransferState(localPath, {
+        status: "preparing",
+        lastError: null,
+        abortController: downloadAbortController
+      });
+    }
     const localFile = this.app.vault.getAbstractFileByPath(localPath);
     const cached = this.findPersistedBinaryCacheEntry(entry.id);
     const remoteSize = entry.blob.sizeBytes;
     const remoteMimeType = entry.blob.mimeType || entry.mimeType || "application/octet-stream";
-    if (localFile instanceof import_obsidian10.TFile && cached?.hash === remoteHash) {
+    if (localFile instanceof import_obsidian10.TFile && cached?.hash === remoteHash && localFile.stat.size === remoteSize) {
       if ((0, import_obsidian10.normalizePath)(cached.filePath) !== localPath) {
         this.persistBinaryCacheEntry(entry.id, localPath, remoteHash, remoteSize, remoteMimeType);
       }
       await this.clearBinaryDownloadPart(workspaceId, entry.id, remoteHash);
+      this.markBinaryTransferCompleted(
+        localPath,
+        "download",
+        remoteSize,
+        downloadCohortId ?? void 0
+      );
       return;
     }
     if (localFile instanceof import_obsidian10.TFile) {
       const localBytes = await this.app.vault.readBinary(localFile);
       const localHash = await sha256Hash(localBytes);
+      if (downloadCohortId && !this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)) {
+        return;
+      }
       if (localHash === remoteHash) {
         this.persistBinaryCacheEntry(entry.id, localPath, remoteHash, remoteSize, remoteMimeType);
         await this.clearBinaryDownloadPart(workspaceId, entry.id, remoteHash);
+        this.markBinaryTransferCompleted(
+          localPath,
+          "download",
+          remoteSize,
+          downloadCohortId ?? void 0
+        );
         return;
       }
       const safeToOverwrite = localBytes.byteLength === 0 || (cached ? cached.hash === localHash : false);
@@ -24426,12 +24687,15 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         await this.resolveBinaryDownloadConflict(workspaceId, entry, localPath);
       }
     }
+    if (!downloadCohortId || !this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)) {
+      return;
+    }
     try {
       this.traceBlob(
         `[${workspaceId}] download-ticket request entryId=${entry.id} localPath=${localPath} serverPath=${entry.path} expectedHash=${remoteHash} expectedSizeBytes=${remoteSize}`
       );
       const ticket = await this.apiClient.createBlobDownloadTicket(entry.id);
-      if (!this.isRoomSyncActive(workspaceId)) {
+      if (!this.isRoomSyncActive(workspaceId) || !this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)) {
         return;
       }
       this.traceBlob(
@@ -24444,6 +24708,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       const totalDownloadBytes = ticket.sizeBytes > 0 ? ticket.sizeBytes : remoteSize;
       const partPath = this.getBinaryDownloadPartPath(workspaceId, entry.id, ticketHash);
       let resumeOffset = await this.getAdapterFileSize(partPath);
+      if (!this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)) {
+        return;
+      }
       if (resumeOffset > totalDownloadBytes) {
         await this.removeAdapterPathIfExists(partPath);
         resumeOffset = 0;
@@ -24459,35 +24726,41 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       if (totalDownloadBytes === 0 && resumeOffset === 0) {
         await this.writeBinaryTransferPart(partPath, new ArrayBuffer(0), false);
       }
-      this.setBinaryTransferState({
-        workspaceId,
-        entryId: entry.id,
+      const currentTransfer = this.binaryTransferState.get(localPath);
+      const transfer = this.maybeUpdateBinaryTransferCohort(
         localPath,
-        serverPath: entry.path,
-        kind: "download",
-        status: "preparing",
-        bytesTotal: totalDownloadBytes,
-        bytesDone: resumeOffset,
-        hash: ticketHash,
-        mimeType: ticket.mimeType || remoteMimeType,
-        uploadId: null,
-        cancelUrl: null,
-        lastError: null,
-        rangeSupported: Boolean(ticket.rangeSupported),
-        createdAt: existingTransfer?.createdAt ?? (/* @__PURE__ */ new Date()).toISOString(),
-        updatedAt: (/* @__PURE__ */ new Date()).toISOString(),
-        rerunRequested: false,
-        abortController: new AbortController()
-      });
-      const transfer = this.maybeUpdateBinaryTransferState(localPath, {
-        status: "downloading",
-        bytesTotal: totalDownloadBytes,
-        bytesDone: resumeOffset,
-        hash: ticketHash,
-        mimeType: ticket.mimeType || remoteMimeType,
-        rangeSupported: Boolean(ticket.rangeSupported)
-      });
+        "download",
+        downloadCohortId,
+        {
+          status: "preparing",
+          bytesTotal: totalDownloadBytes,
+          bytesDone: resumeOffset,
+          hash: ticketHash,
+          mimeType: ticket.mimeType || remoteMimeType,
+          uploadId: null,
+          cancelUrl: null,
+          lastError: null,
+          rangeSupported: Boolean(ticket.rangeSupported),
+          abortController: downloadAbortController ?? currentTransfer?.abortController ?? new AbortController()
+        }
+      );
       if (!transfer) {
+        return;
+      }
+      const downloadingTransfer = this.maybeUpdateBinaryTransferCohort(
+        localPath,
+        "download",
+        downloadCohortId,
+        {
+          status: "downloading",
+          bytesTotal: totalDownloadBytes,
+          bytesDone: resumeOffset,
+          hash: ticketHash,
+          mimeType: ticket.mimeType || remoteMimeType,
+          rangeSupported: Boolean(ticket.rangeSupported)
+        }
+      );
+      if (!downloadingTransfer) {
         return;
       }
       if (resumeOffset > 0 && resumeOffset < totalDownloadBytes) {
@@ -24509,19 +24782,27 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
           downloadUrl,
           resumeOffset,
           async (chunk) => {
+            if (!this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)) {
+              return;
+            }
             await this.writeBinaryTransferPart(partPath, chunk, append2);
             append2 = true;
           },
           (progress) => {
-            this.maybeUpdateBinaryTransferState(localPath, {
-              status: "downloading",
-              bytesDone: progress.loadedBytes,
-              bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : totalDownloadBytes
-            });
+            this.maybeUpdateBinaryTransferCohort(
+              localPath,
+              "download",
+              downloadCohortId,
+              {
+                status: "downloading",
+                bytesDone: progress.loadedBytes,
+                bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : totalDownloadBytes
+              }
+            );
           },
-          transfer.abortController?.signal
+          downloadingTransfer.abortController?.signal
         );
-        if (!this.isRoomSyncActive(workspaceId)) {
+        if (!this.isRoomSyncActive(workspaceId) || !this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)) {
           return;
         }
         this.traceBlob(
@@ -24537,7 +24818,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
             sizeBytes: totalDownloadBytes,
             mimeType: download.contentType ?? ticket.mimeType ?? remoteMimeType
           },
-          reason
+          reason,
+          downloadCohortId
         );
       } else {
         this.traceBlob(
@@ -24553,11 +24835,20 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
             sizeBytes: totalDownloadBytes,
             mimeType: ticket.mimeType ?? remoteMimeType
           },
-          reason
+          reason,
+          downloadCohortId
         );
       }
-      this.clearBinaryTransferState(localPath);
+      this.markBinaryTransferCompleted(
+        localPath,
+        "download",
+        totalDownloadBytes,
+        downloadCohortId
+      );
     } catch (error) {
+      if (!this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)) {
+        return;
+      }
       if (!(error instanceof Error && error.name === "AbortError")) {
         this.recordLog(
           "blob",
@@ -24570,18 +24861,24 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       if (this.isUnloading) {
         return;
       }
-      this.maybeUpdateBinaryTransferState(localPath, {
+      this.maybeUpdateBinaryTransferCohort(localPath, "download", downloadCohortId, {
         status: "failed",
         lastError: error instanceof Error ? error.message : String(error),
         abortController: null
       });
     }
   }
-  async applyDownloadedBinary(workspaceId, entry, localPath, partPath, downloadMeta, reason) {
-    if (!this.isRoomSyncActive(workspaceId)) {
+  async applyDownloadedBinary(workspaceId, entry, localPath, partPath, downloadMeta, reason, cohortId) {
+    const isCurrent = () => {
+      return this.isRoomSyncActive(workspaceId) && this.isBinaryTransferCohortCurrent(localPath, "download", cohortId);
+    };
+    if (!isCurrent()) {
       return;
     }
     const downloadData = await this.readBinaryTransferPart(partPath);
+    if (!isCurrent()) {
+      return;
+    }
     if (!downloadData) {
       throw new Error(`Downloaded binary part for ${entry.path} is missing.`);
     }
@@ -24595,7 +24892,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       );
     }
     const computedHash = await sha256Hash(downloadData);
-    if (!this.isRoomSyncActive(workspaceId)) {
+    if (!isCurrent()) {
       return;
     }
     this.traceBlob(
@@ -24610,6 +24907,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     if (existingLocalFile instanceof import_obsidian10.TFile) {
       const currentLocalBytes = await this.app.vault.readBinary(existingLocalFile);
       const currentLocalHash = await sha256Hash(currentLocalBytes);
+      if (!isCurrent()) {
+        return;
+      }
       if (currentLocalHash === computedHash) {
         this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType);
         await this.removeAdapterPathIfExists(partPath);
@@ -24618,9 +24918,18 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       const safeToOverwrite = currentLocalBytes.byteLength === 0 || (cached ? cached.hash === currentLocalHash : false);
       if (!safeToOverwrite) {
         await this.resolveBinaryDownloadConflict(workspaceId, entry, localPath);
+        if (!isCurrent()) {
+          return;
+        }
       }
     }
+    if (!isCurrent()) {
+      return;
+    }
     await this.fileBridge.writeBinaryContent(workspaceId, entry.path, downloadData);
+    if (!isCurrent()) {
+      return;
+    }
     await this.removeAdapterPathIfExists(partPath);
     this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType);
     this.recordLog(
@@ -25270,6 +25579,15 @@ function isRetryableBackgroundMarkdownError(error) {
   }
   const message = getErrorMessage(error);
   return message.includes("ERR_CONTENT_LENGTH_MISMATCH") || message.includes("ERR_NETWORK_IO_SUSPENDED") || message.includes("Failed to fetch") || message.includes("NetworkError");
+}
+function getBinaryTransferProgressActivity(status) {
+  if (status === "done") {
+    return "completed";
+  }
+  if (status === "queued" || status === "failed") {
+    return "queued";
+  }
+  return "active";
 }
 function clampTransferBytes(value, totalBytes) {
   if (!Number.isFinite(value) || value <= 0) {

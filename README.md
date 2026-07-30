@@ -224,7 +224,13 @@ Tag note:
 - Non-markdown files now follow a separate blob flow: initial room snapshot materializes their paths, then the plugin downloads actual bytes through blob download tickets and keeps them updated from authoritative room snapshots/events.
 - Markdown files that are still waiting for safe preload are temporarily protected from local move/rename/delete, and the Files pane marks those notes and their parent folders in red until the room has finished loading them safely.
 - Binary files that are still downloading are also marked red and protected from local move/rename/delete; binary files with a local upload in flight are marked yellow until `commit_blob_revision` publishes the new revision.
-- Explorer badges now show a required `0-100%` progress label for red downloading/protected paths and yellow uploading paths, including folder roll-ups. Remote binary placeholders start at `0%` the moment the file path appears.
+- Explorer badges show a required byte-weighted `0-100%` progress label for downloading/protected
+  paths and uploading paths, including folder roll-ups. The full known binary queue contributes to
+  the total before workers start, and completed siblings keep contributing until their cohort
+  drains, so sequential equal-size files advance a parent through `0 -> 50 -> 100` instead of
+  repeating `0 -> 100`. Queued downloads/uploads use a muted red/yellow state; only files currently
+  preparing, transferring, or committing use the stronger color. Remote binary placeholders start
+  at `0%` the moment the file path appears.
 - Settings still do an initial REST snapshot on open, but further profile/rooms/invite/admin updates now come from a dedicated settings SSE stream instead of periodic polling.
 - Runtime sync logs are mirrored into `.obsidian/plugins/rolay/rolay-sync.log` so support/debugging does not depend only on the in-settings log widget. The persistent log keeps roughly the last 48 hours and is capped to a compact recent tail, so attached logs stay useful without growing indefinitely.
 - If a locally created offline markdown note collides with a server path on reconnect, the plugin keeps both by renaming the local file to the next free name such as `file(1).md` before retrying the create.

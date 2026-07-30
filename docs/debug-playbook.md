@@ -138,7 +138,14 @@ Check:
 Useful expectation:
 
 - a remote binary placeholder should immediately count as `loading` in the explorer
-- any red downloading/protected explorer path or yellow uploading path should have a `0-100%` badge. Active binary transfers use byte progress, remote placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll child progress up.
+- any downloading/protected explorer path or uploading path should have a `0-100%` badge. Active
+  binary transfers use the stronger red/yellow state, queued work uses a muted version, remote
+  placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll
+  child progress up
+- binary folder progress is byte-weighted across the full known cohort. A completed child must stay
+  in the aggregate while an unfinished sibling remains; if two equal sequential files make a parent
+  repeat `0 -> 100`, inspect `prepareBinaryDownloadQueue`, persisted transfer `cohortId`, and
+  `clearIdleCompletedBinaryTransferCohorts`
 
 ### Disconnect does not stop room activity
 

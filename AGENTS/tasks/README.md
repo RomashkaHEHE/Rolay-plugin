@@ -12,6 +12,9 @@ belongs in `README.md` and `docs/*`; product ideas that are not being implemente
 
 ## Watch
 
+- [Binary transfer queue progress](binary-transfer-queue-progress.md)
+  Full-queue byte aggregation, completed cohort retention, and muted queued states are implemented
+  and automated; verify timing and visual balance with a real multi-file transfer.
 - [Snapshot refresh coalescing](snapshot-refresh-coalescing.md)
   Cursor-aware local-op/SSE deduplication and safe binary-only Markdown-bootstrap skipping are
   implemented and automated; verify the traffic reduction in a real installed build.

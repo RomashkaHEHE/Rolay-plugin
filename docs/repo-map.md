@@ -32,6 +32,9 @@ The plugin is split into a few strong boundaries:
 - `src/sync/snapshot-refresh.ts`
   Pure cursor coalescing and active-Markdown-tree comparison helpers used by room snapshot
   scheduling. Start here when a local operation and its SSE echo trigger redundant work.
+- `src/sync/transfer-progress.ts`
+  Pure byte-weighted explorer transfer aggregation. It keeps queued, active, and completed cohort
+  contributions separate so sequential files cannot reset parent progress.
 - `src/settings/tab.ts`
   All settings UI and navigation. Rooms view, room detail page, account page, admin page, pagination, room install button, color picker, and tooltips all live here.
 - `src/settings/data.ts`

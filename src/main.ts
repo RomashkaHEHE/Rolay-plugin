@@ -11,7 +11,6 @@ import {
 import { createSharedPresenceExtension, getMarkdownViewsForFile } from "./realtime/shared-presence";
 import {
   type RolayBinaryCacheEntry,
-  type RolayBinaryTransferEntry,
   getRoomBindingSettings,
   ROLAY_AUTO_CONNECT,
   ROLAY_DEVICE_NAME,
@@ -46,6 +45,13 @@ import {
   type SnapshotRefreshOptions,
   type SnapshotRefreshRequest
 } from "./sync/snapshot-refresh";
+import {
+  formatTransferProgressPercent,
+  getTransferProgressActivity,
+  mergeTransferProgress,
+  type TransferProgressActivity,
+  type TransferProgressAggregate
+} from "./sync/transfer-progress";
 import {
   getRoomRoot,
   isValidRoomFolderName,
@@ -134,6 +140,7 @@ interface DownloadedRoomDescriptor {
 
 type BinaryTransferKind = "upload" | "download";
 type BinaryTransferStatus =
+  | "queued"
   | "preparing"
   | "uploading"
   | "canceling"
@@ -159,6 +166,7 @@ interface BinaryTransferState {
   rangeSupported: boolean;
   createdAt: string;
   updatedAt: string;
+  cohortId: string;
   rerunRequested: boolean;
   abortController: AbortController | null;
 }
@@ -184,14 +192,7 @@ interface NotePresenceDisplayState {
 interface ExplorerTransferBadgeState {
   label: string;
   kind: BinaryTransferKind;
-}
-
-interface ExplorerTransferBadgeAggregate {
-  kind: BinaryTransferKind;
-  completedBytes: number;
-  totalBytes: number;
-  itemCount: number;
-  activeItemCount: number;
+  activity: Exclude<TransferProgressActivity, "completed">;
 }
 
 export interface RoomCardState {
@@ -3369,6 +3370,7 @@ export default class RolayPlugin extends Plugin {
         "rolay-loading-ancestor",
         "rolay-uploading-path",
         "rolay-uploading-ancestor",
+        "rolay-transfer-queued",
         "rolay-room-folder",
         "rolay-room-folder-disconnected",
         "rolay-room-folder-connecting",
@@ -3390,6 +3392,10 @@ export default class RolayPlugin extends Plugin {
 
       if (transferBadge?.kind === "upload") {
         element.classList.add("rolay-uploading-path");
+      }
+
+      if (transferBadge?.activity === "queued") {
+        element.classList.add("rolay-transfer-queued");
       }
 
       if (roomFolderStatus) {
@@ -3905,24 +3911,20 @@ export default class RolayPlugin extends Plugin {
   private getExplorerTransferBadges(
     visibleExplorerPaths: Set<string>
   ): Map<string, ExplorerTransferBadgeState> {
-    const aggregate = new Map<string, ExplorerTransferBadgeAggregate>();
+    const aggregate = new Map<string, TransferProgressAggregate>();
     const exactTransferPaths = new Set<string>();
     const markdownBootstrapCoveredPaths = new Set<string>();
+    const unfinishedBinaryCohortIds = new Set(
+      [...this.binaryTransferState.values()]
+        .filter((transfer) => transfer.status !== "done")
+        .map((transfer) => transfer.cohortId)
+    );
 
     for (const transfer of this.binaryTransferState.values()) {
-      const activeUpload =
-        transfer.kind === "upload" &&
-        (
-          transfer.status === "preparing" ||
-          transfer.status === "uploading" ||
-          transfer.status === "canceling" ||
-          transfer.status === "committing"
-        );
-      const activeDownload =
-        transfer.kind === "download" &&
-        (transfer.status === "preparing" || transfer.status === "downloading");
-
-      if (!activeUpload && !activeDownload) {
+      if (
+        transfer.status === "done" &&
+        !unfinishedBinaryCohortIds.has(transfer.cohortId)
+      ) {
         continue;
       }
 
@@ -3933,7 +3935,8 @@ export default class RolayPlugin extends Plugin {
         transfer.kind,
         Math.max(0, transfer.bytesDone),
         Math.max(0, transfer.bytesTotal),
-        visibleExplorerPaths
+        visibleExplorerPaths,
+        getBinaryTransferProgressActivity(transfer.status)
       );
     }
 
@@ -3955,7 +3958,8 @@ export default class RolayPlugin extends Plugin {
         "download",
         0,
         entry?.blob?.sizeBytes ?? 1,
-        visibleExplorerPaths
+        visibleExplorerPaths,
+        "queued"
       );
     }
 
@@ -3991,7 +3995,8 @@ export default class RolayPlugin extends Plugin {
           "download",
           progress.completedBytes,
           progress.totalBytes,
-          visibleExplorerPaths
+          visibleExplorerPaths,
+          "active"
         );
       }
     }
@@ -4009,7 +4014,8 @@ export default class RolayPlugin extends Plugin {
         "upload",
         0,
         this.getLocalFileSizeOrOne(normalizedPath),
-        visibleExplorerPaths
+        visibleExplorerPaths,
+        "queued"
       );
     }
 
@@ -4026,7 +4032,8 @@ export default class RolayPlugin extends Plugin {
         "upload",
         0,
         this.getLocalFileSizeOrOne(normalizedPath),
-        visibleExplorerPaths
+        visibleExplorerPaths,
+        "queued"
       );
     }
 
@@ -4043,50 +4050,77 @@ export default class RolayPlugin extends Plugin {
         "upload",
         0,
         this.getLocalFileSizeOrOne(normalizedPath),
-        visibleExplorerPaths
+        visibleExplorerPaths,
+        "queued"
       );
     }
 
     return new Map(
       [...aggregate.entries()]
-        .filter(([, state]) => state.activeItemCount > 0)
-        .map(([localPath, state]) => [
-          localPath,
-          {
-            label: this.formatExplorerTransferAggregatePercentLabel(state),
-            kind: state.kind
-          }
-        ] as const)
+        .map(([localPath, state]) => {
+          const activity = getTransferProgressActivity(state);
+          return activity
+            ? [
+                localPath,
+                {
+                  label: formatTransferProgressPercent(state),
+                  kind: state.kind,
+                  activity
+                }
+              ] as const
+            : null;
+        })
+        .filter((entry): entry is readonly [string, ExplorerTransferBadgeState] => entry !== null)
     );
   }
 
   private addExplorerTransferProgress(
-    aggregate: Map<string, ExplorerTransferBadgeAggregate>,
+    aggregate: Map<string, TransferProgressAggregate>,
     localPath: string,
     kind: BinaryTransferKind,
     completedBytes: number,
     totalBytes: number,
-    visibleExplorerPaths: Set<string>
+    visibleExplorerPaths: Set<string>,
+    activity: TransferProgressActivity = "active"
   ): void {
     const normalizedPath = normalizePath(localPath);
     const room = this.resolveDownloadedRoomByLocalPath(normalizedPath);
     if (!room) {
-      this.mergeExplorerTransferProgress(aggregate, normalizedPath, kind, completedBytes, totalBytes);
+      if (activity !== "completed") {
+        this.mergeExplorerTransferProgress(
+          aggregate,
+          normalizedPath,
+          kind,
+          completedBytes,
+          totalBytes,
+          activity
+        );
+      }
       return;
     }
 
     const roomRoot = normalizePath(getRoomRoot(this.data.settings.syncRoot, room.folderName));
+    const targetPath = this.getMinimalVisibleExplorerRollupPath(
+      normalizedPath,
+      roomRoot,
+      visibleExplorerPaths
+    );
+    if (activity === "completed" && targetPath === normalizedPath) {
+      return;
+    }
+
     this.mergeExplorerTransferProgress(
       aggregate,
-      this.getMinimalVisibleExplorerRollupPath(normalizedPath, roomRoot, visibleExplorerPaths),
+      targetPath,
       kind,
       completedBytes,
-      totalBytes
+      totalBytes,
+      activity
     );
   }
 
   private addMarkdownBootstrapVisibleProgress(
-    aggregate: Map<string, ExplorerTransferBadgeAggregate>,
+    aggregate: Map<string, TransferProgressAggregate>,
     workspaceId: string,
     runtime: RoomRuntimeState,
     visibleExplorerPaths: Set<string>,
@@ -4131,52 +4165,29 @@ export default class RolayPlugin extends Plugin {
         "download",
         completed ? totalBytes : 0,
         totalBytes,
-        !completed
+        completed ? "completed" : "active"
       );
     }
   }
 
   private mergeExplorerTransferProgress(
-    aggregate: Map<string, ExplorerTransferBadgeAggregate>,
+    aggregate: Map<string, TransferProgressAggregate>,
     localPath: string,
     kind: BinaryTransferKind,
     completedBytes: number,
     totalBytes: number,
-    active = true
+    activity: TransferProgressActivity = "active"
   ): void {
-    const normalizedTotalBytes = Math.max(1, Math.trunc(totalBytes));
-    const normalizedCompletedBytes = Math.max(
-      0,
-      Math.min(Math.trunc(completedBytes), normalizedTotalBytes)
-    );
-    const existing = aggregate.get(localPath);
-    if (!existing) {
-      aggregate.set(localPath, {
+    aggregate.set(
+      localPath,
+      mergeTransferProgress(
+        aggregate.get(localPath),
         kind,
-        completedBytes: normalizedCompletedBytes,
-        totalBytes: normalizedTotalBytes,
-        itemCount: 1,
-        activeItemCount: active ? 1 : 0
-      });
-      return;
-    }
-
-    aggregate.set(localPath, {
-      kind: existing.kind === "download" || kind === "download" ? "download" : "upload",
-      completedBytes: existing.completedBytes + normalizedCompletedBytes,
-      totalBytes: existing.totalBytes + normalizedTotalBytes,
-      itemCount: existing.itemCount + 1,
-      activeItemCount: existing.activeItemCount + (active ? 1 : 0)
-    });
-  }
-
-  private formatExplorerTransferAggregatePercentLabel(state: ExplorerTransferBadgeAggregate): string {
-    if (state.totalBytes <= 0) {
-      return "0%";
-    }
-
-    const percent = Math.round((state.completedBytes / state.totalBytes) * 100);
-    return `${Math.max(0, Math.min(100, percent))}%`;
+        completedBytes,
+        totalBytes,
+        activity
+      )
+    );
   }
 
   private getMarkdownLockProgress(
@@ -4283,11 +4294,11 @@ export default class RolayPlugin extends Plugin {
     badge.textContent = badgeState.label;
     badge.classList.toggle("rolay-transfer-progress-badge-upload", badgeState.kind === "upload");
     badge.classList.toggle("rolay-transfer-progress-badge-download", badgeState.kind === "download");
+    badge.classList.toggle("rolay-transfer-progress-badge-queued", badgeState.activity === "queued");
     badge.setAttribute(
       "aria-label",
-      badgeState.kind === "upload"
-        ? `Upload progress ${badgeState.label}`
-        : `Download progress ${badgeState.label}`
+      `${badgeState.activity === "queued" ? "Queued" : "Active"} ` +
+      `${badgeState.kind === "upload" ? "upload" : "download"} progress ${badgeState.label}`
     );
   }
 
@@ -4399,15 +4410,25 @@ export default class RolayPlugin extends Plugin {
   }
 
   private formatRoomBinaryTransferLabel(workspaceId: string): string {
-    const transfers = this.getBinaryTransfersForWorkspace(workspaceId).filter((transfer) => {
-      return transfer.status !== "done";
+    const workspaceTransfers = this.getBinaryTransfersForWorkspace(workspaceId);
+    const unfinishedCohortIds = new Set(
+      workspaceTransfers
+        .filter((transfer) => transfer.status !== "done")
+        .map((transfer) => transfer.cohortId)
+    );
+    const transfers = workspaceTransfers.filter((transfer) => {
+      return transfer.status !== "done" || unfinishedCohortIds.has(transfer.cohortId);
     });
     if (transfers.length === 0) {
       return "idle";
     }
 
-    const activeUploads = transfers.filter((transfer) => transfer.kind === "upload");
-    const activeDownloads = transfers.filter((transfer) => transfer.kind === "download");
+    const activeUploads = transfers.filter((transfer) => {
+      return transfer.kind === "upload" && transfer.status !== "done";
+    });
+    const activeDownloads = transfers.filter((transfer) => {
+      return transfer.kind === "download" && transfer.status !== "done";
+    });
     const totalBytes = transfers.reduce((sum, transfer) => sum + Math.max(0, transfer.bytesTotal), 0);
     const completedBytes = transfers.reduce((sum, transfer) => {
       return sum + Math.min(Math.max(0, transfer.bytesDone), Math.max(0, transfer.bytesTotal));
@@ -4474,6 +4495,112 @@ export default class RolayPlugin extends Plugin {
     return this.binarySyncPathsByToken.get(token) ?? null;
   }
 
+  private createBinaryTransferCohortId(
+    workspaceId: string,
+    kind: BinaryTransferKind
+  ): string {
+    const nonce = typeof globalThis.crypto?.randomUUID === "function"
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return `${kind}:${workspaceId}:${nonce}`;
+  }
+
+  private findReusableUploadCohortId(workspaceId: string): string | null {
+    const reusable = this.getBinaryTransfersForWorkspace(workspaceId).find((transfer) => {
+      return (
+        transfer.kind === "upload" &&
+        transfer.status !== "done" &&
+        transfer.status !== "failed"
+      );
+    });
+    return reusable?.cohortId ?? null;
+  }
+
+  private markBinaryTransferCompleted(
+    localPath: string,
+    kind: BinaryTransferKind,
+    bytesTotal: number,
+    cohortId?: string
+  ): void {
+    const normalizedLocalPath = normalizePath(localPath);
+    const existing = this.binaryTransferState.get(normalizedLocalPath);
+    if (
+      !existing ||
+      existing.kind !== kind ||
+      (cohortId !== undefined && existing.cohortId !== cohortId)
+    ) {
+      return;
+    }
+
+    const normalizedTotal = Math.max(0, Math.trunc(bytesTotal));
+    this.updateBinaryTransferState(normalizedLocalPath, {
+      status: "done",
+      bytesDone: normalizedTotal,
+      bytesTotal: normalizedTotal,
+      uploadId: null,
+      cancelUrl: null,
+      lastError: null,
+      abortController: null
+    });
+  }
+
+  private isBinaryTransferCohortCurrent(
+    localPath: string,
+    kind: BinaryTransferKind,
+    cohortId: string
+  ): boolean {
+    const transfer = this.binaryTransferState.get(normalizePath(localPath));
+    return transfer?.kind === kind && transfer.cohortId === cohortId;
+  }
+
+  private maybeUpdateBinaryTransferCohort(
+    localPath: string,
+    kind: BinaryTransferKind,
+    cohortId: string,
+    patch: Partial<BinaryTransferState>
+  ): BinaryTransferState | null {
+    if (!this.isBinaryTransferCohortCurrent(localPath, kind, cohortId)) {
+      return null;
+    }
+
+    return this.updateBinaryTransferState(localPath, patch);
+  }
+
+  private clearIdleCompletedBinaryTransferCohorts(
+    workspaceId: string,
+    kind: BinaryTransferKind
+  ): void {
+    const transfers = this.getBinaryTransfersForWorkspace(workspaceId).filter((transfer) => {
+      return transfer.kind === kind;
+    });
+    const cohorts = new Map<string, BinaryTransferState[]>();
+    for (const transfer of transfers) {
+      const cohort = cohorts.get(transfer.cohortId);
+      if (cohort) {
+        cohort.push(transfer);
+      } else {
+        cohorts.set(transfer.cohortId, [transfer]);
+      }
+    }
+
+    let clearedAny = false;
+    for (const cohort of cohorts.values()) {
+      if (cohort.some((transfer) => transfer.status !== "done")) {
+        continue;
+      }
+
+      for (const transfer of cohort) {
+        this.clearBinaryTransferState(transfer.localPath, false);
+        clearedAny = true;
+      }
+    }
+
+    if (clearedAny) {
+      this.scheduleExplorerLoadingDecorations();
+      this.updateStatusBar();
+    }
+  }
+
   private updateBinaryTransferState(localPath: string, patch: Partial<BinaryTransferState>): BinaryTransferState {
     const normalizedLocalPath = normalizePath(localPath);
     const existing = this.binaryTransferState.get(normalizedLocalPath);
@@ -4507,7 +4634,7 @@ export default class RolayPlugin extends Plugin {
     return this.updateBinaryTransferState(normalizedLocalPath, patch);
   }
 
-  private setBinaryTransferState(state: BinaryTransferState): void {
+  private setBinaryTransferState(state: BinaryTransferState, notify = true): void {
     const normalizedLocalPath = normalizePath(state.localPath);
     const nextState = {
       ...state,
@@ -4515,8 +4642,10 @@ export default class RolayPlugin extends Plugin {
     };
     this.binaryTransferState.set(normalizedLocalPath, nextState);
     this.persistBinaryTransferState(nextState);
-    this.scheduleExplorerLoadingDecorations();
-    this.updateStatusBar();
+    if (notify) {
+      this.scheduleExplorerLoadingDecorations();
+      this.updateStatusBar();
+    }
   }
 
   private traceBlob(message: string, level: RolayLogEntry["level"] = "info"): void {
@@ -4527,19 +4656,21 @@ export default class RolayPlugin extends Plugin {
     this.recordLog("blob-trace", message, level);
   }
 
-  private clearBinaryTransferRuntimeState(localPath: string): void {
+  private clearBinaryTransferRuntimeState(localPath: string, notify = true): void {
     if (!this.binaryTransferState.delete(normalizePath(localPath))) {
       return;
     }
 
-    this.scheduleExplorerLoadingDecorations();
-    this.updateStatusBar();
+    if (notify) {
+      this.scheduleExplorerLoadingDecorations();
+      this.updateStatusBar();
+    }
   }
 
-  private clearBinaryTransferState(localPath: string): void {
+  private clearBinaryTransferState(localPath: string, notify = true): void {
     const normalizedLocalPath = normalizePath(localPath);
     this.clearPersistedBinaryTransferState(normalizedLocalPath);
-    this.clearBinaryTransferRuntimeState(normalizedLocalPath);
+    this.clearBinaryTransferRuntimeState(normalizedLocalPath, notify);
   }
 
   private restorePersistedBinaryTransfers(): void {
@@ -4550,7 +4681,10 @@ export default class RolayPlugin extends Plugin {
         localPath: normalizePath(persisted.localPath),
         serverPath: persisted.serverPath,
         kind: persisted.kind,
-        status: persisted.status,
+        status:
+          persisted.status === "done" || persisted.status === "failed"
+            ? persisted.status
+            : "queued",
         bytesTotal: persisted.bytesTotal,
         bytesDone: persisted.bytesDone,
         hash: persisted.hash,
@@ -4561,6 +4695,7 @@ export default class RolayPlugin extends Plugin {
         rangeSupported: persisted.rangeSupported,
         createdAt: persisted.createdAt,
         updatedAt: persisted.updatedAt,
+        cohortId: persisted.cohortId,
         rerunRequested: false,
         abortController: null
       });
@@ -4584,6 +4719,7 @@ export default class RolayPlugin extends Plugin {
       rangeSupported: state.rangeSupported,
       createdAt: state.createdAt,
       updatedAt: state.updatedAt,
+      cohortId: state.cohortId,
       lastError: state.lastError
     };
     this.schedulePersist();
@@ -4660,7 +4796,12 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
-    if (transfer.kind === "upload" && transfer.uploadId && transfer.entryId) {
+    if (
+      transfer.kind === "upload" &&
+      transfer.status !== "done" &&
+      transfer.uploadId &&
+      transfer.entryId
+    ) {
       this.updateBinaryTransferState(normalizedLocalPath, {
         status: "canceling"
       });
@@ -4668,7 +4809,12 @@ export default class RolayPlugin extends Plugin {
 
     transfer.abortController?.abort();
 
-    if (transfer.kind === "upload" && transfer.uploadId && transfer.entryId) {
+    if (
+      transfer.kind === "upload" &&
+      transfer.status !== "done" &&
+      transfer.uploadId &&
+      transfer.entryId
+    ) {
       try {
         await this.apiClient.cancelBlobUpload(transfer.entryId, transfer.uploadId);
         this.recordLog(
@@ -4709,7 +4855,7 @@ export default class RolayPlugin extends Plugin {
 
     this.recordLog(
       "blob",
-      `[${workspaceId}] Canceling ${transfers.length} active binary transfer(s) because room sync was disconnected.`
+      `[${workspaceId}] Clearing ${transfers.length} queued/active binary transfer state(s) because room sync was disconnected.`
     );
     await Promise.all(
       transfers.map((transfer) => this.cancelBinaryTransferForLocalPath(transfer.localPath, reason))
@@ -4721,7 +4867,7 @@ export default class RolayPlugin extends Plugin {
     for (const transfer of this.binaryTransferState.values()) {
       if (
         transfer.kind !== "download" ||
-        (transfer.status !== "preparing" && transfer.status !== "downloading")
+        transfer.status === "done"
       ) {
         continue;
       }
@@ -7469,7 +7615,48 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
+    const activeDownload = this.binaryTransferState.get(localPath);
+    if (
+      activeDownload?.kind === "download" &&
+      activeDownload.status !== "done"
+    ) {
+      await this.cancelBinaryTransferForLocalPath(localPath, "superseded-by-local-write");
+      if (!this.isRoomSyncActive(workspaceId)) {
+        return;
+      }
+    }
+
     this.rememberPendingBinaryWrite(workspaceId, localPath, serverPath, existingEntry?.id ?? null);
+    const existingTransfer = this.binaryTransferState.get(localPath);
+    const reusableExistingUpload =
+      existingTransfer?.kind === "upload" && existingTransfer.status !== "done"
+        ? existingTransfer
+        : null;
+    const queuedAt = new Date().toISOString();
+    this.setBinaryTransferState({
+      workspaceId,
+      entryId: existingEntry?.id ?? reusableExistingUpload?.entryId ?? null,
+      localPath,
+      serverPath,
+      kind: "upload",
+      status: "queued",
+      bytesTotal: localContent?.byteLength ?? this.getLocalFileSizeOrOne(localPath),
+      bytesDone: 0,
+      hash: null,
+      mimeType: guessMimeTypeFromPath(localPath),
+      uploadId: null,
+      cancelUrl: null,
+      lastError: null,
+      rangeSupported: false,
+      createdAt: reusableExistingUpload?.createdAt ?? queuedAt,
+      updatedAt: queuedAt,
+      cohortId:
+        reusableExistingUpload?.cohortId ??
+        this.findReusableUploadCohortId(workspaceId) ??
+        this.createBinaryTransferCohortId(workspaceId, "upload"),
+      rerunRequested: false,
+      abortController: null
+    });
     const token = this.createBinarySyncToken(localPath);
     void this.syncBinaryWrite(
       workspaceId,
@@ -7656,7 +7843,7 @@ export default class RolayPlugin extends Plugin {
           entry.blob.mimeType || entry.mimeType || mimeType
         );
         await this.clearPendingBinaryWriteForLocalPath(desiredLocalPath, false);
-        this.clearBinaryTransferState(desiredLocalPath);
+        this.markBinaryTransferCompleted(desiredLocalPath, "upload", sizeBytes);
         this.invalidateBinarySyncToken(desiredLocalPath);
         this.traceBlob(
           `[${workspaceId}] upload skipped entryId=${entry.id} localPath=${desiredLocalPath} ` +
@@ -7683,6 +7870,9 @@ export default class RolayPlugin extends Plugin {
         rangeSupported: false,
         createdAt: existingTransfer?.createdAt ?? new Date().toISOString(),
         updatedAt: new Date().toISOString(),
+        cohortId:
+          existingTransfer?.cohortId ??
+          this.createBinaryTransferCohortId(workspaceId, "upload"),
         rerunRequested: false,
         abortController: null
       });
@@ -7918,7 +8108,7 @@ export default class RolayPlugin extends Plugin {
 
       this.persistBinaryCacheEntry(entry.id, desiredLocalPath, commitHash, totalUploadBytes, ticket.mimeType);
       await this.clearPendingBinaryWriteForLocalPath(desiredLocalPath, false);
-      this.clearBinaryTransferState(desiredLocalPath);
+      this.markBinaryTransferCompleted(desiredLocalPath, "upload", totalUploadBytes);
       this.invalidateBinarySyncToken(desiredLocalPath);
       this.recordLog(
         "blob",
@@ -7981,8 +8171,14 @@ export default class RolayPlugin extends Plugin {
       } else if (this.isBinarySyncTokenCurrent(normalizedFinalLocalPath, token)) {
         this.invalidateBinarySyncToken(normalizedFinalLocalPath);
       }
-      if (!shouldRerun && transfer?.status !== "failed") {
-        this.clearBinaryTransferState(transfer?.localPath ?? rerunLocalPath);
+      if (
+        !shouldRerun &&
+        transfer &&
+        transfer.status !== "failed" &&
+        transfer.status !== "done" &&
+        !(normalizePath(transfer.localPath) in this.data.pendingBinaryWrites)
+      ) {
+        this.clearBinaryTransferState(transfer.localPath);
       }
 
       if (shouldRerun) {
@@ -8010,6 +8206,8 @@ export default class RolayPlugin extends Plugin {
           );
         }
       }
+
+      this.clearIdleCompletedBinaryTransferCohorts(workspaceId, "upload");
     }
   }
 
@@ -8158,11 +8356,12 @@ export default class RolayPlugin extends Plugin {
 
     const binaryEntries = entries.filter((entry) => !entry.deleted && entry.kind === "binary");
     await this.cancelStaleBinaryDownloads(workspaceId, binaryEntries);
+    this.clearIdleCompletedBinaryTransferCohorts(workspaceId, "download");
     if (binaryEntries.length === 0) {
       return;
     }
 
-    const queue = [...binaryEntries];
+    const queue = this.prepareBinaryDownloadQueue(workspaceId, binaryEntries);
     const workers = Array.from(
       { length: Math.min(RolayPlugin.BINARY_DOWNLOAD_CONCURRENCY, queue.length) },
       async () => {
@@ -8182,6 +8381,103 @@ export default class RolayPlugin extends Plugin {
     );
 
     await Promise.all(workers);
+    this.clearIdleCompletedBinaryTransferCohorts(workspaceId, "download");
+  }
+
+  private prepareBinaryDownloadQueue(
+    workspaceId: string,
+    entries: FileEntry[]
+  ): FileEntry[] {
+    const queuedEntryIds = new Set<string>();
+    const newCohortId = this.createBinaryTransferCohortId(workspaceId, "download");
+
+    for (const entry of entries) {
+      if (entry.deleted || entry.kind !== "binary" || !entry.blob) {
+        continue;
+      }
+
+      const localPath = normalizePath(
+        this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path
+      );
+      if (localPath in this.data.pendingBinaryWrites) {
+        continue;
+      }
+
+      const existingTransfer = this.binaryTransferState.get(localPath);
+      if (existingTransfer?.kind === "upload" && existingTransfer.status !== "done") {
+        continue;
+      }
+
+      const remoteHash = normalizeSha256Hash(entry.blob.hash);
+      if (!remoteHash) {
+        continue;
+      }
+
+      const localFile = this.app.vault.getAbstractFileByPath(localPath);
+      const cached = this.findPersistedBinaryCacheEntry(entry.id);
+      if (
+        localFile instanceof TFile &&
+        cached?.hash === remoteHash &&
+        localFile.stat.size === entry.blob.sizeBytes
+      ) {
+        continue;
+      }
+
+      const sameRevision =
+        existingTransfer?.kind === "download" &&
+        existingTransfer.entryId === entry.id &&
+        existingTransfer.serverPath === entry.path &&
+        existingTransfer.hash === remoteHash;
+      const alreadyActive =
+        sameRevision &&
+        (
+          existingTransfer.status === "preparing" ||
+          existingTransfer.status === "downloading"
+        ) &&
+        existingTransfer.abortController !== null;
+      if (alreadyActive) {
+        queuedEntryIds.add(entry.id);
+        continue;
+      }
+
+      const queuedAt = new Date().toISOString();
+      this.setBinaryTransferState({
+        workspaceId,
+        entryId: entry.id,
+        localPath,
+        serverPath: entry.path,
+        kind: "download",
+        status: "queued",
+        bytesTotal: entry.blob.sizeBytes,
+        bytesDone:
+          sameRevision && existingTransfer.status !== "done"
+            ? clampTransferBytes(existingTransfer.bytesDone, entry.blob.sizeBytes)
+            : 0,
+        hash: remoteHash,
+        mimeType: entry.blob.mimeType || entry.mimeType || "application/octet-stream",
+        uploadId: null,
+        cancelUrl: null,
+        lastError: null,
+        rangeSupported: sameRevision ? existingTransfer.rangeSupported : false,
+        createdAt: sameRevision ? existingTransfer.createdAt : queuedAt,
+        updatedAt: queuedAt,
+        cohortId: sameRevision ? existingTransfer.cohortId : newCohortId,
+        rerunRequested: false,
+        abortController: null
+      }, false);
+      queuedEntryIds.add(entry.id);
+    }
+
+    if (queuedEntryIds.size > 0) {
+      this.scheduleExplorerLoadingDecorations();
+      this.updateStatusBar();
+    }
+
+    // Known missing/stale files start first, while cache-clean entries still run
+    // through the inexpensive reconciliation path that clears obsolete parts.
+    return [...entries].sort((left, right) => {
+      return Number(queuedEntryIds.has(right.id)) - Number(queuedEntryIds.has(left.id));
+    });
   }
 
   private async cancelStaleBinaryDownloads(workspaceId: string, entries: FileEntry[]): Promise<void> {
@@ -8223,7 +8519,11 @@ export default class RolayPlugin extends Plugin {
     }
 
     const activeUpload = this.binaryTransferState.get(localPath);
-    if (activeUpload && activeUpload.kind === "upload") {
+    if (
+      activeUpload &&
+      activeUpload.kind === "upload" &&
+      activeUpload.status !== "done"
+    ) {
       return;
     }
 
@@ -8243,25 +8543,73 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
+    const downloadCohortId =
+      existingTransfer?.kind === "download" && existingTransfer.hash === remoteHash
+        ? existingTransfer.cohortId
+        : null;
+    let downloadAbortController: AbortController | null = null;
+    if (
+      existingTransfer?.kind === "download" &&
+      existingTransfer.hash === remoteHash &&
+      (
+        existingTransfer.status === "queued" ||
+        existingTransfer.status === "failed" ||
+        (
+          existingTransfer.status === "preparing" &&
+          existingTransfer.abortController === null
+        )
+      )
+    ) {
+      downloadAbortController = new AbortController();
+      this.updateBinaryTransferState(localPath, {
+        status: "preparing",
+        lastError: null,
+        abortController: downloadAbortController
+      });
+    }
+
     const localFile = this.app.vault.getAbstractFileByPath(localPath);
     const cached = this.findPersistedBinaryCacheEntry(entry.id);
     const remoteSize = entry.blob.sizeBytes;
     const remoteMimeType = entry.blob.mimeType || entry.mimeType || "application/octet-stream";
 
-    if (localFile instanceof TFile && cached?.hash === remoteHash) {
+    if (
+      localFile instanceof TFile &&
+      cached?.hash === remoteHash &&
+      localFile.stat.size === remoteSize
+    ) {
       if (normalizePath(cached.filePath) !== localPath) {
         this.persistBinaryCacheEntry(entry.id, localPath, remoteHash, remoteSize, remoteMimeType);
       }
       await this.clearBinaryDownloadPart(workspaceId, entry.id, remoteHash);
+      this.markBinaryTransferCompleted(
+        localPath,
+        "download",
+        remoteSize,
+        downloadCohortId ?? undefined
+      );
       return;
     }
 
     if (localFile instanceof TFile) {
       const localBytes = await this.app.vault.readBinary(localFile);
       const localHash = await sha256Hash(localBytes);
+      if (
+        downloadCohortId &&
+        !this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)
+      ) {
+        return;
+      }
+
       if (localHash === remoteHash) {
         this.persistBinaryCacheEntry(entry.id, localPath, remoteHash, remoteSize, remoteMimeType);
         await this.clearBinaryDownloadPart(workspaceId, entry.id, remoteHash);
+        this.markBinaryTransferCompleted(
+          localPath,
+          "download",
+          remoteSize,
+          downloadCohortId ?? undefined
+        );
         return;
       }
 
@@ -8274,13 +8622,23 @@ export default class RolayPlugin extends Plugin {
       }
     }
 
+    if (
+      !downloadCohortId ||
+      !this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)
+    ) {
+      return;
+    }
+
     try {
       this.traceBlob(
         `[${workspaceId}] download-ticket request entryId=${entry.id} localPath=${localPath} serverPath=${entry.path} ` +
         `expectedHash=${remoteHash} expectedSizeBytes=${remoteSize}`
       );
       const ticket = await this.apiClient.createBlobDownloadTicket(entry.id);
-      if (!this.isRoomSyncActive(workspaceId)) {
+      if (
+        !this.isRoomSyncActive(workspaceId) ||
+        !this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)
+      ) {
         return;
       }
 
@@ -8297,6 +8655,10 @@ export default class RolayPlugin extends Plugin {
       const totalDownloadBytes = ticket.sizeBytes > 0 ? ticket.sizeBytes : remoteSize;
       const partPath = this.getBinaryDownloadPartPath(workspaceId, entry.id, ticketHash);
       let resumeOffset = await this.getAdapterFileSize(partPath);
+      if (!this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)) {
+        return;
+      }
+
       if (resumeOffset > totalDownloadBytes) {
         await this.removeAdapterPathIfExists(partPath);
         resumeOffset = 0;
@@ -8314,36 +8676,45 @@ export default class RolayPlugin extends Plugin {
         await this.writeBinaryTransferPart(partPath, new ArrayBuffer(0), false);
       }
 
-      this.setBinaryTransferState({
-        workspaceId,
-        entryId: entry.id,
+      const currentTransfer = this.binaryTransferState.get(localPath);
+      const transfer = this.maybeUpdateBinaryTransferCohort(
         localPath,
-        serverPath: entry.path,
-        kind: "download",
-        status: "preparing",
-        bytesTotal: totalDownloadBytes,
-        bytesDone: resumeOffset,
-        hash: ticketHash,
-        mimeType: ticket.mimeType || remoteMimeType,
-        uploadId: null,
-        cancelUrl: null,
-        lastError: null,
-        rangeSupported: Boolean(ticket.rangeSupported),
-        createdAt: existingTransfer?.createdAt ?? new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-        rerunRequested: false,
-        abortController: new AbortController()
-      });
-
-      const transfer = this.maybeUpdateBinaryTransferState(localPath, {
-        status: "downloading",
-        bytesTotal: totalDownloadBytes,
-        bytesDone: resumeOffset,
-        hash: ticketHash,
-        mimeType: ticket.mimeType || remoteMimeType,
-        rangeSupported: Boolean(ticket.rangeSupported)
-      });
+        "download",
+        downloadCohortId,
+        {
+          status: "preparing",
+          bytesTotal: totalDownloadBytes,
+          bytesDone: resumeOffset,
+          hash: ticketHash,
+          mimeType: ticket.mimeType || remoteMimeType,
+          uploadId: null,
+          cancelUrl: null,
+          lastError: null,
+          rangeSupported: Boolean(ticket.rangeSupported),
+          abortController:
+            downloadAbortController ??
+            currentTransfer?.abortController ??
+            new AbortController()
+        }
+      );
       if (!transfer) {
+        return;
+      }
+
+      const downloadingTransfer = this.maybeUpdateBinaryTransferCohort(
+        localPath,
+        "download",
+        downloadCohortId,
+        {
+          status: "downloading",
+          bytesTotal: totalDownloadBytes,
+          bytesDone: resumeOffset,
+          hash: ticketHash,
+          mimeType: ticket.mimeType || remoteMimeType,
+          rangeSupported: Boolean(ticket.rangeSupported)
+        }
+      );
+      if (!downloadingTransfer) {
         return;
       }
 
@@ -8371,19 +8742,31 @@ export default class RolayPlugin extends Plugin {
           downloadUrl,
           resumeOffset,
           async (chunk) => {
+            if (!this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)) {
+              return;
+            }
+
             await this.writeBinaryTransferPart(partPath, chunk, append);
             append = true;
           },
           (progress) => {
-            this.maybeUpdateBinaryTransferState(localPath, {
-              status: "downloading",
-              bytesDone: progress.loadedBytes,
-              bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : totalDownloadBytes
-            });
+            this.maybeUpdateBinaryTransferCohort(
+              localPath,
+              "download",
+              downloadCohortId,
+              {
+                status: "downloading",
+                bytesDone: progress.loadedBytes,
+                bytesTotal: progress.totalBytes > 0 ? progress.totalBytes : totalDownloadBytes
+              }
+            );
           },
-          transfer.abortController?.signal
+          downloadingTransfer.abortController?.signal
         );
-        if (!this.isRoomSyncActive(workspaceId)) {
+        if (
+          !this.isRoomSyncActive(workspaceId) ||
+          !this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)
+        ) {
           return;
         }
 
@@ -8404,7 +8787,8 @@ export default class RolayPlugin extends Plugin {
             sizeBytes: totalDownloadBytes,
             mimeType: download.contentType ?? ticket.mimeType ?? remoteMimeType
           },
-          reason
+          reason,
+          downloadCohortId
         );
       } else {
         this.traceBlob(
@@ -8420,12 +8804,22 @@ export default class RolayPlugin extends Plugin {
             sizeBytes: totalDownloadBytes,
             mimeType: ticket.mimeType ?? remoteMimeType
           },
-          reason
+          reason,
+          downloadCohortId
         );
       }
 
-      this.clearBinaryTransferState(localPath);
+      this.markBinaryTransferCompleted(
+        localPath,
+        "download",
+        totalDownloadBytes,
+        downloadCohortId
+      );
     } catch (error) {
+      if (!this.isBinaryTransferCohortCurrent(localPath, "download", downloadCohortId)) {
+        return;
+      }
+
       if (!(error instanceof Error && error.name === "AbortError")) {
         this.recordLog(
           "blob",
@@ -8440,7 +8834,7 @@ export default class RolayPlugin extends Plugin {
         return;
       }
 
-      this.maybeUpdateBinaryTransferState(localPath, {
+      this.maybeUpdateBinaryTransferCohort(localPath, "download", downloadCohortId, {
         status: "failed",
         lastError: error instanceof Error ? error.message : String(error),
         abortController: null
@@ -8454,13 +8848,24 @@ export default class RolayPlugin extends Plugin {
     localPath: string,
     partPath: string,
     downloadMeta: { hash: string; sizeBytes: number; mimeType: string | null },
-    reason: string
+    reason: string,
+    cohortId: string
   ): Promise<void> {
-    if (!this.isRoomSyncActive(workspaceId)) {
+    const isCurrent = (): boolean => {
+      return (
+        this.isRoomSyncActive(workspaceId) &&
+        this.isBinaryTransferCohortCurrent(localPath, "download", cohortId)
+      );
+    };
+    if (!isCurrent()) {
       return;
     }
 
     const downloadData = await this.readBinaryTransferPart(partPath);
+    if (!isCurrent()) {
+      return;
+    }
+
     if (!downloadData) {
       throw new Error(`Downloaded binary part for ${entry.path} is missing.`);
     }
@@ -8477,7 +8882,7 @@ export default class RolayPlugin extends Plugin {
     }
 
     const computedHash = await sha256Hash(downloadData);
-    if (!this.isRoomSyncActive(workspaceId)) {
+    if (!isCurrent()) {
       return;
     }
 
@@ -8495,6 +8900,9 @@ export default class RolayPlugin extends Plugin {
     if (existingLocalFile instanceof TFile) {
       const currentLocalBytes = await this.app.vault.readBinary(existingLocalFile);
       const currentLocalHash = await sha256Hash(currentLocalBytes);
+      if (!isCurrent()) {
+        return;
+      }
 
       if (currentLocalHash === computedHash) {
         this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType);
@@ -8508,10 +8916,21 @@ export default class RolayPlugin extends Plugin {
 
       if (!safeToOverwrite) {
         await this.resolveBinaryDownloadConflict(workspaceId, entry, localPath);
+        if (!isCurrent()) {
+          return;
+        }
       }
     }
 
+    if (!isCurrent()) {
+      return;
+    }
+
     await this.fileBridge.writeBinaryContent(workspaceId, entry.path, downloadData);
+    if (!isCurrent()) {
+      return;
+    }
+
     await this.removeAdapterPathIfExists(partPath);
     this.persistBinaryCacheEntry(entry.id, localPath, computedHash, effectiveSize, effectiveMimeType);
     this.recordLog(
@@ -9351,6 +9770,20 @@ function isRetryableBackgroundMarkdownError(error: unknown): boolean {
     message.includes("Failed to fetch") ||
     message.includes("NetworkError")
   );
+}
+
+function getBinaryTransferProgressActivity(
+  status: BinaryTransferStatus
+): TransferProgressActivity {
+  if (status === "done") {
+    return "completed";
+  }
+
+  if (status === "queued" || status === "failed") {
+    return "queued";
+  }
+
+  return "active";
 }
 
 function clampTransferBytes(value: number, totalBytes: number): number {

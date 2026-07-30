@@ -53,6 +53,11 @@ Show transfer progress only where it is relevant:
 Progress is state, not an error. Avoid global notices for ordinary downloads, uploads, preload, retry,
 or finalization.
 
+Binary progress represents the whole known byte queue, not only the worker currently using the
+network. Queued paths remain visible in a muted transfer color, active paths use the stronger color,
+and completed siblings keep contributing to a collapsed parent's percentage until the cohort
+finishes. This preserves information without making every queued file look equally urgent.
+
 ### Degraded But Recovering
 
 Use the subtle room health mark as the first escalation point:
