@@ -47,8 +47,7 @@ credentials/note content, or creating an error-reporting feedback loop.
 
 ## Next Steps
 
-1. Release plugin `1.2.24`.
-2. After plugin rollout, trigger one controlled client error and confirm its structured log correlation in
+1. Trigger one controlled client error and confirm its structured log correlation in
    production without exposing credentials.
 
 ## Completed
@@ -64,6 +63,8 @@ credentials/note content, or creating an error-reporting feedback loop.
 - Added authenticated server ingestion, server-derived actor/device identity, per-device rate
   limiting, and structured Pino error records.
 - Deployed server support in production commit `a23133e` on 2026-07-30.
+- Released plugin `1.2.24` from commit `9f665e7`; workflow `30536888018`, all standalone assets,
+  archive contents, and production update-proxy bytes were verified.
 - Verified plugin `check`, tests, production build, server tests, and server typecheck on
   2026-07-30.
 

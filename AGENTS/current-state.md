@@ -272,12 +272,13 @@ These are important because future regressions will often land in these areas:
   completed-cohort contribution, muted queued download/upload styling, stale-worker guards, and a
   local-size guard for persisted cache hits; GitHub workflow `30527292378`, all five assets,
   archive contents, and production updater bytes were verified
-- Prepared `1.2.24` with immediate startup update discovery and capped pre-success
+- Released `1.2.24` with immediate startup update discovery and capped pre-success
   offline/deferred retries, so a missed startup connectivity window cannot postpone discovery for
   15 minutes
-- Prepared `1.2.24` with authenticated client error reporting, durable offline queueing, dedupe,
-  plugin/Obsidian/platform/request correlation, strict redaction, and structured server ingestion;
-  server support is deployed in `a23133e`
+- Released `1.2.24` with authenticated client error reporting, durable offline queueing, dedupe,
+  plugin/Obsidian/platform/request correlation, strict redaction, and structured server ingestion.
+  Server support is deployed in `a23133e`; release workflow `30536888018`, all five assets, archive
+  contents, and production updater bytes were verified.
 
 ## First Places To Look By Task Type
 

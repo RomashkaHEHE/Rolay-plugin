@@ -84,6 +84,9 @@ any manual refresh/check/install action.
 - 2026-07-29: Published plain-semver release `1.2.22` from commit `d76c84a`. GitHub Actions run
   `30453648991` passed. The five release assets and four-file archive match the tag; the production
   endpoint reports `1.2.22` and serves exact bytes for all three updater files.
+- 2026-07-30: Published plain-semver release `1.2.24` from commit `9f665e7`. GitHub Actions run
+  `30536888018` passed. The five release assets and four-file archive match the raw tag blobs; the
+  production endpoint reports `1.2.24` and serves exact bytes for all three updater files.
 - 2026-07-28: Canonical `1.2.20` release SHA-256 values are
   `0cdf9aa7b8f5fd91e50d86d70508145331a1a398d0284ca7a3351b76acc42483` (`main.js`),
   `0dbaea63b5567a68a979f8ddb3a93522b17631cebd8f9a98a1d895b334ca9301`
@@ -101,6 +104,12 @@ any manual refresh/check/install action.
   `debee0500643ecd447da87356e342676ecb14a53fbf949ed0db0f716a3c84fe2`
   (`manifest.json`), and
   `2e2bc5dc2ca433f2e7951d267f5fefbbf3ddb068cf563858d4ec32912215db22`
+  (`styles.css`).
+- 2026-07-30: Canonical `1.2.24` release SHA-256 values are
+  `2530deec2619677818ee4f77ba77228782f821e6284867aac612810cb5e3e7d8` (`main.js`),
+  `b29d9ec24a3b6aeb1fac8c340d42884a2d309e06b0f15dbb458ae7d23875e9d0`
+  (`manifest.json`), and
+  `efa097f3af211c61dfe6e7bbaa1e422d127b76d8007a34538e8cba5358a4236b`
   (`styles.css`).
 - 2026-07-28: The desktop vault `Main` provided the live two-version proof. Rolay `1.2.19`
   discovered `1.2.20`, downloaded and verified it, installed it automatically, performed a

@@ -32,8 +32,8 @@ belongs in `README.md` and `docs/*`; product ideas that are not being implemente
 
 - [Client error reporting](client-error-reporting.md)
   Authenticated durable error delivery, strict redaction, request correlation, and structured
-  server ingestion are implemented and verified; server support is deployed and plugin `1.2.24`
-  is the release candidate.
+  server ingestion are deployed in plugin `1.2.24` and server commit `a23133e`; one controlled
+  production report remains to verify operational log correlation.
 - [Self update](self-update.md)
   Desktop `1.2.19 -> 1.2.20` automatic discovery, verification, installation, and soft reload are
   proven by the real vault `Main`.
