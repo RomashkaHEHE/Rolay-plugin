@@ -288,6 +288,9 @@ These are important because future regressions will often land in these areas:
   in locked retry and causing 118 successful bootstrap HTTP requests in two minutes. Startup
   observations now suppress echoes without scheduling settle, and the post-connect tree follow-up
   no longer forces an unchanged second room-wide Markdown preload.
+- Released `1.2.25` from commit `0889458`; GitHub Actions run `30699925749`, all five release
+  assets, four archive members, and the three production updater files were byte-verified against
+  the plain-semver tag.
 
 ## First Places To Look By Task Type
 

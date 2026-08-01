@@ -2,7 +2,7 @@
 
 Status: WATCH
 Priority: High
-Last updated: 2026-07-31
+Last updated: 2026-08-01
 
 ## Goal
 
@@ -77,6 +77,9 @@ correctness.
   `if-markdown-tree-changed`; default startup, lifecycle, manual, and recovery requests still use
   unconditional Markdown bootstrap.
 - 2026-07-31: Added focused policy/startup-settle tests. All 18 tests and TypeScript check pass.
+- 2026-08-01: Published plain-semver release `1.2.25` from commit `0889458`. GitHub Actions run
+  `30699925749` passed; all five assets, all four archive files, and production updater runtime
+  bytes match the tag exactly.
 
 ## Open Questions / Risks
 
@@ -95,7 +98,7 @@ correctness.
 
 ## Next Steps
 
-1. Install the next plugin release in the real `Main` vault and restart Obsidian.
+1. Let the automatic updater install `1.2.25` in the real `Main` vault and restart Obsidian.
 2. Confirm startup still logs ignored inactive creates, but no startup-derived `locked-retry` or
    `remote-markdown-settle` pass follows; the post-connect snapshot should log skipped room-wide
    Markdown bootstrap when the tree/cache is unchanged.
