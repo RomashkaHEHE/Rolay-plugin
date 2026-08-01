@@ -16,6 +16,10 @@ import { isMarkdownPath } from "../utils/file-kind";
 
 type RemotePathChangeType = "rename_entry" | "move_entry";
 
+export interface RemotePathObservationOptions {
+  scheduleMarkdownSettle?: boolean;
+}
+
 interface DownloadedRoomContext {
   workspaceId: string;
   folderName: string;
@@ -47,7 +51,12 @@ interface FileBridgeConfig {
     type: RemotePathChangeType
   ) => Promise<void>;
   onDeleteEntry: (workspaceId: string, entry: FileEntry) => Promise<void>;
-  onRemotePathObserved?: (workspaceId: string, localPath: string, serverPath: string) => void;
+  onRemotePathObserved?: (
+    workspaceId: string,
+    localPath: string,
+    serverPath: string,
+    options?: RemotePathObservationOptions
+  ) => void;
   wasPathRecentlyObservedAsRemote?: (workspaceId: string, localPath: string) => boolean;
 }
 
@@ -76,7 +85,12 @@ export class FileBridge {
     type: RemotePathChangeType
   ) => Promise<void>;
   private readonly onDeleteEntry: (workspaceId: string, entry: FileEntry) => Promise<void>;
-  private readonly onRemotePathObserved?: (workspaceId: string, localPath: string, serverPath: string) => void;
+  private readonly onRemotePathObserved?: (
+    workspaceId: string,
+    localPath: string,
+    serverPath: string,
+    options?: RemotePathObservationOptions
+  ) => void;
   private readonly wasPathRecentlyObservedAsRemote?: (workspaceId: string, localPath: string) => boolean;
   private readonly suppressedPrefixes = new Map<string, number>();
   private readonly recentRemoteCreates = new Map<string, number>();
@@ -196,7 +210,12 @@ export class FileBridge {
 
     if (!this.isWorkspaceSyncActive(resolved.workspaceId)) {
       this.log(`Ignored local create for ${file.path} because room sync is not active.`);
-      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      this.onRemotePathObserved?.(
+        resolved.workspaceId,
+        file.path,
+        resolved.serverPath,
+        { scheduleMarkdownSettle: false }
+      );
       return;
     }
 

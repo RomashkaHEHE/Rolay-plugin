@@ -1,12 +1,12 @@
 # Current State
 
-Last updated: 2026-07-30
+Last updated: 2026-08-01
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.24`
-- Release baseline: `1.2.24` immediate startup update discovery and authenticated client error
-  reporting
+- Plugin version: `1.2.25`
+- Release baseline: `1.2.25` startup false-download-state suppression and conditional post-connect
+  Markdown preload
 
 ## Current Priorities
 
@@ -68,6 +68,9 @@ These should be treated as high-confidence truths unless code/docs are intention
   and symmetric credential redaction. Never add note bodies, credentials, arbitrary headers, or
   unrestricted metadata to reports, and never let reporter failure affect sync.
 - Startup sync is deferred until after Obsidian workspace layout is ready; downloaded rooms then resume with a small stagger so auth/snapshot/preload work does not block the plugin loading screen.
+- Obsidian may emit vault `create` events for every existing file before a downloaded room becomes
+  active. These events may receive a short remote-echo suppression hint, but must never schedule
+  remote Markdown settle, lock empty notes, or trigger delayed full-room bootstrap work.
 - Room Disconnect is a hard per-room pause: it stops room SSE/presence, cancels scheduled snapshot/background markdown work, aborts active binary transfers for that workspace, invalidates in-flight upload tokens, and ignores late snapshot/bootstrap/download results without affecting other connected rooms.
 - Disconnected/stopped rooms must not persist new markdown/binary create replay records from Obsidian vault `create` events. Existing remote files can otherwise be misclassified as local creates on startup/reconnect, causing runaway `(1)`, `(2)`, ... duplicates.
 - Binary pending-write reconciliation must not request a rerun for an upload worker that is already
@@ -85,7 +88,8 @@ These should be treated as high-confidence truths unless code/docs are intention
   Covered cursors are discarded, and cursor-backed event/successful-local-op snapshots skip
   room-wide Markdown bootstrap only when the active Markdown `entryId -> path` set and hydrated
   cache are healthy. Failed operations and forced startup/lifecycle/recovery paths remain
-  unconditional.
+  unconditional. The forced post-connect binary follow-up still refetches tree state but uses the
+  same conditional Markdown policy, because the initial connect already completed a full preload.
 - Room publication is private by default and public access is only through the separate server-root read-only site.
 - Quiet healthy-state presentation must not remove underlying presence, transfer state, or durable
   diagnostics. It is a rendering/attention policy, not a protocol simplification.
@@ -279,6 +283,11 @@ These are important because future regressions will often land in these areas:
   plugin/Obsidian/platform/request correlation, strict redaction, and structured server ingestion.
   Server support is deployed in `a23133e`; release workflow `30536888018`, all five assets, archive
   contents, and production updater bytes were verified.
+- Diagnosed transient red Markdown/folder flashes in the real `Main` vault: startup create events
+  incorrectly scheduled remote-settle protection for existing notes, leaving 12 valid empty notes
+  in locked retry and causing 118 successful bootstrap HTTP requests in two minutes. Startup
+  observations now suppress echoes without scheduling settle, and the post-connect tree follow-up
+  no longer forces an unchanged second room-wide Markdown preload.
 
 ## First Places To Look By Task Type
 

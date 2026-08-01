@@ -2,7 +2,7 @@
 
 Status: WATCH
 Priority: High
-Last updated: 2026-07-29
+Last updated: 2026-07-31
 
 ## Goal
 
@@ -63,6 +63,20 @@ correctness.
 - 2026-07-29: Published plain-semver release `1.2.22` from commit `d76c84a`. GitHub Actions run
   `30453648991` passed, all five release assets and the four-file archive match the tag, and the
   production updater reports `1.2.22` with byte-verified runtime files.
+- 2026-07-31: Audited transient red flashes in production room `main` (`ws_09521c9e-8f75-4181-8c36-a5a11d8a6fd6`). Local state ended clean at cursor `255` with no pending Markdown, binary, transfer,
+  or client-error records; every server tree/ops/bootstrap request returned `200`.
+- 2026-07-31: The trace showed 118 `/markdown/bootstrap` requests in two minutes. Obsidian startup
+  emitted inactive `create` events for the existing vault, and `onRemotePathObserved` mistakenly
+  scheduled remote-settle timers for those local observations. Twelve legitimate empty notes
+  (`AAA=` state and zero local bytes) then entered repeated `locked-retry`, creating the false red
+  aggregate and redundant full-room reruns.
+- 2026-07-31: Inactive/startup path observations now explicitly disable Markdown settle and the
+  main callback additionally requires active room sync before scheduling it. Real remote creates
+  still retain empty-document settle protection.
+- 2026-07-31: The mandatory post-connect binary follow-up remains a forced tree fetch, but now uses
+  `if-markdown-tree-changed`; default startup, lifecycle, manual, and recovery requests still use
+  unconditional Markdown bootstrap.
+- 2026-07-31: Added focused policy/startup-settle tests. All 18 tests and TypeScript check pass.
 
 ## Open Questions / Risks
 
@@ -70,20 +84,27 @@ correctness.
   changes, and Markdown create/delete/rename/path changes.
 - Real Obsidian verification is still required because scheduler timing, vault events, SSE timing,
   and HTTP bootstrap calls cannot be reproduced fully by the pure tests.
+- Two plain server `invalid-crdt-token` lines appeared beside successful plugin CRDT connections in
+  the incident window, but the broader 24-hour trace identified the source as the public web viewer
+  reusing an expired fixed read-only token on Hocuspocus reconnect. The plugin already refreshes
+  authenticated tokens and logged no auth failure. The separate server fix is tracked in
+  `../server/AGENTS/tasks/public-crdt-reconnect.md`; it is not part of explorer transfer state.
 - A healthy binary-only snapshot may still fetch `/tree`; this change removes duplicate covered
   snapshots and expensive unchanged Markdown bootstrap work, not legitimate snapshots for distinct
   server events.
 
 ## Next Steps
 
-1. Let the automatic updater install `1.2.22` in a test vault, then perform one binary create plus
-   rapid renames.
-2. Confirm each server cursor is fetched at most once and binary-only snapshots log skipped
-   room-wide Markdown bootstrap rather than `Preloading 113 markdown document(s)`.
-3. During a deliberately slowed bootstrap, create, rename, and delete a Markdown note and verify the
-   target mismatch schedules exactly one safe rerun.
-4. Keep this task at `WATCH` until the real runtime trace confirms both reduced traffic and complete
-   Markdown convergence.
+1. Install the next plugin release in the real `Main` vault and restart Obsidian.
+2. Confirm startup still logs ignored inactive creates, but no startup-derived `locked-retry` or
+   `remote-markdown-settle` pass follows; the post-connect snapshot should log skipped room-wide
+   Markdown bootstrap when the tree/cache is unchanged.
+3. Create a real remote empty Markdown note and verify it remains protected until its CRDT seed
+   settles, proving the safety path was not weakened.
+4. Confirm each server cursor is fetched at most once and perform one binary create plus rapid
+   renames to keep the original coalescing regression covered.
+5. Keep this task at `WATCH` until the installed runtime trace confirms reduced traffic, no false
+   red flash, and complete Markdown convergence.
 
 ## Exit Criteria
 

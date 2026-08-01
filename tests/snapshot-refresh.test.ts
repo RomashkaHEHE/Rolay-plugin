@@ -6,7 +6,8 @@ import {
   doesActiveMarkdownTreeMatch,
   hasActiveMarkdownTreeChanged,
   isSnapshotRefreshCovered,
-  mergeSnapshotRefreshRequests
+  mergeSnapshotRefreshRequests,
+  shouldScheduleRemoteMarkdownSettle
 } from "../src/sync/snapshot-refresh";
 import type { EntryKind, FileEntry } from "../src/types/protocol";
 
@@ -27,7 +28,7 @@ test("coalesces duplicate cursors and drops a request already covered by a snaps
   assert.equal(isSnapshotRefreshCovered(merged, 12), true);
 });
 
-test("keeps a newer cursor pending and lets a forced refresh dominate", () => {
+test("keeps a newer cursor pending and separates forced tree refresh from Markdown policy", () => {
   const cursorRequest = createSnapshotRefreshRequest("event-stream", {
     targetCursor: 12,
     markdownBootstrapPolicy: "if-markdown-tree-changed"
@@ -44,11 +45,36 @@ test("keeps a newer cursor pending and lets a forced refresh dominate", () => {
   const forced = createSnapshotRefreshRequest("failed-operation", {
     markdownBootstrapPolicy: "if-markdown-tree-changed"
   });
-  assert.equal(forced.markdownBootstrapPolicy, "always");
+  assert.equal(forced.force, true);
+  assert.equal(forced.markdownBootstrapPolicy, "if-markdown-tree-changed");
   const withForcedRefresh = mergeSnapshotRefreshRequests(withNewerCursor, forced);
   assert.equal(withForcedRefresh.force, true);
-  assert.equal(withForcedRefresh.markdownBootstrapPolicy, "always");
+  assert.equal(withForcedRefresh.markdownBootstrapPolicy, "if-markdown-tree-changed");
   assert.equal(isSnapshotRefreshCovered(withForcedRefresh, 99), false);
+
+  const forcedRecovery = createSnapshotRefreshRequest("failed-operation");
+  assert.equal(forcedRecovery.markdownBootstrapPolicy, "always");
+  const withForcedRecovery = mergeSnapshotRefreshRequests(withNewerCursor, forcedRecovery);
+  assert.equal(withForcedRecovery.markdownBootstrapPolicy, "always");
+});
+
+test("does not schedule Markdown settle for inactive startup observations", () => {
+  assert.equal(
+    shouldScheduleRemoteMarkdownSettle(false, "main/Notes/one.md", "Notes/one.md"),
+    false
+  );
+  assert.equal(
+    shouldScheduleRemoteMarkdownSettle(true, "main/Notes/one.md", "Notes/one.md", false),
+    false
+  );
+  assert.equal(
+    shouldScheduleRemoteMarkdownSettle(true, "main/Notes/one.md", "Notes/one.md"),
+    true
+  );
+  assert.equal(
+    shouldScheduleRemoteMarkdownSettle(true, "main/Images/one.png", "Images/one.png"),
+    false
+  );
 });
 
 test("ignores binary-only tree changes for Markdown bootstrap decisions", () => {

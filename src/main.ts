@@ -13,7 +13,10 @@ import {
 import * as Y from "yjs";
 import { RolayApiClient, RolayApiError } from "./api/client";
 import { ClientErrorReporter } from "./diagnostics/client-error-reporter";
-import { FileBridge } from "./obsidian/file-bridge";
+import {
+  FileBridge,
+  type RemotePathObservationOptions
+} from "./obsidian/file-bridge";
 import {
   buildPresenceColor,
   createMarkdownTextState,
@@ -53,6 +56,7 @@ import {
   hasActiveMarkdownTreeChanged,
   isSnapshotRefreshCovered,
   mergeSnapshotRefreshRequests,
+  shouldScheduleRemoteMarkdownSettle,
   type MarkdownBootstrapPolicy,
   type SnapshotRefreshOptions,
   type SnapshotRefreshRequest
@@ -480,8 +484,8 @@ export default class RolayPlugin extends Plugin {
       onUpdateBinary: (workspaceId, entry, localContent) => this.queueBinaryWrite(workspaceId, entry.path, localContent, entry),
       onRenameOrMove: (workspaceId, entry, newPath, type) => this.queueRenameOrMove(workspaceId, entry, newPath, type),
       onDeleteEntry: (workspaceId, entry) => this.queueDeleteEntry(workspaceId, entry),
-      onRemotePathObserved: (workspaceId, localPath, serverPath) => {
-        this.noteRemoteObservedPath(workspaceId, localPath, serverPath);
+      onRemotePathObserved: (workspaceId, localPath, serverPath, options) => {
+        this.noteRemoteObservedPath(workspaceId, localPath, serverPath, options);
       },
       wasPathRecentlyObservedAsRemote: (workspaceId, localPath) =>
         this.wasPathRecentlyObservedAsRemote(workspaceId, localPath)
@@ -1268,7 +1272,9 @@ export default class RolayPlugin extends Plugin {
     }
 
     await this.startRoomEventStream(room.workspace.id);
-    this.scheduleSnapshotRefresh(room.workspace.id, "post-connect-binary-followup");
+    this.scheduleSnapshotRefresh(room.workspace.id, "post-connect-binary-followup", {
+      markdownBootstrapPolicy: "if-markdown-tree-changed"
+    });
     this.scheduleBackgroundMarkdownRefresh(
       room.workspace.id,
       "post-connect-background-refresh",
@@ -5345,7 +5351,12 @@ export default class RolayPlugin extends Plugin {
     return `${workspaceId}::${normalizePath(localPath)}`;
   }
 
-  private noteRemoteObservedPath(workspaceId: string, localPath: string, serverPath: string): void {
+  private noteRemoteObservedPath(
+    workspaceId: string,
+    localPath: string,
+    serverPath: string,
+    options: RemotePathObservationOptions = {}
+  ): void {
     const key = this.buildRemoteObservedPathKey(workspaceId, localPath);
     const existingHandle = this.recentRemoteObservedPaths.get(key);
     if (existingHandle !== undefined) {
@@ -5356,7 +5367,12 @@ export default class RolayPlugin extends Plugin {
       this.recentRemoteObservedPaths.delete(key);
     }, RolayPlugin.RECENT_REMOTE_PATH_TTL_MS);
     this.recentRemoteObservedPaths.set(key, handle);
-    if (/\.(md|markdown)$/i.test(localPath) || /\.md$/i.test(serverPath)) {
+    if (shouldScheduleRemoteMarkdownSettle(
+      this.isRoomSyncActive(workspaceId),
+      localPath,
+      serverPath,
+      options.scheduleMarkdownSettle !== false
+    )) {
       this.markPendingRemoteMarkdownSettle(workspaceId, localPath);
     }
     this.clearPendingLocalCreate(workspaceId, serverPath);

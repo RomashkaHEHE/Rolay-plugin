@@ -27,11 +27,21 @@ export function createSnapshotRefreshRequest(
     reason,
     targetCursor,
     force: targetCursor === null,
-    markdownBootstrapPolicy:
-      targetCursor === null
-        ? "always"
-        : options.markdownBootstrapPolicy ?? "always"
+    markdownBootstrapPolicy: options.markdownBootstrapPolicy ?? "always"
   };
+}
+
+export function shouldScheduleRemoteMarkdownSettle(
+  syncActive: boolean,
+  localPath: string,
+  serverPath: string,
+  scheduleMarkdownSettle = true
+): boolean {
+  return Boolean(
+    syncActive &&
+    scheduleMarkdownSettle &&
+    (/\.(md|markdown)$/i.test(localPath) || /\.md$/i.test(serverPath))
+  );
 }
 
 export function mergeSnapshotRefreshRequests(

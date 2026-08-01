@@ -11059,7 +11059,12 @@ var _FileBridge = class _FileBridge {
     }
     if (!this.isWorkspaceSyncActive(resolved.workspaceId)) {
       this.log(`Ignored local create for ${file.path} because room sync is not active.`);
-      this.onRemotePathObserved?.(resolved.workspaceId, file.path, resolved.serverPath);
+      this.onRemotePathObserved?.(
+        resolved.workspaceId,
+        file.path,
+        resolved.serverPath,
+        { scheduleMarkdownSettle: false }
+      );
       return;
     }
     if (this.consumeRecentRemoteCreate(file.path)) {
@@ -18455,8 +18460,13 @@ function createSnapshotRefreshRequest(reason, options = {}) {
     reason,
     targetCursor,
     force: targetCursor === null,
-    markdownBootstrapPolicy: targetCursor === null ? "always" : options.markdownBootstrapPolicy ?? "always"
+    markdownBootstrapPolicy: options.markdownBootstrapPolicy ?? "always"
   };
+}
+function shouldScheduleRemoteMarkdownSettle(syncActive, localPath, serverPath, scheduleMarkdownSettle = true) {
+  return Boolean(
+    syncActive && scheduleMarkdownSettle && (/\.(md|markdown)$/i.test(localPath) || /\.md$/i.test(serverPath))
+  );
 }
 function mergeSnapshotRefreshRequests(current, incoming) {
   if (!current) {
@@ -18846,8 +18856,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       onUpdateBinary: (workspaceId, entry, localContent) => this.queueBinaryWrite(workspaceId, entry.path, localContent, entry),
       onRenameOrMove: (workspaceId, entry, newPath, type) => this.queueRenameOrMove(workspaceId, entry, newPath, type),
       onDeleteEntry: (workspaceId, entry) => this.queueDeleteEntry(workspaceId, entry),
-      onRemotePathObserved: (workspaceId, localPath, serverPath) => {
-        this.noteRemoteObservedPath(workspaceId, localPath, serverPath);
+      onRemotePathObserved: (workspaceId, localPath, serverPath, options) => {
+        this.noteRemoteObservedPath(workspaceId, localPath, serverPath, options);
       },
       wasPathRecentlyObservedAsRemote: (workspaceId, localPath) => this.wasPathRecentlyObservedAsRemote(workspaceId, localPath)
     });
@@ -19514,7 +19524,9 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       return;
     }
     await this.startRoomEventStream(room.workspace.id);
-    this.scheduleSnapshotRefresh(room.workspace.id, "post-connect-binary-followup");
+    this.scheduleSnapshotRefresh(room.workspace.id, "post-connect-binary-followup", {
+      markdownBootstrapPolicy: "if-markdown-tree-changed"
+    });
     this.scheduleBackgroundMarkdownRefresh(
       room.workspace.id,
       "post-connect-background-refresh",
@@ -22719,7 +22731,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
   buildRemoteObservedPathKey(workspaceId, localPath) {
     return `${workspaceId}::${(0, import_obsidian10.normalizePath)(localPath)}`;
   }
-  noteRemoteObservedPath(workspaceId, localPath, serverPath) {
+  noteRemoteObservedPath(workspaceId, localPath, serverPath, options = {}) {
     const key = this.buildRemoteObservedPathKey(workspaceId, localPath);
     const existingHandle = this.recentRemoteObservedPaths.get(key);
     if (existingHandle !== void 0) {
@@ -22729,7 +22741,12 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       this.recentRemoteObservedPaths.delete(key);
     }, _RolayPlugin.RECENT_REMOTE_PATH_TTL_MS);
     this.recentRemoteObservedPaths.set(key, handle);
-    if (/\.(md|markdown)$/i.test(localPath) || /\.md$/i.test(serverPath)) {
+    if (shouldScheduleRemoteMarkdownSettle(
+      this.isRoomSyncActive(workspaceId),
+      localPath,
+      serverPath,
+      options.scheduleMarkdownSettle !== false
+    )) {
       this.markPendingRemoteMarkdownSettle(workspaceId, localPath);
     }
     this.clearPendingLocalCreate(workspaceId, serverPath);
