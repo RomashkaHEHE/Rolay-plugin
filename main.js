@@ -21340,6 +21340,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
           element2.classList.add("rolay-room-folder-connecting");
         }
       }
+      this.updateExplorerRoomStatusIndicator(element2, roomFolderStatus);
       this.updateExplorerTransferBadge(
         element2,
         transferBadge
@@ -21647,6 +21648,40 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       folderElement.closest(".nav-files-container") || folderElement.closest('.workspace-leaf-content[data-type="file-explorer"]')
     );
   }
+  updateExplorerRoomStatusIndicator(element2, status) {
+    const titleHost = this.findExplorerTitleHost(element2);
+    if (!titleHost) {
+      return;
+    }
+    let indicator = titleHost.querySelector(".rolay-room-status-indicator");
+    if (!status) {
+      indicator?.remove();
+      return;
+    }
+    if (!indicator) {
+      indicator = document.createElement("span");
+      indicator.className = "rolay-room-status-indicator";
+      indicator.setAttribute("role", "img");
+      const firstBadge = titleHost.querySelector(
+        ".rolay-transfer-progress-badge, .rolay-note-presence-badge, .rolay-note-anonymous-presence-badge"
+      );
+      if (firstBadge) {
+        titleHost.insertBefore(indicator, firstBadge);
+      } else {
+        titleHost.appendChild(indicator);
+      }
+    }
+    const label = getExplorerRoomStatusLabel(status);
+    this.setExplorerIndicatorTooltip(indicator, label);
+  }
+  setExplorerIndicatorTooltip(indicator, label) {
+    indicator.setAttribute("aria-label", label);
+    indicator.removeAttribute("title");
+    (0, import_obsidian10.setTooltip)(indicator, label, {
+      delay: _RolayPlugin.EXPLORER_TOOLTIP_DELAY_MS,
+      placement: "top"
+    });
+  }
   updateExplorerNotePresenceBadge(element2, badgeState) {
     const titleHost = this.findExplorerTitleHost(element2);
     if (!titleHost) {
@@ -21670,7 +21705,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     badge.style.setProperty("--rolay-note-presence-badge-color", badgeState.color);
     badge.textContent = badgeState.count <= 1 ? "" : String(badgeState.count);
     badge.classList.toggle("rolay-note-presence-badge-multi", badgeState.count > 1);
-    badge.setAttribute("aria-label", badgeState.count <= 1 ? "1 viewer" : `${badgeState.count} viewers`);
+    const label = `Viewers: ${badgeState.count}`;
+    this.setExplorerIndicatorTooltip(badge, label);
   }
   updateExplorerAnonymousPresenceBadge(element2, badgeState) {
     const titleHost = this.findExplorerTitleHost(element2);
@@ -21690,13 +21726,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     const icon = document.createElement("span");
     icon.className = "rolay-note-anonymous-presence-badge-icon";
     (0, import_obsidian10.setIcon)(icon, "eye");
-    const label = document.createElement("span");
-    label.textContent = String(badgeState.count);
-    badge.replaceChildren(icon, label);
-    badge.setAttribute(
-      "aria-label",
-      badgeState.count === 1 ? "1 anonymous public viewer" : `${badgeState.count} anonymous public viewers`
-    );
+    const countLabel = document.createElement("span");
+    countLabel.textContent = String(badgeState.count);
+    badge.replaceChildren(icon, countLabel);
+    const label = `Public readers: ${badgeState.count}`;
+    this.setExplorerIndicatorTooltip(badge, label);
   }
   getExplorerTransferBadges(visibleExplorerPaths) {
     const aggregate = /* @__PURE__ */ new Map();
@@ -21990,10 +22024,8 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     badge.classList.toggle("rolay-transfer-progress-badge-upload", badgeState.kind === "upload");
     badge.classList.toggle("rolay-transfer-progress-badge-download", badgeState.kind === "download");
     badge.classList.toggle("rolay-transfer-progress-badge-queued", badgeState.activity === "queued");
-    badge.setAttribute(
-      "aria-label",
-      `${badgeState.activity === "queued" ? "Queued" : "Active"} ${badgeState.kind === "upload" ? "upload" : "download"} progress ${badgeState.label}`
-    );
+    const label = badgeState.activity === "queued" ? `${badgeState.kind === "upload" ? "Upload" : "Download"} queued: ${badgeState.label}` : `${badgeState.kind === "upload" ? "Uploading" : "Downloading"}: ${badgeState.label}`;
+    this.setExplorerIndicatorTooltip(badge, label);
   }
   findExplorerTitleHost(element2) {
     return element2.querySelector(".nav-file-title-content") ?? element2.querySelector(".tree-item-inner");
@@ -25815,6 +25847,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
 _RolayPlugin.MAX_PERSISTED_CRDT_DOCS = 1e4;
 _RolayPlugin.MAX_PERSISTED_BINARY_ENTRIES = 1e4;
 _RolayPlugin.ENABLE_BLOB_TRANSFER_TRACE = true;
+_RolayPlugin.EXPLORER_TOOLTIP_DELAY_MS = 140;
 _RolayPlugin.BINARY_TRANSFER_PARTS_FOLDER = "transfers";
 _RolayPlugin.BINARY_UPLOAD_CHUNK_SIZE = (import_obsidian10.Platform.isMobileApp ? 1 : 4) * 1024 * 1024;
 _RolayPlugin.MAX_BINARY_UPLOAD_OFFSET_RECOVERY_ATTEMPTS = 8;
@@ -25837,6 +25870,20 @@ _RolayPlugin.STARTUP_BOOTSTRAP_DELAY_MS = 1500;
 _RolayPlugin.STARTUP_ROOM_CONNECT_STAGGER_MS = 900;
 _RolayPlugin.PLUGIN_UPDATE_QUIET_WINDOW_MS = 5e3;
 var RolayPlugin = _RolayPlugin;
+function getExplorerRoomStatusLabel(status) {
+  switch (status) {
+    case "open":
+      return "Connected";
+    case "stopped":
+      return "Disconnected";
+    case "reconnecting":
+      return "Reconnecting";
+    case "error":
+      return "Connection error";
+    default:
+      return "Connecting";
+  }
+}
 function normalizeSettingsEventEnvelope(event) {
   const rawData = isRecord4(event.data) ? event.data : {};
   const eventId = typeof rawData["eventId"] === "number" ? rawData["eventId"] : event.id;

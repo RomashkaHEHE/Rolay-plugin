@@ -249,6 +249,7 @@ Tag note:
 - Binary crash recovery is byte-resumable: uploads continue from `upload-ticket.uploadedBytes`, downloads continue from persisted `.part` files with HTTP `Range`, and the final vault file is materialized only after complete size/hash verification.
 - If a local binary file conflicts with an already existing remote path or with a newer incoming blob revision, the plugin renames the local file to the next free Explorer-style filename such as `file(1).pdf` so both copies survive.
 - Room note presence now drives viewer chips above notes and minimal-visible-parent explorer badges: a visible note gets its own badge, while hidden notes roll up only to the deepest visible collapsed folder inside the downloaded room root.
+- Explorer room-health, presence, anonymous-viewer, and transfer indicators are compact and low-contrast at rest. Hovering the relevant row restores their emphasis, and a short intentional hover exposes the exact state through an Obsidian tooltip without changing presence or transfer semantics.
 - Remote markdown patches preserve the local viewport while applying incoming CRDT text, so active collaboration should not yank the local reader/editor to the bottom of the document.
 - Remote cursor stabilization now mirrors CodeMirror remapping locally and ignores short-lived stale backward awareness offsets, reducing the "cursor chases its true position" jitter when someone types before a stationary remote cursor.
 - Admin account creation currently supports `writer` and `reader` global roles.

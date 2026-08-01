@@ -8,6 +8,7 @@ import {
   getLanguage,
   normalizePath,
   setIcon,
+  setTooltip,
   type TAbstractFile
 } from "obsidian";
 import * as Y from "yjs";
@@ -254,6 +255,7 @@ export default class RolayPlugin extends Plugin {
   private static readonly MAX_PERSISTED_CRDT_DOCS = 10_000;
   private static readonly MAX_PERSISTED_BINARY_ENTRIES = 10_000;
   private static readonly ENABLE_BLOB_TRANSFER_TRACE = true;
+  private static readonly EXPLORER_TOOLTIP_DELAY_MS = 140;
   private static readonly BINARY_TRANSFER_PARTS_FOLDER = "transfers";
   private static readonly BINARY_UPLOAD_CHUNK_SIZE =
     (Platform.isMobileApp ? 1 : 4) * 1024 * 1024;
@@ -3518,6 +3520,7 @@ export default class RolayPlugin extends Plugin {
         }
       }
 
+      this.updateExplorerRoomStatusIndicator(element, roomFolderStatus);
       this.updateExplorerTransferBadge(
         element,
         transferBadge
@@ -3948,6 +3951,48 @@ export default class RolayPlugin extends Plugin {
     );
   }
 
+  private updateExplorerRoomStatusIndicator(
+    element: HTMLElement,
+    status: WorkspaceEventStreamStatus | null
+  ): void {
+    const titleHost = this.findExplorerTitleHost(element);
+    if (!titleHost) {
+      return;
+    }
+
+    let indicator = titleHost.querySelector<HTMLElement>(".rolay-room-status-indicator");
+    if (!status) {
+      indicator?.remove();
+      return;
+    }
+
+    if (!indicator) {
+      indicator = document.createElement("span");
+      indicator.className = "rolay-room-status-indicator";
+      indicator.setAttribute("role", "img");
+      const firstBadge = titleHost.querySelector<HTMLElement>(
+        ".rolay-transfer-progress-badge, .rolay-note-presence-badge, .rolay-note-anonymous-presence-badge"
+      );
+      if (firstBadge) {
+        titleHost.insertBefore(indicator, firstBadge);
+      } else {
+        titleHost.appendChild(indicator);
+      }
+    }
+
+    const label = getExplorerRoomStatusLabel(status);
+    this.setExplorerIndicatorTooltip(indicator, label);
+  }
+
+  private setExplorerIndicatorTooltip(indicator: HTMLElement, label: string): void {
+    indicator.setAttribute("aria-label", label);
+    indicator.removeAttribute("title");
+    setTooltip(indicator, label, {
+      delay: RolayPlugin.EXPLORER_TOOLTIP_DELAY_MS,
+      placement: "top"
+    });
+  }
+
   private updateExplorerNotePresenceBadge(
     element: HTMLElement,
     badgeState: ExplorerNotePresenceBadgeState | null
@@ -3977,7 +4022,8 @@ export default class RolayPlugin extends Plugin {
     badge.style.setProperty("--rolay-note-presence-badge-color", badgeState.color);
     badge.textContent = badgeState.count <= 1 ? "" : String(badgeState.count);
     badge.classList.toggle("rolay-note-presence-badge-multi", badgeState.count > 1);
-    badge.setAttribute("aria-label", badgeState.count <= 1 ? "1 viewer" : `${badgeState.count} viewers`);
+    const label = `Viewers: ${badgeState.count}`;
+    this.setExplorerIndicatorTooltip(badge, label);
   }
 
   private updateExplorerAnonymousPresenceBadge(
@@ -4005,16 +4051,12 @@ export default class RolayPlugin extends Plugin {
     icon.className = "rolay-note-anonymous-presence-badge-icon";
     setIcon(icon, "eye");
 
-    const label = document.createElement("span");
-    label.textContent = String(badgeState.count);
+    const countLabel = document.createElement("span");
+    countLabel.textContent = String(badgeState.count);
 
-    badge.replaceChildren(icon, label);
-    badge.setAttribute(
-      "aria-label",
-      badgeState.count === 1
-        ? "1 anonymous public viewer"
-        : `${badgeState.count} anonymous public viewers`
-    );
+    badge.replaceChildren(icon, countLabel);
+    const label = `Public readers: ${badgeState.count}`;
+    this.setExplorerIndicatorTooltip(badge, label);
   }
 
   private getExplorerTransferBadges(
@@ -4404,11 +4446,10 @@ export default class RolayPlugin extends Plugin {
     badge.classList.toggle("rolay-transfer-progress-badge-upload", badgeState.kind === "upload");
     badge.classList.toggle("rolay-transfer-progress-badge-download", badgeState.kind === "download");
     badge.classList.toggle("rolay-transfer-progress-badge-queued", badgeState.activity === "queued");
-    badge.setAttribute(
-      "aria-label",
-      `${badgeState.activity === "queued" ? "Queued" : "Active"} ` +
-      `${badgeState.kind === "upload" ? "upload" : "download"} progress ${badgeState.label}`
-    );
+    const label = badgeState.activity === "queued"
+      ? `${badgeState.kind === "upload" ? "Upload" : "Download"} queued: ${badgeState.label}`
+      : `${badgeState.kind === "upload" ? "Uploading" : "Downloading"}: ${badgeState.label}`;
+    this.setExplorerIndicatorTooltip(badge, label);
   }
 
   private findExplorerTitleHost(element: HTMLElement): HTMLElement | null {
@@ -9340,6 +9381,21 @@ export default class RolayPlugin extends Plugin {
       );
       return fallback;
     }
+  }
+}
+
+function getExplorerRoomStatusLabel(status: WorkspaceEventStreamStatus): string {
+  switch (status) {
+    case "open":
+      return "Connected";
+    case "stopped":
+      return "Disconnected";
+    case "reconnecting":
+      return "Reconnecting";
+    case "error":
+      return "Connection error";
+    default:
+      return "Connecting";
   }
 }
 

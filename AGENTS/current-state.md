@@ -1,12 +1,12 @@
 # Current State
 
-Last updated: 2026-08-01
+Last updated: 2026-08-02
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.25`
-- Release baseline: `1.2.25` startup false-download-state suppression and conditional post-connect
-  Markdown preload
+- Plugin version: `1.2.26`
+- Release baseline: `1.2.26` quiet progressive-disclosure explorer indicators and concise hover
+  status tooltips
 
 ## Current Priorities
 
@@ -93,6 +93,9 @@ These should be treated as high-confidence truths unless code/docs are intention
 - Room publication is private by default and public access is only through the separate server-root read-only site.
 - Quiet healthy-state presentation must not remove underlying presence, transfer state, or durable
   diagnostics. It is a rendering/attention policy, not a protocol simplification.
+- Explorer indicators use compact, low-contrast resting styles with extra separation from filenames.
+  Hovering the row raises emphasis, and Obsidian tooltips with a `140 ms` delay preserve exact room,
+  presence, anonymous, and transfer meaning even when the resting mark is intentionally tiny.
 
 ## Current Reliability And Experience Initiative
 
@@ -291,6 +294,15 @@ These are important because future regressions will often land in these areas:
 - Released `1.2.25` from commit `0889458`; GitHub Actions run `30699925749`, all five release
   assets, four archive members, and the three production updater files were byte-verified against
   the plain-semver tag.
+- Prepared and visually approved local build `1.2.26` with quieter explorer indicators and installed
+  byte-matching `main.js`, `manifest.json`, and `styles.css` into vault `Main`. During testing,
+  production remained `1.2.25`, so both the built-in updater and installed BRAT newer-only semver
+  checks left the newer local build intact. Obsidian was closed through its normal window lifecycle
+  and reopened; the runtime log
+  confirms `Plugin version 1.2.26 is current`, followed by successful room SSE/presence/CRDT resume.
+- Refined that test build after visual feedback: resting indicators are slightly more visible, the
+  room-status dot is `0.46rem`, and all explorer indicators use informative Obsidian tooltips with
+  a `140 ms` intentional-hover delay.
 
 ## First Places To Look By Task Type
 

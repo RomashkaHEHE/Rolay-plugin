@@ -1,8 +1,8 @@
 # Ambient Sync Indicators
 
-Status: CANDIDATE
+Status: PARTIALLY IMPLEMENTED
 Priority: High
-Last reviewed: 2026-07-28
+Last reviewed: 2026-08-02
 
 ## Idea
 
@@ -26,6 +26,19 @@ active, or health degrades.
 - A small circle or similarly subtle shape showing that synchronization is online is acceptable.
 - Indicators must stay just as informative when information is actually useful.
 - Users should not need to open a separate page to understand current state.
+- Explorer feedback on 2026-08-02 showed that the colored room square and viewer circles still
+  pulled attention away from filenames. The requested direction is smaller, more separated,
+  lower-contrast resting marks that remain easy to find intentionally.
+
+## Implemented Slice
+
+- Version `1.2.26` replaces the bright room pseudo-square with a small trailing status
+  dot and reduces the resting size, saturation, and weight of presence, anonymous-viewer, and
+  transfer badges.
+- Hovering a file/folder row restores indicator opacity; every compact mark has an informative
+  Obsidian tooltip with a `140 ms` delay so quiet presentation does not remove meaning.
+- Transfer aggregation, mandatory percentages, minimal-visible-parent placement, and presence state
+  are unchanged. See [explorer-indicator-quieting.md](../../tasks/explorer-indicator-quieting.md).
 
 ## Proposed State Ladder
 
