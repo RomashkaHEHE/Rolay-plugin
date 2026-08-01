@@ -12,9 +12,6 @@ belongs in `README.md` and `docs/*`; product ideas that are not being implemente
 
 ## Watch
 
-- [Explorer indicator quieting](explorer-indicator-quieting.md)
-  Compact low-attention room/presence/anonymous/transfer styling is approved for `1.2.26`; publish
-  and byte-verify the release rollout.
 - [Binary transfer queue progress](binary-transfer-queue-progress.md)
   Full-queue byte aggregation, completed cohort retention, and muted queued states are implemented
   and automated; verify timing and visual balance with a real multi-file transfer.
@@ -33,6 +30,9 @@ belongs in `README.md` and `docs/*`; product ideas that are not being implemente
 
 ## Recently Completed
 
+- [Explorer indicator quieting](explorer-indicator-quieting.md)
+  Compact low-attention room/presence/anonymous/transfer styling shipped in `1.2.26`; GitHub and
+  production updater files were byte-verified against the tag.
 - [Client error reporting](client-error-reporting.md)
   Authenticated durable error delivery, strict redaction, request correlation, and structured
   server ingestion are deployed in plugin `1.2.24` and server commit `a23133e`; one controlled

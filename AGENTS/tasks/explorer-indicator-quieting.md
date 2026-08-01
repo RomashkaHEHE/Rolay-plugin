@@ -1,6 +1,6 @@
 # Explorer Indicator Quieting
 
-Status: RELEASE READY
+Status: COMPLETE
 Priority: High
 Last updated: 2026-08-02
 
@@ -62,11 +62,17 @@ or routine transfer state compete with filenames.
   (settings first, main window second) and reopened without force-killing the process.
 - The restarted runtime logs `Plugin version 1.2.26 is current`; room tree, CRDT, SSE, and presence
   resumed successfully. The final visual balance and concise popup copy were user-approved.
+- Published plain-semver tag `1.2.26` from commit `3992628`. GitHub Actions run `30723221496`
+  passed; all five standalone release assets and the four files inside `rolay-1.2.26.zip` match the
+  raw Git objects from the tag.
+- Production `/v1/plugin-updates/latest` switched to `1.2.26` after its normal 15-minute cache TTL.
+  Its `main.js`, `manifest.json`, and `styles.css` bytes, sizes, canonical SHA-256 values, version
+  headers, and immutable download headers were verified against GitHub and the tag.
 
 ## Next Steps
 
-1. Publish the plain-semver tag and GitHub release for `1.2.26`.
-2. Verify all release assets, archive members, and production updater bytes against the tag.
+No implementation or rollout work remains. Monitor normal automatic updates and future explorer
+feedback without reopening this task for unrelated ambient-sync work.
 
 ## Exit Criteria
 

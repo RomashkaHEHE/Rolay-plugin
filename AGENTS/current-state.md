@@ -303,6 +303,9 @@ These are important because future regressions will often land in these areas:
 - Refined that test build after visual feedback: resting indicators are slightly more visible, the
   room-status dot is `0.46rem`, and all explorer indicators use informative Obsidian tooltips with
   a `140 ms` intentional-hover delay.
+- Released `1.2.26` from commit `3992628`; GitHub Actions run `30723221496` passed. All five release
+  assets, all four archive members, and the three production updater files match the plain-semver
+  tag exactly. The production cache switched to `1.2.26` at 2026-08-02 04:37:48 +05:00.
 
 ## First Places To Look By Task Type
 
