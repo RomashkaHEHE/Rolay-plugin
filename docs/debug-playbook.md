@@ -22,6 +22,15 @@ each SSE open records its actual `node-http(s)` or `fetch` transport without log
 
 ## Common Symptoms
 
+### Successful Markdown downloads repeat without resolving protected notes
+
+Compare the actual file text with decoded cached `content` and the read-only remote bootstrap.
+Obsidian attachment moves may rewrite wiki links, including targets outside the room. A successful
+download cannot resolve this local divergence. The plugin keeps the local file protected and
+excludes known divergent paths from fast locked-download retries; normal background reconciliation
+still checks remote state. Look for `Preserved local markdown` logs. Do not reset caches or force
+overwrite files to silence the indicator; first establish which link targets/content should survive.
+
 ### Room folder looks forgotten after restart
 
 Check:

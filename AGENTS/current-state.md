@@ -1,14 +1,17 @@
 # Current State
 
-Last updated: 2026-08-02
+Last updated: 2026-11-13
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.26`
-- Release baseline: `1.2.26` quiet progressive-disclosure explorer indicators and concise hover
-  status tooltips
+- Plugin version: `1.2.27`
+- Release baseline: `1.2.27` shared token refresh and local-divergence download retry suppression
 
 ## Current Priorities
+
+Latest audit: [desktop/server sync audit](tasks/2026-11-13-sync-audit.md). Main content matches
+production; Lessons has five preserved attachment-link differences. Refresh concurrency and fast
+download-loop fixes are included in release candidate 1.2.27; audited vaults were running 1.2.26.
 
 Priority order for most work unless the user explicitly overrides it:
 

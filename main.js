@@ -8437,6 +8437,7 @@ var RolayApiError = class extends Error {
 };
 var RolayApiClient = class {
   constructor(config) {
+    this.refreshInFlight = null;
     this.config = config;
   }
   getClientHeaders() {
@@ -8505,7 +8506,25 @@ var RolayApiClient = class {
     });
     return response;
   }
-  async refresh() {
+  async refresh(failedAccessToken) {
+    const current = this.config.getSession();
+    if (failedAccessToken && current?.accessToken && current.accessToken !== failedAccessToken) {
+      return { accessToken: current.accessToken, refreshToken: current.refreshToken };
+    }
+    if (this.refreshInFlight) {
+      return this.refreshInFlight;
+    }
+    const pending = this.performSessionRefresh();
+    this.refreshInFlight = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.refreshInFlight === pending) {
+        this.refreshInFlight = null;
+      }
+    }
+  }
+  async performSessionRefresh() {
     const session = this.config.getSession();
     if (!session?.refreshToken) {
       throw new Error("No refresh token is stored yet.");
@@ -8520,6 +8539,9 @@ var RolayApiClient = class {
         body,
         { auth: false }
       );
+      if (this.config.getSession()?.refreshToken !== session.refreshToken) {
+        throw new Error("Session changed during token refresh.");
+      }
       await this.config.saveSession({
         ...session,
         accessToken: response.accessToken,
@@ -8528,7 +8550,7 @@ var RolayApiClient = class {
       });
       return response;
     } catch (error) {
-      if (error instanceof RolayApiError && error.status === 401) {
+      if (error instanceof RolayApiError && error.status === 401 && this.config.getSession()?.refreshToken === session.refreshToken) {
         await this.config.saveSession(null);
       }
       throw error;
@@ -8901,7 +8923,7 @@ var RolayApiClient = class {
     const initialToken = await this.getAccessToken();
     let response = await this.fetchStream(path, initialToken, init);
     if (response.status === 401) {
-      await this.refresh();
+      await this.refresh(initialToken);
       const nextToken = await this.getAccessToken();
       response = await this.fetchStream(path, nextToken, init);
     }
@@ -8939,7 +8961,7 @@ var RolayApiClient = class {
     const initialToken = await this.getAccessToken();
     let response = await this.performRequest(method, path, body, initialToken);
     if (response.status === 401) {
-      await this.refresh();
+      await this.refresh(initialToken);
       const nextToken = await this.getAccessToken();
       response = await this.performRequest(method, path, body, nextToken);
     }
@@ -9034,7 +9056,7 @@ var RolayApiClient = class {
       if (!(error instanceof RolayApiError) || error.status !== 401) {
         throw error;
       }
-      await this.refresh();
+      await this.refresh(initialToken);
       const nextToken = await this.getAccessToken();
       return this.performAuthorizedBlobDownload(
         url,
@@ -9154,7 +9176,7 @@ var RolayApiClient = class {
       if (!(error instanceof RolayApiError) || error.status !== 401) {
         throw error;
       }
-      await this.refresh();
+      await this.refresh(initialToken);
       const nextToken = await this.getAccessToken();
       return this.performAuthorizedBlobUpload(
         path,
@@ -18658,6 +18680,17 @@ function decodeBase64(encoded) {
   return bytes;
 }
 
+// src/sync/markdown-hydration.ts
+function getMarkdownHydrationAction(currentText, remoteText, previousText) {
+  if (currentText === remoteText) {
+    return "unchanged";
+  }
+  return currentText.length === 0 || currentText === previousText ? "write" : "preserve-local";
+}
+function needsLockedMarkdownDownload(path, lockedPaths, locallyDivergedPaths) {
+  return lockedPaths.has(path) && !locallyDivergedPaths.has(path);
+}
+
 // src/main.ts
 var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
   constructor() {
@@ -21065,6 +21098,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
         completedEntryIds: /* @__PURE__ */ new Set(),
         hydratedTargets: 0,
         lockedLocalPaths: /* @__PURE__ */ new Set(),
+        locallyDivergedPaths: /* @__PURE__ */ new Set(),
         lastRunAt: null,
         lastError: null,
         rerunRequested: false,
@@ -21182,6 +21216,7 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
       runtime.markdownBootstrap.lockedLocalPaths.add(normalizedLocalPath);
     } else {
       runtime.markdownBootstrap.lockedLocalPaths.delete(normalizedLocalPath);
+      runtime.markdownBootstrap.locallyDivergedPaths.delete(normalizedLocalPath);
       this.clearPendingRemoteMarkdownSettle(workspaceId, normalizedLocalPath);
     }
     if (runtime.markdownBootstrap.lockedLocalPaths.size === 0) {
@@ -22643,7 +22678,11 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
           return false;
         }
         const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
-        return currentRuntime.markdownBootstrap.lockedLocalPaths.has((0, import_obsidian10.normalizePath)(localPath));
+        return needsLockedMarkdownDownload(
+          (0, import_obsidian10.normalizePath)(localPath),
+          currentRuntime.markdownBootstrap.lockedLocalPaths,
+          currentRuntime.markdownBootstrap.locallyDivergedPaths
+        );
       });
       if (lockedEntries.length === 0) {
         this.clearLockedMarkdownBootstrapRetry(workspaceId);
@@ -23721,16 +23760,22 @@ var _RolayPlugin = class _RolayPlugin extends import_obsidian10.Plugin {
     }
     const nextText = decodeMarkdownTextState(nextState);
     const currentText = await this.app.vault.cachedRead(localFile);
-    if (currentText === nextText) {
+    const previousText = previousState ? decodeMarkdownTextState(previousState) : null;
+    const action = getMarkdownHydrationAction(currentText, nextText, previousText);
+    const divergedPaths = this.roomRuntime.get(workspaceId)?.markdownBootstrap.locallyDivergedPaths;
+    const normalizedLocalPath = (0, import_obsidian10.normalizePath)(localPath);
+    if (action === "preserve-local") {
+      if (!divergedPaths?.has(normalizedLocalPath)) {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Preserved local markdown ${entry.path}: local content differs from cached/remote state; download retries cannot resolve local changes. Local file remains protected.`
+        );
+      }
+      divergedPaths?.add(normalizedLocalPath);
       return false;
     }
-    const previousText = previousState ? decodeMarkdownTextState(previousState) : null;
-    const safeToOverwrite = currentText.length === 0 || previousText !== null && currentText === previousText;
-    if (!safeToOverwrite) {
-      this.recordLog(
-        "crdt",
-        `[${workspaceId}] Left local markdown ${entry.path} untouched during preload because it diverged from the last known cached content.`
-      );
+    divergedPaths?.delete(normalizedLocalPath);
+    if (action === "unchanged") {
       return false;
     }
     await this.app.vault.modify(localFile, nextText);

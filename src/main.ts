@@ -107,6 +107,7 @@ import {
 import { isBinaryPath, isMarkdownPath, guessMimeTypeFromPath } from "./utils/file-kind";
 import { decodeBase64, encodeBase64 } from "./utils/base64";
 import { normalizeSha256Hash, sha256Hash } from "./utils/sha256";
+import { getMarkdownHydrationAction, needsLockedMarkdownDownload } from "./sync/markdown-hydration";
 
 // Main orchestration state for one downloaded room. This is keyed strictly by
 // workspace.id so repeated room names cannot collide in memory or local sync.
@@ -146,6 +147,7 @@ interface RoomMarkdownBootstrapState {
   completedEntryIds: Set<string>;
   hydratedTargets: number;
   lockedLocalPaths: Set<string>;
+  locallyDivergedPaths: Set<string>;
   lastRunAt: string | null;
   lastError: string | null;
   rerunRequested: boolean;
@@ -3158,6 +3160,7 @@ export default class RolayPlugin extends Plugin {
         completedEntryIds: new Set(),
         hydratedTargets: 0,
         lockedLocalPaths: new Set<string>(),
+        locallyDivergedPaths: new Set<string>(),
         lastRunAt: null,
         lastError: null,
         rerunRequested: false,
@@ -3325,6 +3328,7 @@ export default class RolayPlugin extends Plugin {
       runtime.markdownBootstrap.lockedLocalPaths.add(normalizedLocalPath);
     } else {
       runtime.markdownBootstrap.lockedLocalPaths.delete(normalizedLocalPath);
+      runtime.markdownBootstrap.locallyDivergedPaths.delete(normalizedLocalPath);
       this.clearPendingRemoteMarkdownSettle(workspaceId, normalizedLocalPath);
     }
 
@@ -5240,7 +5244,11 @@ export default class RolayPlugin extends Plugin {
         }
 
         const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
-        return currentRuntime.markdownBootstrap.lockedLocalPaths.has(normalizePath(localPath));
+        return needsLockedMarkdownDownload(
+          normalizePath(localPath),
+          currentRuntime.markdownBootstrap.lockedLocalPaths,
+          currentRuntime.markdownBootstrap.locallyDivergedPaths
+        );
       });
 
       if (lockedEntries.length === 0) {
@@ -6643,20 +6651,22 @@ export default class RolayPlugin extends Plugin {
 
     const nextText = decodeMarkdownTextState(nextState);
     const currentText = await this.app.vault.cachedRead(localFile);
-    if (currentText === nextText) {
+    const previousText = previousState ? decodeMarkdownTextState(previousState) : null;
+    const action = getMarkdownHydrationAction(currentText, nextText, previousText);
+    const divergedPaths = this.roomRuntime.get(workspaceId)?.markdownBootstrap.locallyDivergedPaths;
+    const normalizedLocalPath = normalizePath(localPath);
+    if (action === "preserve-local") {
+      if (!divergedPaths?.has(normalizedLocalPath)) {
+        this.recordLog(
+          "crdt",
+          `[${workspaceId}] Preserved local markdown ${entry.path}: local content differs from cached/remote state; download retries cannot resolve local changes. Local file remains protected.`
+        );
+      }
+      divergedPaths?.add(normalizedLocalPath);
       return false;
     }
-
-    const previousText = previousState ? decodeMarkdownTextState(previousState) : null;
-    const safeToOverwrite =
-      currentText.length === 0 ||
-      (previousText !== null && currentText === previousText);
-
-    if (!safeToOverwrite) {
-      this.recordLog(
-        "crdt",
-        `[${workspaceId}] Left local markdown ${entry.path} untouched during preload because it diverged from the last known cached content.`
-      );
+    divergedPaths?.delete(normalizedLocalPath);
+    if (action === "unchanged") {
       return false;
     }
 

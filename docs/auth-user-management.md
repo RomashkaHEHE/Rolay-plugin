@@ -23,6 +23,10 @@ This document captures the auth and user-management model that the plugin now ta
 
 `login` returns tokens plus the current `user`. `refresh` only rotates tokens, so the plugin follows it with `GET /v1/auth/me` to rebuild authoritative user state including `isAdmin` and `globalRole`.
 
+Refresh tokens are single-use. Concurrent API, SSE, and blob authorization recovery shares one
+refresh request. A late 401 for an already-replaced access token retries with the current token.
+Refresh responses must not restore a logged-out session or erase a newer login.
+
 ### Self-service profile update
 
 - `PATCH /v1/auth/me/profile`

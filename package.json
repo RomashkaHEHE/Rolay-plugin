@@ -1,6 +1,6 @@
 {
   "name": "rolay-obsidian-plugin",
-  "version": "1.2.26",
+  "version": "1.2.27",
   "main": "main.js",
   "scripts": {
     "build": "node esbuild.config.mjs production",

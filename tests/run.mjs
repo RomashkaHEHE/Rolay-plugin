@@ -11,7 +11,9 @@ const entryPoints = [
   path.join(testsDirectory, "operations.test.ts"),
   path.join(testsDirectory, "snapshot-refresh.test.ts"),
   path.join(testsDirectory, "transfer-progress.test.ts"),
-  path.join(testsDirectory, "client-error.test.ts")
+  path.join(testsDirectory, "client-error.test.ts"),
+  path.join(testsDirectory, "auth-refresh.test.ts"),
+  path.join(testsDirectory, "markdown-hydration.test.ts")
 ];
 
 try {
@@ -21,6 +23,7 @@ try {
     format: "esm",
     platform: "node",
     target: "node20",
+    alias: { obsidian: path.join(testsDirectory, "fixtures/obsidian.ts") },
     outdir: outputDirectory,
     entryNames: "[name]",
     write: true

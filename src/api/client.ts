@@ -120,6 +120,7 @@ export class RolayApiError extends Error {
 
 export class RolayApiClient {
   private readonly config: RolayApiClientConfig;
+  private refreshInFlight: Promise<RefreshResponse> | null = null;
 
   constructor(config: RolayApiClientConfig) {
     this.config = config;
@@ -204,7 +205,27 @@ export class RolayApiClient {
     return response;
   }
 
-  async refresh(): Promise<RefreshResponse> {
+  async refresh(failedAccessToken?: string): Promise<RefreshResponse> {
+    const current = this.config.getSession();
+    // A late 401 may belong to a token another request has already replaced.
+    if (failedAccessToken && current?.accessToken && current.accessToken !== failedAccessToken) {
+      return { accessToken: current.accessToken, refreshToken: current.refreshToken };
+    }
+    if (this.refreshInFlight) {
+      return this.refreshInFlight;
+    }
+    const pending = this.performSessionRefresh();
+    this.refreshInFlight = pending;
+    try {
+      return await pending;
+    } finally {
+      if (this.refreshInFlight === pending) {
+        this.refreshInFlight = null;
+      }
+    }
+  }
+
+  private async performSessionRefresh(): Promise<RefreshResponse> {
     const session = this.config.getSession();
     if (!session?.refreshToken) {
       throw new Error("No refresh token is stored yet.");
@@ -222,6 +243,9 @@ export class RolayApiClient {
         { auth: false }
       );
 
+      if (this.config.getSession()?.refreshToken !== session.refreshToken) {
+        throw new Error("Session changed during token refresh.");
+      }
       await this.config.saveSession({
         ...session,
         accessToken: response.accessToken,
@@ -231,7 +255,10 @@ export class RolayApiClient {
 
       return response;
     } catch (error) {
-      if (error instanceof RolayApiError && error.status === 401) {
+      if (
+        error instanceof RolayApiError && error.status === 401 &&
+        this.config.getSession()?.refreshToken === session.refreshToken
+      ) {
         await this.config.saveSession(null);
       }
 
@@ -709,7 +736,7 @@ export class RolayApiClient {
     let response = await this.fetchStream(path, initialToken, init);
 
     if (response.status === 401) {
-      await this.refresh();
+      await this.refresh(initialToken);
       const nextToken = await this.getAccessToken();
       response = await this.fetchStream(path, nextToken, init);
     }
@@ -777,7 +804,7 @@ export class RolayApiClient {
     let response = await this.performRequest(method, path, body, initialToken);
 
     if (response.status === 401) {
-      await this.refresh();
+      await this.refresh(initialToken);
       const nextToken = await this.getAccessToken();
       response = await this.performRequest(method, path, body, nextToken);
     }
@@ -908,7 +935,7 @@ export class RolayApiClient {
         throw error;
       }
 
-      await this.refresh();
+      await this.refresh(initialToken);
       const nextToken = await this.getAccessToken();
       return this.performAuthorizedBlobDownload(
         url,
@@ -1057,7 +1084,7 @@ export class RolayApiClient {
         throw error;
       }
 
-      await this.refresh();
+      await this.refresh(initialToken);
       const nextToken = await this.getAccessToken();
       return this.performAuthorizedBlobUpload(
         path,
