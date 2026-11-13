@@ -11,7 +11,10 @@ Last updated: 2026-11-13
 
 Latest audit: [desktop/server sync audit](tasks/2026-11-13-sync-audit.md). Main content matches
 production; Lessons has five preserved attachment-link differences. Refresh concurrency and fast
-download-loop fixes are included in release candidate 1.2.27; audited vaults were running 1.2.26.
+download-loop fixes shipped in 1.2.27 from commit f79b474 (workflow 43481085438). GitHub assets,
+zip contents, and versioned production runtime files match the tag. Production latest discovery
+was still cached at 1.2.26 during verification; its normal TTL is 15 minutes. Audited vaults were
+running 1.2.26; post-update runtime verification remains.
 
 Priority order for most work unless the user explicitly overrides it:
 

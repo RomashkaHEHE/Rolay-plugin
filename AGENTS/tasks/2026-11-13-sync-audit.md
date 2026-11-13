@@ -54,9 +54,19 @@ Investigate desktop/server sync issues without overwriting divergent user conten
 - tests/markdown-hydration.test.ts
 - docs/debug-playbook.md
 
+## Release Rollout
+
+- Published plain-semver tag 1.2.27 from commit f79b474. GitHub Actions run 43481085438 passed.
+- Verified all five release assets and four zip members. Standalone files match raw tag blobs.
+- All three production /v1/plugin-updates/1.2.27/files/* responses match GitHub/tag bytes and
+  advertise correct version and SHA-256 headers.
+- Latest discovery still returned cached 1.2.26 at verification time; normal server TTL is
+  15 minutes. No server restart or cache configuration change was made.
+- No manual vault installation or Obsidian restart was performed for this rollout.
+
 ## Next Steps
 
-- Publish and verify release 1.2.27; audited vaults were running 1.2.26.
+- Confirm latest discovery refreshes to 1.2.27 and automatic installation reaches active vaults.
 - Verify auth recovery and elimination of 8-second divergent-note loops in runtime logs.
 - Design safe durable reconciliation for external Markdown edits and Obsidian link rewrites,
   including links outside the room. Five existing local differences remain intact.

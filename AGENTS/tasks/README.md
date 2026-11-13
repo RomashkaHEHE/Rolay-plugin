@@ -13,7 +13,7 @@ belongs in `README.md` and `docs/*`; product ideas that are not being implemente
 ## Watch
 
 - [Desktop/server sync audit](2026-11-13-sync-audit.md)
-  Refresh race and divergent-note loop fixed in source; rollout/runtime verification and safe
+  Refresh race and divergent-note loop fixes released in 1.2.27; runtime verification and safe
   reconciliation of five local attachment-link differences remain.
 - [Binary transfer queue progress](binary-transfer-queue-progress.md)
   Full-queue byte aggregation, completed cohort retention, and muted queued states are implemented
