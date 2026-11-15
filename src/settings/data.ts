@@ -86,6 +86,7 @@ export interface RolayPendingMarkdownMergeEntry {
   createdAt: string;
   lastAttemptAt: string | null;
   lastError: string | null;
+  linkRewrite?: { encodedState: string; originalText: string };
 }
 
 export interface RolayPendingBinaryWriteEntry {
@@ -436,7 +437,11 @@ function normalizePendingMarkdownMerges(
       filePath,
       createdAt: typeof candidate.createdAt === "string" ? candidate.createdAt : new Date().toISOString(),
       lastAttemptAt: typeof candidate.lastAttemptAt === "string" ? candidate.lastAttemptAt : null,
-      lastError: typeof candidate.lastError === "string" ? candidate.lastError : null
+      lastError: typeof candidate.lastError === "string" ? candidate.lastError : null,
+      ...(candidate.linkRewrite && typeof candidate.linkRewrite.encodedState === "string" &&
+        typeof candidate.linkRewrite.originalText === "string"
+        ? { linkRewrite: { encodedState: candidate.linkRewrite.encodedState, originalText: candidate.linkRewrite.originalText } }
+        : {})
     };
   }
 

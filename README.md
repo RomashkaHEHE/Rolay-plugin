@@ -229,7 +229,13 @@ Tag note:
 - Non-markdown files now follow a separate blob flow: initial room snapshot materializes their paths, then the plugin downloads actual bytes through blob download tickets and keeps them updated from authoritative room snapshots/events.
 - Markdown files that are still waiting for safe preload are temporarily protected from local move/rename/delete, and the Files pane marks those notes and their parent folders in red until the room has finished loading them safely.
 - Binary files that are still downloading are also marked red and protected from local move/rename/delete; binary files with a local upload in flight are marked yellow until `commit_blob_revision` publishes the new revision.
-- Explorer badges show a required byte-weighted `0-100%` progress label for downloading/protected
+- Preserved local Markdown differences use a muted `!` badge (`Local changes`), rolled up to the
+  nearest visible collapsed folder. They remain protected without being counted as downloads.
+- Closed-note wiki/inline Markdown link rewrites to the same room file are reconciled using
+  portable relative paths and durable Yjs updates, regardless of target file type. Ambiguous or
+  outside-room targets remain protected. Recovery copies are stored in the plugin's
+  `link-backups` directory before reconciliation; they are not part of log retention.
+- Explorer badges show a required byte-weighted `0-100%` progress label for downloading/installing
   paths and uploading paths, including folder roll-ups. The full known binary queue contributes to
   the total before workers start, and completed siblings keep contributing until their cohort
   drains, so sequential equal-size files advance a parent through `0 -> 50 -> 100` instead of

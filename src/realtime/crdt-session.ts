@@ -36,6 +36,7 @@ interface CrdtSessionManagerConfig {
   getPersistedCrdtState: (entryId: string) => Uint8Array | null;
   persistCrdtState: (entryId: string, filePath: string, state: Uint8Array) => void;
   resolveEntryByLocalPath: (localPath: string) => FileEntry | null;
+  canBindPreservedFile?: (entryId: string, filePath: string) => boolean;
   log: (message: string, error?: unknown) => void;
 }
 
@@ -51,6 +52,7 @@ export class CrdtSessionManager {
   private readonly resolveEntryByLocalPath: (localPath: string) => FileEntry | null;
   private readonly log: (message: string, error?: unknown) => void;
   private readonly pendingOfflineUpdates = new Map<string, Uint8Array>();
+  private readonly canBindPreservedFile: (entryId: string, filePath: string) => boolean;
   private activeSession: BoundCrdtSession | null = null;
   private sessionOperationQueue = Promise.resolve();
 
@@ -64,6 +66,7 @@ export class CrdtSessionManager {
     this.getPersistedCrdtState = config.getPersistedCrdtState;
     this.persistCrdtState = config.persistCrdtState;
     this.resolveEntryByLocalPath = config.resolveEntryByLocalPath;
+    this.canBindPreservedFile = config.canBindPreservedFile ?? (() => true);
     this.log = config.log;
   }
 
@@ -137,6 +140,14 @@ export class CrdtSessionManager {
       this.detachActiveSession();
       await this.activeSession?.destroy();
       this.activeSession = null;
+      return;
+    }
+
+    if (!this.activeSession?.matches(file, entry) && !this.canBindPreservedFile(entry.id, file.path)) {
+      this.detachActiveSession();
+      await this.activeSession?.destroy();
+      this.activeSession = null;
+      this.log(`Preserved local content for ${file.path}; CRDT binding waits for link reconciliation.`);
       return;
     }
 
@@ -235,7 +246,8 @@ export class CrdtSessionManager {
   async mergeRemoteMarkdownState(
     entry: FileEntry,
     localState: Uint8Array,
-    contextLabel = entry.path
+    contextLabel = entry.path,
+    signal?: AbortSignal
   ): Promise<void> {
     if (localState.byteLength === 0) {
       return;
@@ -243,11 +255,13 @@ export class CrdtSessionManager {
 
     this.log(`Merging local markdown state into remote CRDT doc for ${contextLabel}.`);
     const bootstrap = await this.apiClient.createCrdtToken(entry.id);
+    if (signal?.aborted) { throw new Error("Markdown merge canceled."); }
     await mergeRemoteMarkdownState({
       wsUrl: bootstrap.wsUrl,
       docId: bootstrap.docId,
       token: createCrdtTokenSupplier(this.apiClient, entry.id, bootstrap.token),
       localState,
+      signal,
       log: this.log,
       contextLabel
     });
@@ -945,6 +959,7 @@ interface RemoteMarkdownSeedOptions {
   localState: Uint8Array;
   log: (message: string, error?: unknown) => void;
   contextLabel: string;
+  signal?: AbortSignal;
 }
 
 async function mergeRemoteMarkdownState(options: RemoteMarkdownSeedOptions): Promise<void> {
@@ -965,6 +980,7 @@ async function mergeRemoteMarkdownState(options: RemoteMarkdownSeedOptions): Pro
       }
 
       settled = true;
+      options.signal?.removeEventListener("abort", abort);
       timeoutHandle && window.clearTimeout(timeoutHandle);
       try {
         callback();
@@ -974,11 +990,15 @@ async function mergeRemoteMarkdownState(options: RemoteMarkdownSeedOptions): Pro
       }
     };
 
+    const abort = () => settle(() => reject(new Error("Markdown merge canceled.")));
     const timeoutHandle = window.setTimeout(() => {
       settle(() => {
         reject(new Error(`Timed out while seeding remote markdown for ${options.contextLabel}.`));
       });
     }, 15_000);
+
+    options.signal?.addEventListener("abort", abort, { once: true });
+    if (options.signal?.aborted) { abort(); return; }
 
     provider = new HocuspocusProvider({
       url: options.wsUrl,

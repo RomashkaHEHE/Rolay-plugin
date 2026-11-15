@@ -718,7 +718,8 @@
   width: 0.52rem;
 }
 
-.rolay-transfer-progress-badge {
+.rolay-transfer-progress-badge,
+.rolay-local-changes-badge {
   align-items: center;
   border-radius: 4px;
   display: inline-flex;
@@ -733,6 +734,14 @@
   padding: 0 0.25rem;
   transition: opacity 120ms ease, background-color 120ms ease, border-color 120ms ease;
   vertical-align: middle;
+}
+
+.rolay-local-changes-badge {
+  background: color-mix(in srgb, var(--text-warning, #d4a100) 7%, transparent);
+  border: 1px solid color-mix(in srgb, var(--text-warning, #d4a100) 22%, var(--background-modifier-border));
+  color: color-mix(in srgb, var(--text-warning, #d4a100) 68%, var(--text-muted));
+  min-width: 0.72rem;
+  padding: 0 0.12rem;
 }
 
 .rolay-transfer-progress-badge-download {
@@ -761,14 +770,14 @@
   opacity: 0.62;
 }
 
-:is(.rolay-room-status-indicator, .rolay-transfer-progress-badge, .rolay-note-presence-badge, .rolay-note-anonymous-presence-badge)
-  + :is(.rolay-transfer-progress-badge, .rolay-note-presence-badge, .rolay-note-anonymous-presence-badge) {
+:is(.rolay-room-status-indicator, .rolay-transfer-progress-badge, .rolay-local-changes-badge, .rolay-note-presence-badge, .rolay-note-anonymous-presence-badge)
+  + :is(.rolay-transfer-progress-badge, .rolay-local-changes-badge, .rolay-note-presence-badge, .rolay-note-anonymous-presence-badge) {
   margin-left: 0.22rem;
 }
 
 :is(.nav-file-title, .nav-folder-title, .tree-item-self):hover
-  :is(.rolay-room-status-indicator, .rolay-transfer-progress-badge, .rolay-note-presence-badge, .rolay-note-anonymous-presence-badge),
-:is(.rolay-room-status-indicator, .rolay-transfer-progress-badge, .rolay-note-presence-badge, .rolay-note-anonymous-presence-badge):hover {
+  :is(.rolay-room-status-indicator, .rolay-transfer-progress-badge, .rolay-local-changes-badge, .rolay-note-presence-badge, .rolay-note-anonymous-presence-badge),
+:is(.rolay-room-status-indicator, .rolay-transfer-progress-badge, .rolay-local-changes-badge, .rolay-note-presence-badge, .rolay-note-anonymous-presence-badge):hover {
   opacity: 0.96;
 }
 

@@ -40,6 +40,13 @@ Investigate desktop/server sync issues without overwriting divergent user conten
 - Per-room local divergence tracking excludes these notes from fast locked-download retries,
   logs the cause once per episode, preserves protection, and clears on convergence. Normal
   background reconciliation still checks remote state.
+- Follow-up screenshot showed local divergence still rendered as `Downloading: 100%`. Explorer
+  now excludes divergent notes from both Markdown transfer aggregation paths and displays a muted
+  amber `!` / `Local changes` badge using minimal-visible-parent placement. Genuine 100% pending
+  work remains visible as `Sync pending` (download) or `Finalizing upload`; rounding cannot show
+  100% before all tracked bytes arrive. This follow-up is not yet released.
+- Follow-up verification: TypeScript, production build, all 27 tests, and whitespace checks pass.
+  Runtime visual verification remains pending; no vault files were replaced for this follow-up.
 - Added regression coverage for concurrent refresh, late 401, session replacement, logout,
   transient retry, local text preservation, and locked-download filtering. All 24 tests,
   TypeScript check, production build, and git diff --check pass. No vault data or server state
@@ -68,10 +75,11 @@ Investigate desktop/server sync issues without overwriting divergent user conten
 
 - Confirm latest discovery refreshes to 1.2.27 and automatic installation reaches active vaults.
 - Verify auth recovery and elimination of 8-second divergent-note loops in runtime logs.
-- Design safe durable reconciliation for external Markdown edits and Obsidian link rewrites,
-  including links outside the room. Five existing local differences remain intact.
-- Improve protected-local-change UI separately from byte download progress: protection also
-  covers divergence and cannot always be interpreted as missing bytes.
+- [Portable note links](portable-note-links.md) implements conservative same-entry link-only
+  reconciliation, with durable replay and source backups. Deploy and verify four safe cases;
+  the fifth outside-room link and arbitrary non-link offline text edits remain protected.
+- Verify the new local-change badge replaces false download percentages in the actual explorer
+  after the next release; mixed folders must retain both real transfer progress and local warnings.
 
 ## Exit Criteria
 

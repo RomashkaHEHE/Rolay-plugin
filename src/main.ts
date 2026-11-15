@@ -65,6 +65,7 @@ import {
 import {
   formatTransferProgressPercent,
   getTransferProgressActivity,
+  getTransferProgressTooltip,
   mergeTransferProgress,
   type TransferProgressActivity,
   type TransferProgressAggregate
@@ -108,6 +109,7 @@ import { isBinaryPath, isMarkdownPath, guessMimeTypeFromPath } from "./utils/fil
 import { decodeBase64, encodeBase64 } from "./utils/base64";
 import { normalizeSha256Hash, sha256Hash } from "./utils/sha256";
 import { getMarkdownHydrationAction, needsLockedMarkdownDownload } from "./sync/markdown-hydration";
+import { planPortableLinkEdits, resolveRoomLink, createLinkRewriteState, includesMarkdownState } from "./sync/markdown-links";
 
 // Main orchestration state for one downloaded room. This is keyed strictly by
 // workspace.id so repeated room names cannot collide in memory or local sync.
@@ -212,6 +214,7 @@ interface NotePresenceDisplayState {
 
 interface ExplorerTransferBadgeState {
   label: string;
+  tooltip: string;
   kind: BinaryTransferKind;
   activity: Exclude<TransferProgressActivity, "completed">;
 }
@@ -299,6 +302,9 @@ export default class RolayPlugin extends Plugin {
   private readonly pendingBinarySyncReruns = new Set<string>();
   private readonly recentRemoteObservedPaths = new Map<string, number>();
   private readonly pendingRemoteMarkdownSettles = new Map<string, number>();
+  private readonly markdownLinkWork = new Map<string, Promise<boolean>>();
+  private readonly markdownLinkAliases = new Map<string, Map<string, string>>();
+  private readonly markdownLinkTransfers = new Map<string, { workspaceId: string; controller: AbortController }>();
   private persistHandle: number | null = null;
   private isUnloading = false;
   private explorerDecorationHandle: number | null = null;
@@ -432,6 +438,8 @@ export default class RolayPlugin extends Plugin {
       getPersistedCrdtState: (entryId) => this.getPersistedCrdtState(entryId),
       persistCrdtState: (entryId, filePath, state) => this.persistCrdtState(entryId, filePath, state),
       resolveEntryByLocalPath: (localPath) => this.resolveEntryByLocalPath(localPath),
+      canBindPreservedFile: (entryId, path) => !this.data.pendingMarkdownMerges[entryId]?.linkRewrite &&
+        ![...this.roomRuntime.values()].some(runtime => runtime.markdownBootstrap.locallyDivergedPaths.has(normalizePath(path))),
       log: (message, error) => this.recordLog(
         "crdt",
         message,
@@ -1779,6 +1787,14 @@ export default class RolayPlugin extends Plugin {
       return;
     }
 
+    const linkAliases = this.markdownLinkAliases.get(workspaceId) ?? new Map<string, string>();
+    for (const next of snapshot.entries) {
+      const previous = runtime.treeStore.getEntryById(next.id);
+      if (!next.deleted && previous && previous.path !== next.path) {
+        linkAliases.set(previous.path, next.id);
+      }
+    }
+    this.markdownLinkAliases.set(workspaceId, linkAliases);
     runtime.treeStore.applySnapshot(snapshot);
     this.confirmSnapshotPendingCreates(room.workspace.id, snapshot.entries);
     this.confirmSnapshotPendingDeletes(room.workspace.id, snapshot.entries);
@@ -1996,6 +2012,9 @@ export default class RolayPlugin extends Plugin {
   }
 
   stopRoomEventStream(workspaceId: string): void {
+    for (const transfer of this.markdownLinkTransfers.values()) {
+      if (transfer.workspaceId === workspaceId) { transfer.controller.abort(); }
+    }
     const runtime = this.roomRuntime.get(workspaceId);
     if (!runtime) {
       return;
@@ -2479,7 +2498,29 @@ export default class RolayPlugin extends Plugin {
 
   private async handleVaultModify(file: TAbstractFile): Promise<void> {
     try {
-      if (!(file instanceof TFile) || isMarkdownPath(file.path)) {
+      if (!(file instanceof TFile)) {
+        return;
+      }
+      if (isMarkdownPath(file.path)) {
+        const room = this.resolveDownloadedRoomByLocalPath(file.path);
+        const entry = this.resolveEntryByLocalPath(file.path);
+        if (room && entry?.kind === "markdown" && this.isRoomSyncActive(room.workspaceId)) {
+          const state = this.getPersistedCrdtState(entry.id);
+          if (state && getMarkdownViewsForFile(this.app, file.path).length === 0 &&
+            !this.hasPendingLocalCreate(room.workspaceId, entry.path) &&
+            !this.data.pendingMarkdownCreates[normalizePath(file.path)] &&
+            (!this.data.pendingMarkdownMerges[entry.id] || this.data.pendingMarkdownMerges[entry.id].linkRewrite)) {
+            const current = await this.app.vault.read(file);
+            if (current !== decodeMarkdownTextState(state)) {
+              this.roomRuntime.get(room.workspaceId)?.markdownBootstrap.locallyDivergedPaths.add(normalizePath(file.path));
+              const reconciled = await this.reconcileMarkdownLinks(room.workspaceId, entry, file.path, state);
+              if (!reconciled) {
+                this.roomRuntime.get(room.workspaceId)?.markdownBootstrap.locallyDivergedPaths.add(normalizePath(file.path));
+              }
+            }
+            await this.syncMarkdownLockForEntry(room.workspaceId, entry, file.path);
+          }
+        }
         return;
       }
 
@@ -2502,6 +2543,7 @@ export default class RolayPlugin extends Plugin {
       }
 
       await this.refreshMarkdownContentBeforeRoomExit(file, oldPath);
+      this.rememberMarkdownLinkRename(oldPath, file.path);
       this.forgetRecentRemoteHintsForLocalPath(oldPath, true);
       this.forgetRecentRemoteHintsForLocalPath(file.path, true);
       this.handlePendingMarkdownCreateRename(oldPath, file.path);
@@ -3476,6 +3518,7 @@ export default class RolayPlugin extends Plugin {
     const pathElements = [...container.querySelectorAll<HTMLElement>("[data-path]")];
     const visibleExplorerPaths = this.getVisibleExplorerPathSet(pathElements);
     const transferBadges = this.getExplorerTransferBadges(visibleExplorerPaths);
+    const localChangesBadges = this.getExplorerLocalChangesBadges(visibleExplorerPaths);
     const notePresenceBadges = this.getExplorerNotePresenceBadges(visibleExplorerPaths);
     const anonymousPresenceBadges = this.getExplorerAnonymousPresenceBadges(visibleExplorerPaths);
 
@@ -3529,6 +3572,7 @@ export default class RolayPlugin extends Plugin {
         element,
         transferBadge
       );
+      this.updateExplorerLocalChangesBadge(element, localChangesBadges.get(normalizedPath) ?? 0);
       this.updateExplorerNotePresenceBadge(
         element,
         notePresenceBadges.get(normalizedPath) ?? null
@@ -4136,6 +4180,7 @@ export default class RolayPlugin extends Plugin {
       for (const lockedPath of runtime.markdownBootstrap.lockedLocalPaths) {
         const normalizedPath = normalizePath(lockedPath);
         if (
+          runtime.markdownBootstrap.locallyDivergedPaths.has(normalizedPath) ||
           this.isExplorerPathUploading(normalizedPath) ||
           exactTransferPaths.has(normalizedPath) ||
           markdownBootstrapCoveredPaths.has(normalizedPath)
@@ -4219,6 +4264,7 @@ export default class RolayPlugin extends Plugin {
                 localPath,
                 {
                   label: formatTransferProgressPercent(state),
+                  tooltip: getTransferProgressTooltip(state),
                   kind: state.kind,
                   activity
                 }
@@ -4296,7 +4342,10 @@ export default class RolayPlugin extends Plugin {
       const localPath = this.fileBridge.toLocalPath(workspaceId, entry.path) ?? entry.path;
       const normalizedLocalPath = normalizePath(localPath);
       coveredLocalPaths.add(normalizedLocalPath);
-      if (this.isExplorerPathUploading(normalizedLocalPath)) {
+      if (
+        runtime.markdownBootstrap.locallyDivergedPaths.has(normalizedLocalPath) ||
+        this.isExplorerPathUploading(normalizedLocalPath)
+      ) {
         continue;
       }
 
@@ -4450,10 +4499,46 @@ export default class RolayPlugin extends Plugin {
     badge.classList.toggle("rolay-transfer-progress-badge-upload", badgeState.kind === "upload");
     badge.classList.toggle("rolay-transfer-progress-badge-download", badgeState.kind === "download");
     badge.classList.toggle("rolay-transfer-progress-badge-queued", badgeState.activity === "queued");
-    const label = badgeState.activity === "queued"
-      ? `${badgeState.kind === "upload" ? "Upload" : "Download"} queued: ${badgeState.label}`
-      : `${badgeState.kind === "upload" ? "Uploading" : "Downloading"}: ${badgeState.label}`;
-    this.setExplorerIndicatorTooltip(badge, label);
+    this.setExplorerIndicatorTooltip(badge, badgeState.tooltip);
+  }
+
+  private getExplorerLocalChangesBadges(visibleExplorerPaths: Set<string>): Map<string, number> {
+    const counts = new Map<string, number>();
+    for (const room of this.getDownloadedRooms()) {
+      const bootstrap = this.roomRuntime.get(room.workspaceId)?.markdownBootstrap;
+      if (!bootstrap) {
+        continue;
+      }
+      const roomRoot = normalizePath(getRoomRoot(this.data.settings.syncRoot, room.folderName));
+      for (const path of bootstrap.locallyDivergedPaths) {
+        if (!bootstrap.lockedLocalPaths.has(path)) {
+          continue;
+        }
+        const target = this.getMinimalVisibleExplorerRollupPath(path, roomRoot, visibleExplorerPaths);
+        counts.set(target, (counts.get(target) ?? 0) + 1);
+      }
+    }
+    return counts;
+  }
+
+  private updateExplorerLocalChangesBadge(element: HTMLElement, count: number): void {
+    const host = this.findExplorerTitleHost(element);
+    if (!host) {
+      return;
+    }
+    let badge = host.querySelector<HTMLElement>(".rolay-local-changes-badge");
+    if (count === 0) {
+      badge?.remove();
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement("span");
+      badge.className = "rolay-local-changes-badge";
+      badge.setAttribute("role", "img");
+      host.appendChild(badge);
+    }
+    badge.textContent = "!";
+    this.setExplorerIndicatorTooltip(badge, count === 1 ? "Local changes" : `Local changes: ${count}`);
   }
 
   private findExplorerTitleHost(element: HTMLElement): HTMLElement | null {
@@ -6389,6 +6474,7 @@ export default class RolayPlugin extends Plugin {
     const normalizedLocalPath = normalizePath(localPath);
     const existing = this.data.pendingMarkdownMerges[entryId];
     this.data.pendingMarkdownMerges[entryId] = {
+      ...existing,
       workspaceId,
       entryId,
       localPath: normalizedLocalPath,
@@ -6618,6 +6704,120 @@ export default class RolayPlugin extends Plugin {
     }
   }
 
+  private rememberMarkdownLinkRename(oldLocalPath: string, newLocalPath: string): void {
+    const room = this.resolveDownloadedRoomByLocalPath(oldLocalPath);
+    if (!room || this.resolveDownloadedRoomByLocalPath(newLocalPath)?.workspaceId !== room.workspaceId) {
+      return;
+    }
+    const oldPath = toServerPathForRoom(oldLocalPath, this.data.settings.syncRoot, room.folderName);
+    const newPath = toServerPathForRoom(newLocalPath, this.data.settings.syncRoot, room.folderName);
+    if (!oldPath || !newPath) { return; }
+    const aliases = this.markdownLinkAliases.get(room.workspaceId) ?? new Map<string, string>();
+    for (const entry of this.getRoomStore(room.workspaceId)?.getEntries() ?? []) {
+      if (!entry.deleted && entry.kind !== "folder" && (entry.path === oldPath || entry.path.startsWith(`${oldPath}/`))) {
+        aliases.set(entry.path, entry.id);
+        aliases.set(newPath + entry.path.slice(oldPath.length), entry.id);
+      }
+    }
+    this.markdownLinkAliases.set(room.workspaceId, aliases);
+  }
+
+  private async reconcileMarkdownLinks(
+    workspaceId: string, entry: FileEntry, localPath: string, remoteState: Uint8Array
+  ): Promise<boolean> {
+    const existing = this.markdownLinkWork.get(entry.id);
+    if (existing) { return existing; }
+    const work = this.performMarkdownLinkReconciliation(workspaceId, entry, localPath, remoteState);
+    this.markdownLinkWork.set(entry.id, work);
+    try { return await work; }
+    finally { if (this.markdownLinkWork.get(entry.id) === work) { this.markdownLinkWork.delete(entry.id); } }
+  }
+
+  private async performMarkdownLinkReconciliation(
+    workspaceId: string, entry: FileEntry, localPath: string, remoteState: Uint8Array
+  ): Promise<boolean> {
+    const runtime = this.roomRuntime.get(workspaceId);
+    const generation = runtime?.markdownBootstrap.runToken;
+    const file = this.app.vault.getAbstractFileByPath(localPath);
+    if (!(file instanceof TFile)) { return false; }
+    const valid = () => !this.isUnloading && this.isRoomSyncActive(workspaceId) &&
+      file.path === localPath && this.app.vault.getAbstractFileByPath(localPath) === file &&
+      this.roomRuntime.get(workspaceId) === runtime && runtime?.markdownBootstrap.runToken === generation &&
+      runtime?.treeStore.getEntryById(entry.id)?.path === entry.path &&
+      !runtime?.treeStore.getEntryById(entry.id)?.deleted;
+    if (!valid() || getMarkdownViewsForFile(this.app, localPath).length > 0) { return false; }
+    const room = this.resolveDownloadedRoomByLocalPath(localPath);
+    if (!room || room.workspaceId !== workspaceId) { return false; }
+    const controller = new AbortController();
+    this.markdownLinkTransfers.set(entry.id, { workspaceId, controller });
+    try {
+      let pending = this.data.pendingMarkdownMerges[entry.id];
+      if (!pending?.linkRewrite) {
+        const originalText = await this.app.vault.read(file);
+        const targets = runtime!.treeStore.getEntries()
+          .filter(e => !e.deleted && e.kind !== "folder");
+        const aliases = this.markdownLinkAliases.get(workspaceId);
+        const decode = (path: string) => { try { return decodeURIComponent(path.replace(/\\([() ])/g, "$1")); } catch { return path; } };
+        const edits = planPortableLinkEdits(
+          decodeMarkdownTextState(remoteState), originalText, entry.path,
+          path => resolveRoomLink(decode(path), entry.path, targets, aliases),
+          path => {
+            const target = this.app.metadataCache.getFirstLinkpathDest(decode(path), localPath);
+            if (!target) { return null; }
+            const relative = toServerPathForRoom(target.path, this.data.settings.syncRoot, room.folderName);
+            const resolved = relative ? resolveRoomLink(`/${relative}`, entry.path, targets, aliases) : null;
+            return resolved?.path === relative ? resolved : null;
+          }
+        );
+        const backupFolder = normalizePath(`${this.getPersistentLogFolderPath()}/link-backups`);
+        await this.ensureAdapterFolderExists(backupFolder);
+        const fingerprint = sanitizePathSegment(await sha256Hash(new TextEncoder().encode(originalText)));
+        const backupPath = `${backupFolder}/${sanitizePathSegment(entry.id)}-${fingerprint}.json`;
+        if (!await this.app.vault.adapter.exists(backupPath)) {
+          await this.app.vault.adapter.write(backupPath, JSON.stringify({ workspaceId, entryId: entry.id,
+            localPath, originalText, remoteState: encodeBase64(remoteState) }));
+        }
+        if (!edits || !valid()) { return false; }
+        const encodedState = encodeBase64(createLinkRewriteState(remoteState, edits));
+        this.rememberPendingMarkdownMerge(workspaceId, entry.id, localPath, entry.path);
+        pending = this.data.pendingMarkdownMerges[entry.id];
+        pending.linkRewrite = { encodedState, originalText };
+        await this.persistNow();
+      }
+      if (!valid() || !pending.linkRewrite) { return false; }
+      const state = decodeBase64(pending.linkRewrite.encodedState);
+      if (!includesMarkdownState(remoteState, state)) {
+        await this.crdtManager.mergeRemoteMarkdownState(entry, state, entry.path, controller.signal);
+      }
+      if (!valid()) { return false; }
+      const confirmation = await this.apiClient.getWorkspaceMarkdownBootstrap(workspaceId, { entryIds: [entry.id], includeState: true });
+      const document = confirmation.documents.find(doc => doc.entryId === entry.id);
+      if (!document?.state || !valid()) { return false; }
+      const confirmedState = normalizeBootstrapState(document.state);
+      if (!includesMarkdownState(confirmedState, state)) { return false; }
+      const text = decodeMarkdownTextState(confirmedState);
+      // Atomic compare-and-write preserves edits made while the merge was in flight.
+      const result = await this.app.vault.process(file, current =>
+        valid() && getMarkdownViewsForFile(this.app, localPath).length === 0 &&
+        current === pending.linkRewrite!.originalText ? text : current);
+      if (!valid()) { return false; }
+      this.persistCrdtState(entry.id, localPath, confirmedState);
+      this.clearPendingMarkdownMerge(entry.id);
+      if (result === text) { runtime!.markdownBootstrap.locallyDivergedPaths.delete(normalizePath(localPath)); }
+      this.recordLog("crdt", `[${workspaceId}] Confirmed portable link reconciliation for ${entry.path}.`);
+      await this.persistNow();
+      return result === text;
+    } catch (error) {
+      if (controller.signal.aborted) { return false; }
+      const pending = this.data.pendingMarkdownMerges[entry.id];
+      if (pending?.linkRewrite) { pending.lastError = getErrorMessage(error); this.schedulePersist(); }
+      this.handleError(`Link reconciliation failed for ${entry.path}`, error, false);
+      return false;
+    } finally {
+      if (this.markdownLinkTransfers.get(entry.id)?.controller === controller) { this.markdownLinkTransfers.delete(entry.id); }
+    }
+  }
+
   private async hydrateMarkdownFileFromState(
     workspaceId: string,
     entry: FileEntry,
@@ -6641,6 +6841,9 @@ export default class RolayPlugin extends Plugin {
     }
 
     if (this.data.pendingMarkdownMerges[entry.id]) {
+      if (this.data.pendingMarkdownMerges[entry.id].linkRewrite) {
+        return this.reconcileMarkdownLinks(workspaceId, entry, localPath, nextState);
+      }
       this.recordLog("crdt", `[${workspaceId}] Skipped preload overwrite for ${entry.path} because a local markdown merge is pending.`);
       return false;
     }
@@ -6656,7 +6859,13 @@ export default class RolayPlugin extends Plugin {
     const divergedPaths = this.roomRuntime.get(workspaceId)?.markdownBootstrap.locallyDivergedPaths;
     const normalizedLocalPath = normalizePath(localPath);
     if (action === "preserve-local") {
-      if (!divergedPaths?.has(normalizedLocalPath)) {
+      const alreadyDiverged = divergedPaths?.has(normalizedLocalPath);
+      divergedPaths?.add(normalizedLocalPath);
+      if (await this.reconcileMarkdownLinks(workspaceId, entry, localPath, nextState)) {
+        divergedPaths?.delete(normalizedLocalPath);
+        return true;
+      }
+      if (!alreadyDiverged) {
         this.recordLog(
           "crdt",
           `[${workspaceId}] Preserved local markdown ${entry.path}: local content differs from cached/remote state; download retries cannot resolve local changes. Local file remains protected.`
@@ -6848,7 +7057,7 @@ export default class RolayPlugin extends Plugin {
         }
 
         if (updateLocks && this.isLocalPathInDownloadedRoom(target.localPath, workspaceId)) {
-          await this.syncMarkdownLockForEntry(workspaceId, entry, target.localPath, normalizedState);
+          await this.syncMarkdownLockForEntry(workspaceId, entry, target.localPath);
         }
       }
     }
@@ -7172,7 +7381,7 @@ export default class RolayPlugin extends Plugin {
             await this.bindActiveMarkdownToCrdt();
           }
 
-          await this.syncMarkdownLockForEntry(workspaceId, entry, localPath, normalizedState);
+          await this.syncMarkdownLockForEntry(workspaceId, entry, localPath);
           this.scheduleExplorerLoadingDecorations();
           this.updateStatusBar();
         }
@@ -7750,6 +7959,11 @@ export default class RolayPlugin extends Plugin {
           `[${workspaceId}] Cleared pending markdown merge for ${pendingMerge.localPath} because the local CRDT cache is missing.`,
           "error"
         );
+        continue;
+      }
+
+      if (pendingMerge.linkRewrite) {
+        await this.reconcileMarkdownLinks(workspaceId, entry, pendingMerge.localPath, persistedState);
         continue;
       }
 

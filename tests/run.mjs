@@ -13,7 +13,8 @@ const entryPoints = [
   path.join(testsDirectory, "transfer-progress.test.ts"),
   path.join(testsDirectory, "client-error.test.ts"),
   path.join(testsDirectory, "auth-refresh.test.ts"),
-  path.join(testsDirectory, "markdown-hydration.test.ts")
+  path.join(testsDirectory, "markdown-hydration.test.ts"),
+  path.join(testsDirectory, "markdown-links.test.ts")
 ];
 
 try {

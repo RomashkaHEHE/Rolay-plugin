@@ -35,6 +35,9 @@ The plugin is split into a few strong boundaries:
 - `src/sync/transfer-progress.ts`
   Pure byte-weighted explorer transfer aggregation. It keeps queued, active, and completed cohort
   contributions separate so sequential files cannot reset parent progress.
+- `src/sync/markdown-links.ts`
+  Conservative link destination planning, room entry identity resolution, portable relative paths,
+  precise Yjs link rewrites, and confirmation checks for durable reconciliation.
 - `src/settings/tab.ts`
   All settings UI and navigation. Rooms view, room detail page, account page, admin page, pagination, room install button, color picker, and tooltips all live here.
 - `src/settings/data.ts`

@@ -6,6 +6,14 @@ These notes summarize the server-side conflict model that the plugin must respec
 
 - Concurrent markdown edits merge through Yjs.
 - Offline markdown edits are expected to merge back through Yjs persistence after reconnect.
+- Closed-note automatic link rewrites are reconciled only when changed destinations resolve to
+  identical room entry IDs. Wiki/inline Markdown targets use source-relative paths, with aliases
+  for observed moves/renames. Ambiguous, deleted, different, and outside-room targets stay protected.
+- Link reconciliation saves original local text/base state in `.obsidian/plugins/rolay/link-backups`
+  and a replayable Yjs state in `pendingMarkdownMerges.linkRewrite`. A server bootstrap read must
+  confirm the update before queue removal. Atomic local application preserves newer local edits.
+- Opening a protected divergent note does not newly attach a CRDT session that could replace its
+  local text. Reconciliation operates on closed notes; the active editor keeps its normal CRDT flow.
 - If the original markdown file was deleted while a client still holds offline changes, the client should preserve those edits as a conflict copy instead of silently dropping them.
 
 ## File Tree

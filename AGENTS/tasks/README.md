@@ -12,6 +12,9 @@ belongs in `README.md` and `docs/*`; product ideas that are not being implemente
 
 ## Watch
 
+- [Portable note links](portable-note-links.md)
+  Same-entry link rewrites for arbitrary files, durable CRDT replay and backups implemented;
+  deploy public-viewer relative-path support before releasing the client.
 - [Desktop/server sync audit](2026-11-13-sync-audit.md)
   Refresh race and divergent-note loop fixes released in 1.2.27; runtime verification and safe
   reconciliation of five local attachment-link differences remain.

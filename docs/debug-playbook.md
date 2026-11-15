@@ -27,9 +27,13 @@ each SSE open records its actual `node-http(s)` or `fetch` transport without log
 Compare the actual file text with decoded cached `content` and the read-only remote bootstrap.
 Obsidian attachment moves may rewrite wiki links, including targets outside the room. A successful
 download cannot resolve this local divergence. The plugin keeps the local file protected and
-excludes known divergent paths from fast locked-download retries; normal background reconciliation
+shows a muted `!` (`Local changes`) instead of a red download percentage. Known divergent paths
+are excluded from fast locked-download retries; normal background reconciliation
 still checks remote state. Look for `Preserved local markdown` logs. Do not reset caches or force
 overwrite files to silence the indicator; first establish which link targets/content should survive.
+
+Actual transfers remain visible at 100% until sync/application or upload publication finishes.
+Their tooltip reads `Sync pending` or `Finalizing upload`; 100% alone never hides pending work.
 
 ### Room folder looks forgotten after restart
 
@@ -147,7 +151,8 @@ Check:
 Useful expectation:
 
 - a remote binary placeholder should immediately count as `loading` in the explorer
-- any downloading/protected explorer path or uploading path should have a `0-100%` badge. Active
+- any downloading/installing explorer path or uploading path should have a `0-100%` badge. Local
+  Markdown divergence instead uses `!` / `Local changes` and remains protected. Active
   binary transfers use the stronger red/yellow state, queued work uses a muted version, remote
   placeholders start at `0%`, markdown locks use bootstrap metadata/cache state, and folders roll
   child progress up

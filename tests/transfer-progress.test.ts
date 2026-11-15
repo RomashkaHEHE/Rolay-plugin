@@ -3,6 +3,7 @@ import test from "node:test";
 import {
   formatTransferProgressPercent,
   getTransferProgressActivity,
+  getTransferProgressTooltip,
   mergeTransferProgress,
   type TransferProgressAggregate
 } from "../src/sync/transfer-progress";
@@ -49,4 +50,25 @@ test("hides an aggregate only after every item is completed", () => {
 
   assert.equal(formatTransferProgressPercent(aggregate), "100%");
   assert.equal(getTransferProgressActivity(aggregate), null);
+});
+
+test("received bytes stay visible while sync or upload publication is pending", () => {
+  const download = mergeTransferProgress(undefined, "download", 100, 100, "active");
+  assert.equal(formatTransferProgressPercent(download), "100%");
+  assert.equal(getTransferProgressActivity(download), "active");
+  assert.equal(getTransferProgressTooltip(download), "Sync pending: 100%");
+  const upload = mergeTransferProgress(undefined, "upload", 100, 100, "active");
+  assert.equal(getTransferProgressTooltip(upload), "Finalizing upload: 100%");
+});
+
+test("rounding cannot claim all bytes arrived before transfer completion", () => {
+  const download = mergeTransferProgress(undefined, "download", 999, 1000, "active");
+  assert.equal(formatTransferProgressPercent(download), "99%");
+  assert.equal(getTransferProgressTooltip(download), "Downloading: 99%");
+});
+
+test("completed siblings do not hide a queued transfer or report finalization", () => {
+  let state = mergeTransferProgress(undefined, "download", 100, 100, "completed");
+  state = mergeTransferProgress(state, "download", 0, 100, "queued");
+  assert.equal(getTransferProgressTooltip(state), "Download queued: 50%");
 });

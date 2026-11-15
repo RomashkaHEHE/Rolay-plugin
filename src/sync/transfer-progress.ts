@@ -52,7 +52,20 @@ export function formatTransferProgressPercent(state: TransferProgressAggregate):
   }
 
   const percent = Math.round((state.completedBytes / state.totalBytes) * 100);
-  return `${Math.max(0, Math.min(100, percent))}%`;
+  const ceiling = state.completedBytes < state.totalBytes ? 99 : 100;
+  return `${Math.max(0, Math.min(ceiling, percent))}%`;
+}
+
+export function getTransferProgressTooltip(state: TransferProgressAggregate): string {
+  const percent = formatTransferProgressPercent(state);
+  const direction = state.kind === "upload" ? "Upload" : "Download";
+  if (getTransferProgressActivity(state) === "queued") {
+    return `${direction} queued: ${percent}`;
+  }
+  if (state.totalBytes > 0 && state.completedBytes >= state.totalBytes) {
+    return `${state.kind === "upload" ? "Finalizing upload" : "Sync pending"}: ${percent}`;
+  }
+  return `${state.kind === "upload" ? "Uploading" : "Downloading"}: ${percent}`;
 }
 
 export function getTransferProgressActivity(

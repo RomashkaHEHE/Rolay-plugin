@@ -1,11 +1,11 @@
 # Current State
 
-Last updated: 2026-11-13
+Last updated: 2026-11-15
 
 ## Current Release Baseline
 
-- Plugin version: `1.2.27`
-- Release baseline: `1.2.27` shared token refresh and local-divergence download retry suppression
+- Plugin version: `1.2.28`
+- Release baseline: `1.2.28` portable note links, durable reconciliation and truthful explorer states
 
 ## Current Priorities
 
@@ -15,6 +15,15 @@ download-loop fixes shipped in 1.2.27 from commit f79b474 (workflow 43481085438)
 zip contents, and versioned production runtime files match the tag. Production latest discovery
 was still cached at 1.2.26 during verification; its normal TTL is 15 minutes. Audited vaults were
 running 1.2.26; post-update runtime verification remains.
+
+Version 1.2.28 includes the explorer fix: local Markdown divergence uses a muted `!`
+(`Local changes`) rather than `Downloading: 100%`, with the same minimal-visible-parent roll-up.
+Real complete-byte transfers stay visible while sync/publication is pending.
+
+[Portable note links](tasks/portable-note-links.md) are implemented for 1.2.28: closed-note
+same-entry wiki/Markdown destination rewrites use source-relative paths, durable CRDT replay,
+server confirmation and recovery copies. Unresolved/outside-room targets stay protected. Companion
+server commit 89758fe adds public-viewer relative-path support; rollout verification is pending.
 
 Priority order for most work unless the user explicitly overrides it:
 
@@ -53,6 +62,9 @@ These should be treated as high-confidence truths unless code/docs are intention
   cohort aggregate until all cohort work finishes so parent percentages cannot reset between
   sequential files.
 - Room-wide markdown preload requires a large persistent CRDT cache. Do not lower `MAX_PERSISTED_CRDT_DOCS` back to tiny LRU values: downloaded notes will be pruned from `data.json`, then flicker red/normal and retrigger bootstrap loops even though the room was already downloaded.
+- Local Markdown divergence is an exception to transfer/protection percentage coupling: keep the
+  file protected, exclude it from download totals, and show a muted `!` / `Local changes` badge.
+  Actual complete-byte transfers retain 100% while sync/application/publication is pending.
 - Local delete operations keep a short pending-delete guard so stale snapshots cannot resurrect files while multi-file delete operations are still settling.
 - Bulk duplicate cleanup must stay possible even while markdown preload/locked-state is stale. Remote/suppressed delete echoes and already-pending deletes must be ignored before protected-markdown delete restoration, and safe `entryVersion=0` suffix-copy markdown duplicates may bypass the locked-delete restore so their `delete_entry` can reach the server.
 - Authenticated REST/blob/SSE requests include `X-Rolay-Client: obsidian-plugin` and `X-Rolay-Client-Version`; keep this so the server can diagnose or reject stale clients if an old plugin build starts creating duplicate entries.
