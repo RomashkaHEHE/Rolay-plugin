@@ -22,8 +22,10 @@ Real complete-byte transfers stay visible while sync/publication is pending.
 
 [Portable note links](tasks/portable-note-links.md) are implemented for 1.2.28: closed-note
 same-entry wiki/Markdown destination rewrites use source-relative paths, durable CRDT replay,
-server confirmation and recovery copies. Unresolved/outside-room targets stay protected. Companion
-server commit 89758fe adds public-viewer relative-path support; rollout verification is pending.
+server confirmation and recovery copies. Unresolved/outside-room targets stay protected. Server
+89758fe is deployed; client release b7d4f52 / workflow 43668326462 and runtime files are verified.
+Main and Lessons run 1.2.28. Live audit: Main 143/143 Markdown texts match; Lessons 98/99 match,
+with only the known outside-room link note preserved. Pending merge/binary/error queues are empty.
 
 Priority order for most work unless the user explicitly overrides it:
 

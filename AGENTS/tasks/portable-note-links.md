@@ -25,10 +25,28 @@ or genuinely different targets must remain protected rather than be silently sub
 
 ## Next Steps
 
-- Companion server commit 89758fe is pushed; verify deployment before publishing client 1.2.28.
-- Release/install 1.2.28 and verify in Obsidian. The release includes the local-change indicators.
-- Verify four audited Lessons notes auto-reconcile; the fifth remains protected because an embed
-  resolves outside the room. Read-only planning against current room tree confirmed this split.
+- Monitor runtime recovery and future link rewrites. Client 1.2.28 and server support are deployed.
+- The remaining Lessons note has an outside-room embed and is intentionally protected; resolving
+  its actual intended target is separate from the completed rollout.
+
+## Rollout 2026-11-15
+
+- Server image sha-89758fee2913 is live. CI 43668085336 passed; deploy workflow 43668085530 built
+  the image but failed pulling unrelated MinIO from quay.io (401). Application-only compose pull
+  and up --no-deps completed successfully. Public viewer bytes and /ready were verified.
+- Plugin release 1.2.28 is tagged at b7d4f52; workflow 43668326462 passed. All five release assets,
+  four archive members, and three production update files match raw tag blobs. Latest discovery
+  reports 1.2.28.
+- Main had already autonomously updated; exact release files were then verified/installed in Main
+  and Lessons. Both open vaults were closed normally and reopened without force termination.
+- Before manual installation, each vault's data/runtime and room Markdown files were backed up
+  under .rolay-update/manual-backup-before-1.2.28-20261115 (146 Main / 125 Lessons notes).
+- Runtime confirmed portable-link reconciliation for lectures 13.03, 20.03 and 27.03; all four
+  previously identified physics lecture notes now match server content. Lessons has four
+  link-backups. One confirmation required an idempotent retry before server persistence caught up.
+- Final read-only live audit: Main 143/143 Markdown texts match, Lessons 98/99 match. The only
+  remaining difference is the known outside-room embed note; pending merge/binary/error queues
+  are empty. No vault note was force-replaced during manual installation.
 
 ## Implementation And Verification
 
@@ -51,8 +69,8 @@ or genuinely different targets must remain protected rather than be silently sub
   until reconciliation, avoiding remote editor hydration overwriting its preserved local text.
 - Client 37 tests and TypeScript pass, including arbitrary file types, encoded names, ambiguity,
   rename aliases, room escape, durable replay, concurrent edits, and duplicate update replay.
-- Companion server source-relative lookup tests, web typecheck, and web build pass. End-to-end
-  Obsidian runtime checks remain for rollout; changes are not published or installed yet.
+- Companion server all 40 tests, typecheck, and web build pass. Client all 37 tests, typecheck,
+  production build and real Obsidian reconciliation/reconnect checks pass.
 
 ## Exit Criteria
 
